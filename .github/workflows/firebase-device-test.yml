@@ -158,16 +158,19 @@ jobs:
             name=$(basename "$dev")
             log=$(find "$dev" -name 'logcat' -o -name '*logcat*.txt' | head -1)
             out=$(find "$dev" -type d -name VideoCleanerCalib | head -1)
-            [ -z "$log" ] || [ -z "$out" ] && { echo "$name: logcat veya çıktı yok" >> "$GITHUB_STEP_SUMMARY"; continue; }
-            grep -E 'VCCAL|VCCAPS|VCTEST' "$log" > "device-$name.log" || true
-            python3 .github/scripts/calibration_metrics.py \
-              --logcat "device-$name.log" --outputs "$out" --sources AndroidTest/assets/calib \
-              --vmaf "$RUNNER_TEMP/vmaf/libvmaf/build/tools/vmaf" --label "$name (gerçek cihaz)" \
-              --csv "device-$name.csv" --markdown "device-$name.md"
+            [ -z "$log" ] && { echo "$name: logcat yok" >> "$GITHUB_STEP_SUMMARY"; continue; }
+            [ -z "$out" ] && echo "$name: kalibrasyon çıktısı çekilemedi (yalnızca test özeti)" >> "$GITHUB_STEP_SUMMARY"
+            grep -E 'VCCAL|VCCAPS|VCTEST|VCDIAG' "$log" > "device-$name.log" || true
+            if [ -n "$out" ]; then
+              python3 .github/scripts/calibration_metrics.py \
+                --logcat "device-$name.log" --outputs "$out" --sources AndroidTest/assets/calib \
+                --vmaf "$RUNNER_TEMP/vmaf/libvmaf/build/tools/vmaf" --label "$name (gerçek cihaz)" \
+                --csv "device-$name.csv" --markdown "device-$name.md" || echo "$name: ölçüm betiği hata verdi" >> "$GITHUB_STEP_SUMMARY"
+            fi
             {
-              cat "device-$name.md"
+              cat "device-$name.md" 2>/dev/null
               echo; echo "### Kodlayıcılar ve test özeti ($name)"; echo '```'
-              grep -E 'VCCAPS|VCTEST.*(DEVICE|SUMMARY|VIDEO|BITRATE|SERVICE|PIXELS)' "device-$name.log" | sed -E 's/^.*(VCCAPS|VCTEST) *: //'
+              grep -E 'VCCAPS|VCDIAG|VCTEST.*(DEVICE|SUMMARY|VIDEO|BITRATE|SERVICE|PIXELS|VCCORE|VCAUDIT|REMUX|HBDECODE|CODECS|AV1ENCODE|RUNTIME|CHECKPOINT|AUDIOPROBE)' "device-$name.log" | sed -E 's/^.*(VCCAPS|VCDIAG|VCTEST) *: //'
               echo '```'
             } >> "$GITHUB_STEP_SUMMARY"
           done
