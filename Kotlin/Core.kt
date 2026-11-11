@@ -733,10 +733,25 @@ class VideoJob(
         cancelled = true
     }
 
+    /**
+     * Daha tek kare vermeden çöken video çözücü. [run] bu durumda işi aynı türdeki bir sonraki
+     * çözücüyle baştan dener (ör. bazı cihaz/emülatör donanım çözücüleri CSD aşamasında hata verir).
+     */
+    private class DecoderFailedException(val decoderName: String, cause: Exception) : Exception(cause.message, cause)
+
     /** İşi çağıran iş parçacığında baştan sona çalıştırır. Hata veya iptalde yarım çıktı silinir. */
     fun run(): JobResult {
+        val skipped = LinkedHashSet<String>()
         try {
-            return transcode()
+            while (true) {
+                try {
+                    return transcode(skipped)
+                } catch (e: DecoderFailedException) {
+                    deleteOutput()
+                    Log.w(CleanerService.TAG, "Çözücü ${e.decoderName} kare vermeden hata verdi; sıradaki çözücü deneniyor", e.cause)
+                    if (!skipped.add(e.decoderName) || skipped.size > MAX_DECODER_ATTEMPTS) throw e.cause ?: e
+                }
+            }
         } catch (e: Exception) {
             deleteOutput()
             throw when (e) {
@@ -807,7 +822,16 @@ class VideoJob(
         throw JobException("Bu cihazda ${width}×$height çözünürlüğünü kodlayabilen bir H.264/HEVC kodlayıcı yok", lastError)
     }
 
-    private fun transcode(): JobResult {
+    /** [mime] türünü çözebilen çözücü adları; yazılım çözücüler donanımdakilerden sonra gelir. */
+    private fun decoderNames(mime: String, skipped: Set<String>): List<String> =
+        MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos
+            .filter { info ->
+                !info.isEncoder && !info.isAlias && info.name !in skipped && info.supportedTypes.any { it.equals(mime, ignoreCase = true) }
+            }
+            .sortedBy { if (it.isSoftwareOnly) 1 else 0 }
+            .map { it.name }
+
+    private fun transcode(skippedDecoders: Set<String>): JobResult {
         val started = SystemClock.elapsedRealtime()
         val extractor = MediaExtractor()
         var audioExtractor: MediaExtractor? = null
@@ -836,15 +860,23 @@ class VideoJob(
             val sourceBitrate = sourceFormat.intOr(MediaFormat.KEY_BIT_RATE, 0)
 
             sourceFormat.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible)
-            val dec = try {
-                MediaCodec.createDecoderByType(sourceMime).also {
-                    it.configure(sourceFormat, null, null, 0)
-                    it.start()
+            // Yapılandırılamayan çözücü atlanır; sıradaki denenir (ör. tek sayılı boyutu reddeden VP9 çözücü).
+            var decoderError: Exception? = null
+            var decoderName = ""
+            for (name in decoderNames(sourceMime, skippedDecoders)) {
+                val codec = runCatching { MediaCodec.createByCodecName(name) }.getOrElse { decoderError = it as? Exception; null } ?: continue
+                try {
+                    codec.configure(sourceFormat, null, null, 0)
+                    codec.start()
+                    decoder = codec
+                    decoderName = name
+                    break
+                } catch (e: Exception) {
+                    codec.release()
+                    decoderError = e
                 }
-            } catch (e: Exception) {
-                throw JobException("Bu cihaz '$sourceMime' videosunu çözemiyor", e)
             }
-            decoder = dec
+            val dec = decoder ?: throw JobException("Bu cihaz '$sourceMime' videosunu çözemiyor", decoderError)
 
             // ---- hedef -------------------------------------------------------
             val fd = context.contentResolver.openFileDescriptor(output, "rw") ?: throw JobException("Çıktı dosyası açılamadı")
@@ -929,7 +961,7 @@ class VideoJob(
                 }
             }
 
-            fun decodeStep() {
+            fun decodeStepUnchecked() {
                 if (!inputDone) {
                     val index = dec.dequeueInputBuffer(CODEC_TIMEOUT_US)
                     if (index >= 0) {
@@ -978,6 +1010,15 @@ class VideoJob(
                     }
                     dec.releaseOutputBuffer(index, false)
                     if (end) decoderDone = true
+                }
+            }
+
+            fun decodeStep() {
+                try {
+                    decodeStepUnchecked()
+                } catch (e: MediaCodec.CodecException) {
+                    if (framesDecoded == 0L) throw DecoderFailedException(decoderName, e)
+                    throw e
                 }
             }
 
@@ -1067,6 +1108,7 @@ class VideoJob(
 
     companion object {
         private const val CODEC_TIMEOUT_US = 10_000L
+        private const val MAX_DECODER_ATTEMPTS = 4
         private const val PROGRESS_INTERVAL_MS = 250L
 
         /** MP4 çoklayıcının doğrudan yazabildiği ses türleri; diğerleri AAC'ye dönüştürülür. */

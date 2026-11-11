@@ -76,7 +76,9 @@ class VideoPipelineTest {
         // Kullanıcının bildirdiği hata: nativeCreate(360x270) geçerli tutamağı hata sanıyordu.
         for ((w, h) in listOf(360 to 270, 1280 to 720, 1920 to 1080, 2 to 2, 128 to 96)) {
             CleanerSession(w, h).use { session ->
-                assertEquals(w.toLong() * h * 3 / 2 * 30, session.stats().poolBytes)
+                // Çekirdek her yuvayı 64 bayta hizalar (Rust FrameRing: stride = round_up(kare, 64)).
+                val stride = (w.toLong() * h * 3 / 2 + 63) / 64 * 64
+                assertEquals(stride * 30, session.stats().poolBytes)
             }
         }
         // Geçersiz boyut istisna olarak, doğru hata koduyla dönmeli (çökme değil).
