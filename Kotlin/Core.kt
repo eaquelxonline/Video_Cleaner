@@ -1500,7 +1500,9 @@ class VideoJob(
             for ((k, entry) in audioPaths.withIndex()) entry.first.pump(mux, audioOut[k], Long.MAX_VALUE)
             mux.stop()
             muxerStarted = false
-            notes += if (subtitles.isEmpty()) "Dosyada ayrı altyazı izi yoktu; video ve ses yeniden kodlanmadan kopyalandı."
+            // Not: Android'in ayrıştırıcısı bazı izleri hiç göstermez (ör. MKV içindeki SRT, API 37'de denendi).
+            // Görünmeyen izler de çıktıya yazılmaz; yalnızca video ve ses kopyalanır.
+            notes += if (subtitles.isEmpty()) "Android bu dosyada ayrı altyazı izi görmedi; çıktıya yalnızca video ve ses (yeniden kodlanmadan) yazıldı."
             else "${subtitles.size} ayrı altyazı izi çıkarıldı (${subtitles.joinToString()}); video yeniden kodlanmadı."
             return JobResult(
                 framesDecoded = copied, framesEncoded = copied, elapsedMs = SystemClock.elapsedRealtime() - started,
