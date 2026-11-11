@@ -135,7 +135,8 @@ jobs:
             echo "${{ inputs.devices }}" | tr ';' '\n' | sed 's/^/--device=/' > devices.txt
           else
             gcloud firebase test android models list --format=json > models.json
-            python3 .github/scripts/ftl_pick_devices.py models.json "${{ inputs.max_devices || '3' }}" > devices.txt 2> devices-human.txt
+            echo "models.json: $(wc -c < models.json) bayt"
+            python3 .github/scripts/ftl_pick_devices.py models.json "${{ inputs.max_devices || '3' }}" devices.txt | tee devices-human.txt
           fi
           { echo "## Seçilen cihazlar"; echo '```'; cat devices-human.txt 2>/dev/null || cat devices.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
@@ -166,10 +167,13 @@ jobs:
         timeout-minutes: 40
         if: steps.creds.outputs.skip == 'false'
         run: |
-          # Paket sunucusuna geçici erişim hatalarına (DNS) karşı 3 deneme; her deneme en çok 10 dk.
+          # Koşucularda security.ubuntu.com DNS hatası görüldü: güvenlik deposu da Azure aynasından alınır.
+          sudo sed -i -E 's#https?://security.ubuntu.com/ubuntu#http://azure.archive.ubuntu.com/ubuntu#g' /etc/apt/sources.list /etc/apt/sources.list.d/*.sources 2>/dev/null || true
+          APT="-o Acquire::Retries=3 -o Acquire::http::Timeout=30"
+          # Paket sunucusuna geçici erişim hatalarına karşı 3 deneme; her deneme en çok 10 dk.
           ok=0
           for attempt in 1 2 3; do
-            if timeout 600 sudo apt-get update -qq && timeout 600 sudo apt-get install -y -qq --fix-missing ffmpeg meson ninja-build nasm xxd > /dev/null; then ok=1; break; fi
+            if timeout 600 sudo apt-get $APT update -qq && timeout 600 sudo apt-get $APT install -y -qq --fix-missing ffmpeg meson ninja-build nasm xxd > /dev/null; then ok=1; break; fi
             echo "apt denemesi $attempt başarısız; 20 sn sonra yeniden"; sleep 20
           done
           [ "$ok" = 1 ]
@@ -209,6 +213,7 @@ jobs:
           if-no-files-found: warn
           path: |
             ftl.log
+            models.json
             devices*.txt
             device-*.csv
             device-*.md
