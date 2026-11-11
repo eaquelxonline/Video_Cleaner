@@ -1,4 +1,4 @@
-"""Video_Detector — kaplama (altyazı/filigran) algılama ve ayrıştırma modeli.
+"""Video_Detector (VC-Detector) — kaplama (altyazı/filigran) algılama ve ayrıştırma modeli.
 
 Görev: görüntüye SONRADAN eklenmiş yazıyı bulmak, saydamlığını ve rengini
 kestirmek ve onu sahneye ait gerçek yazıdan (tabela, plaka, forma numarası,

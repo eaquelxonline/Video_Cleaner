@@ -1,4 +1,4 @@
-"""Video_Cleaner v2.0 — eğitim, ölçüm ve dışa aktarma.
+"""Video_Cleaner v2.0 — VC-Trainer ve VC-Tester: eğitim, ölçüm, sürüm kapıları ve dışa aktarma.
 
 Kullanım (proje kökünden):
 
@@ -10,6 +10,7 @@ Kullanım (proje kökünden):
     python Models/Trainer.py --stage mamba    --resume runs/flow/last.pt
     python Models/Trainer.py --stage joint    --resume runs/mamba/last.pt
     python Models/Trainer.py --export out/ --resume runs/joint/last.pt
+    python Models/Trainer.py --audit --resume runs/joint/last.pt   # VC-Tester sürüm kapıları (JSON)
 
 Eğitim sırası: kalibrasyon → Detector → Flow → Mamba → ortak ince ayar → dışa aktarma.
 Toplam süre önceden VARSAYILMAZ: ``--benchmark`` ölçülen adım süresinden hesaplar.
@@ -609,6 +610,26 @@ def warp_pairs(x: torch.Tensor, flow_fw: torch.Tensor) -> torch.Tensor:
     return warp(x[:, 1:].flatten(0, 1).float(), flow_fw.flatten(0, 1).float()).view(b, t - 1, *x.shape[2:])
 
 
+def temporal_validity(
+    clean: torch.Tensor, flow_fw: torch.Tensor, valid: torch.Tensor, reliable: Optional[torch.Tensor] = None,
+    occlusion: float = 0.05, cut: float = 0.25,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Zamansal kayıp/ölçüt için geçerlilik maskesi [B, T-1, 1, H, W] ve gerçek çarpıtma hatası.
+
+    Dışlananlar (planın "geçerlilik maskeli temporal loss" kuralı):
+      * örtülen (occluded) pikseller: temiz videoda bile çarpıtma hatası ``occlusion`` üstünde,
+      * VC-Flow'un güvenilmez dediği pikseller (``reliable`` = ``out["reliable_fw"]``),
+      * sahne geçişi (scene_cut) olan çiftler: ortalama çarpıtma hatası ``cut`` üstünde — çiftin tamamı,
+      * dolgulu (geçersiz) karelere dokunan çiftler.
+    """
+    e_true = (clean[:, :-1] - warp_pairs(clean, flow_fw)).abs().mean(2, keepdim=True)
+    scene_cut = e_true.mean((2, 3, 4), keepdim=True) > cut
+    keep = (e_true < occlusion) & pair_mask(valid) & ~scene_cut
+    if reliable is not None and reliable.shape[1] == keep.shape[1]:
+        keep = keep & reliable.bool()
+    return keep, e_true
+
+
 class VGGPerceptual(nn.Module):
     """İsteğe bağlı algısal kayıp (torchvision VGG16 özellikleri; ağırlık dosyası kullanıcıdan)."""
 
@@ -742,11 +763,11 @@ def restoration_loss(
     if flow_fw is not None and raw.shape[1] > 1:
         fw = flow_fw.float()
         e_pred = (raw[:, :-1] - warp_pairs(raw, fw)).abs().mean(2, keepdim=True)
-        e_true = (clean[:, :-1] - warp_pairs(clean, fw)).abs().mean(2, keepdim=True)
         region = torch.maximum(mask[:, :-1], warp_pairs(mask, fw))
-        visible = (e_true < 0.05).float() * pair_mask(valid).float()                          # örtülme/sahne değişimi dışı
+        # Örtülen, VC-Flow'un güvenmediği ve sahne geçişine uğrayan pikseller kayıptan dışlanır.
+        visible, e_true = temporal_validity(clean, fw, valid, out.get("reliable_fw"))
         # Yalnızca gerçek videodaki zamansal farkın ÜSTÜNDE kalan kısım cezalandırılır.
-        l_temp = masked_mean(F.relu(e_pred - e_true), region * visible)
+        l_temp = masked_mean(F.relu(e_pred - e_true), region * visible.float())
 
     l_perc = raw.new_zeros(())                                                               # λ₄
     if perceptual is not None and w.perceptual > 0:
@@ -865,7 +886,8 @@ def update_ema(ema: VideoCleaner, engine: VideoCleaner, decay: float) -> None:
 
 @torch.no_grad()
 def evaluate(
-    engine: VideoCleaner, cfg: TrainConfig, device: torch.device, clips: int, perceptual: Optional[VGGPerceptual] = None
+    engine: VideoCleaner, cfg: TrainConfig, device: torch.device, clips: int, perceptual: Optional[VGGPerceptual] = None,
+    lpips_fn: Optional[nn.Module] = None,
 ) -> Dict[str, float]:
     """Onarım, koruma ve zamansal sadakati AYRI AYRI ölçer (birbirinin yerine geçmezler).
 
@@ -877,7 +899,12 @@ def evaluate(
     input_psnr            : aynı bölgede GİRDİNİN (altyazılı kare) PSNR'ı — karşılaştırma tabanı
     restoration_perceptual: VGG algısal uzaklık (``--vgg-weights`` verilmişse)
     preservation_max      : maske dışında |çıktı − girdi| en büyük değeri (kapı nedeniyle tam 0 olmalı)
+    restoration_ssim      : silinen bölgenin kutusunda SSIM (11×11 Gauss)
+    restoration_lpips     : LPIPS (yalnızca ``lpips`` paketi ve ağırlıkları varsa)
     temporal_excess       : maske bölgesinde, gerçek videonun üstünde kalan çarpıtma hatası
+    temporal_ewarp        : onarılan bölgede E_warp (MSE; örtülme, güvenilmez akış ve sahne geçişi dışı)
+    temporal_ewarp_source : aynı piksellerde TEMİZ videonun E_warp'ı (karşılaştırma tabanı)
+    boundary_jump         : 14→15 blok sınırı çiftinin fazlalık hatası − diğer çiftlerin ortancası
     detector_iou, missed_overlay, scene_text_erased, flow_epe : ara modellerin doğruluğu
     """
     engine.eval()
@@ -904,12 +931,38 @@ def evaluate(
         }
         if bool(batch["has_flow"].all()):
             fw = batch["flow_fw"].float()
-            e_out = (restored[:, :-1] - warp_pairs(restored, fw)).abs().mean(2, keepdim=True)
-            e_true = (clean[:, :-1] - warp_pairs(clean, fw)).abs().mean(2, keepdim=True)
-            metrics["temporal_excess"] = masked_mean(F.relu(e_out - e_true), region[:, :-1] * (e_true < 0.05)).item()
+            # Akış GERÇEK (bilinen) olduğundan modelin güven haritası değil, örtülme/sahne geçişi dışlanır.
+            visible, e_true = temporal_validity(clean, fw, batch["valid"])
+            diff = restored[:, :-1] - warp_pairs(restored, fw)
+            e_out = diff.abs().mean(2, keepdim=True)
+            pair_region = torch.maximum(region[:, :-1], warp_pairs(region, fw)) * visible.float()
+            metrics["temporal_excess"] = masked_mean(F.relu(e_out - e_true), pair_region).item()
+            # E_warp: onarılan bölgede (örtülme/sahne geçişi dışı) kareler arası çarpıtma hatası, MSE.
+            sq = diff.pow(2).mean(2, keepdim=True)
+            metrics["temporal_ewarp"] = masked_mean(sq, pair_region).item() if pair_region.sum() > 0 else float("nan")
+            metrics["temporal_ewarp_source"] = (
+                masked_mean((clean[:, :-1] - warp_pairs(clean, fw)).pow(2).mean(2, keepdim=True), pair_region).item()
+                if pair_region.sum() > 0 else float("nan")
+            )
+            # Blok sınırı 14→15 (Mod A hedefi ile sonraki yarı): bu çiftin fazlalık hatası diğer
+            # çiftlerin ortancasını aşmamalı ("sıçrama yok").
+            per_pair = [
+                masked_mean(F.relu(e_out - e_true)[:, i], pair_region[:, i]).item()
+                for i in range(e_out.shape[1]) if pair_region[:, i].sum() > 0
+            ]
+            if pair_region[:, TARGET_A].sum() > 0 and len(per_pair) > 1:
+                boundary = masked_mean(F.relu(e_out - e_true)[:, TARGET_A], pair_region[:, TARGET_A]).item()
+                metrics["boundary_jump"] = max(0.0, boundary - float(np.median(per_pair)))
             metrics["flow_epe"] = (out["flows"]["flow_fw"].float() - fw).pow(2).sum(2).sqrt().mean().item()
         if perceptual is not None and region.sum() > 0:
             metrics["restoration_perceptual"] = perceptual(restored, clean).item()
+        if lpips_fn is not None and region.sum() > 0:
+            m = region.flatten(0, 1).expand(-1, 3, -1, -1).bool()
+            a = torch.where(m, restored.flatten(0, 1), clean.flatten(0, 1))      # maske dışı = temiz → yalnız onarım ölçülür
+            metrics["restoration_lpips"] = lpips_fn(a * 2 - 1, clean.flatten(0, 1) * 2 - 1).mean().item()
+        ssim = masked_ssim(restored, clean, region)
+        if ssim is not None:
+            metrics["restoration_ssim"] = ssim
         for k, v in metrics.items():
             if not math.isnan(v):       # her ölçüt yalnızca tanımlı olduğu kliplerde ortalanır
                 sums[k] = sums.get(k, 0.0) + v
@@ -918,6 +971,104 @@ def evaluate(
     result["clips"] = float(clips)
     result["folder_clips_in_val"] = float(len(synth.clips))
     return result
+
+
+def masked_ssim(x: torch.Tensor, y: torch.Tensor, region: torch.Tensor) -> Optional[float]:
+    """SSIM (Wang 2004; 11×11, σ=1,5, C1=0,01², C2=0,03²) haritasının ``region`` üzerindeki ortalaması."""
+    if region.sum() == 0:
+        return None
+    x2, y2 = x.flatten(0, 1).float(), y.flatten(0, 1).float()
+    if min(x2.shape[-2:]) < 11:
+        return None
+    g = torch.exp(-((torch.arange(11, device=x.device, dtype=torch.float32) - 5) ** 2) / (2 * 1.5 ** 2))
+    g = (g / g.sum())
+    k = (g[:, None] * g[None, :]).expand(x2.shape[1], 1, 11, 11).contiguous()
+    blur = lambda z: F.conv2d(z, k, padding=5, groups=x2.shape[1])
+    mx, my = blur(x2), blur(y2)
+    sxx, syy, sxy = blur(x2 * x2) - mx * mx, blur(y2 * y2) - my * my, blur(x2 * y2) - mx * my
+    c1, c2 = 0.01 ** 2, 0.03 ** 2
+    ssim = ((2 * mx * my + c1) * (2 * sxy + c2)) / ((mx * mx + my * my + c1) * (sxx + syy + c2))
+    return masked_mean(ssim, region.flatten(0, 1).float()).item()
+
+
+def load_lpips(device: torch.device) -> Optional[nn.Module]:
+    """``lpips`` paketi (AlexNet) varsa yükler; yoksa None — VC-Tester LPIPS'i "ölçülmedi" yazar."""
+    try:
+        import lpips  # type: ignore
+        return lpips.LPIPS(net="alex", verbose=False).to(device).eval()
+    except Exception as error:      # paket yok veya ağırlıklar indirilemedi
+        print(f"[vc-tester] LPIPS yüklenemedi ({type(error).__name__}: {error}); ölçülmeyecek")
+        return None
+
+
+# ---- VC-Tester: üç eksenli sürüm kapıları ---------------------------------------------------------
+#
+# Her kapı ölçülen bir değerle karşılaştırılır. Ölçülemeyen kapı "ÖLÇÜLMEDİ" olur ve genel
+# karar asla "GEÇTİ" olmaz (ölçülmeyen şey geçmiş sayılmaz).
+
+TESTER_GATES = (
+    # (eksen, ad, ölçüt anahtarı, karşılaştırma, eşik, birim/açıklama)
+    ("preservation", "maske dışı bayt eşitliği", "preservation_max", "==", 0.0, "en büyük |çıktı−girdi|"),
+    ("preservation", "sahne yazısı silme hatası", "scene_text_erased", "<", 0.001, "oran (<%0,1)"),
+    ("restoration", "maske PSNR", "restoration_psnr", ">=", 28.0, "dB"),
+    ("restoration", "LPIPS", "restoration_lpips", "<", 0.04, "AlexNet LPIPS"),
+    ("restoration", "kalan yazı hatası (TER)", "restoration_ter", "<", 0.005, "OCR gerekir (<%0,5)"),
+    ("temporal", "E_warp", "temporal_ewarp", "<", 0.0020, "MSE, onarılan bölge"),
+    ("temporal", "14→15 blok sınırı sıçraması", "boundary_jump", "<=", 1e-4, "fazlalık − ortanca"),
+)
+
+_OPS = {"==": lambda a, b: a == b, "<": lambda a, b: a < b, "<=": lambda a, b: a <= b, ">=": lambda a, b: a >= b}
+
+
+def tester_audit(metrics: Dict[str, float], source: str = "") -> Dict[str, object]:
+    """``evaluate`` ölçütlerinden VC-Tester raporu: her kapı GEÇTİ / KALDI / ÖLÇÜLMEDİ."""
+    axes: Dict[str, Dict[str, object]] = {}
+    verdicts = []
+    for axis, name, key, op, limit, unit in TESTER_GATES:
+        value = metrics.get(key)
+        if value is None or (isinstance(value, float) and math.isnan(value)):
+            status = "ÖLÇÜLMEDİ"
+            note = "OCR modeli yok" if key == "restoration_ter" else ("lpips paketi/ağırlığı yok" if key == "restoration_lpips" else "bu veride tanımsız")
+        else:
+            status = "GEÇTİ" if _OPS[op](float(value), limit) else "KALDI"
+            note = ""
+        verdicts.append(status)
+        axes.setdefault(axis, {"gates": []})["gates"].append(
+            {"name": name, "metric": key, "value": value, "rule": f"{op} {limit}", "unit": unit, "status": status, **({"note": note} if note else {})}
+        )
+    for axis in axes.values():
+        states = [g["status"] for g in axis["gates"]]
+        axis["status"] = "KALDI" if "KALDI" in states else ("ÖLÇÜLMEDİ" if "ÖLÇÜLMEDİ" in states else "GEÇTİ")
+    overall = "KALDI" if "KALDI" in verdicts else ("EKSİK" if "ÖLÇÜLMEDİ" in verdicts else "GEÇTİ")
+    return {
+        "tester": "VC-Tester", "source": source, "overall": overall, "axes": axes,
+        "context": {k: metrics[k] for k in ("input_psnr", "restoration_ssim", "temporal_ewarp_source", "temporal_excess", "detector_iou", "missed_overlay", "flow_epe", "clips") if k in metrics},
+    }
+
+
+def format_audit(report: Dict[str, object]) -> str:
+    lines = [f"VC-Tester — {report['source'] or 'kaynak belirtilmedi'} → GENEL: {report['overall']}"]
+    for axis, data in report["axes"].items():
+        lines.append(f"  [{data['status']}] {axis}")
+        for g in data["gates"]:
+            value = "—" if g["value"] is None else f"{g['value']:.6g}"
+            lines.append(f"      {g['status']:<10} {g['name']}: {value} (kural {g['rule']}; {g['unit']}){'  — ' + g['note'] if 'note' in g else ''}")
+    return "\n".join(lines)
+
+
+def audit(cfg: TrainConfig, device: torch.device, use_lpips: bool) -> Dict[str, object]:
+    """Denetim noktasının EMA ağırlıklarını doğrulama klipleriyle denetler (``--audit``)."""
+    state = load_checkpoint(cfg.resume, cfg) if cfg.resume else None
+    engine = make_engine(cfg)
+    source = "rastgele başlangıç (EĞİTİLMEMİŞ — kapıların kalması beklenir)"
+    if state:
+        engine.load_state_dict(state.get("ema", state["engine"]))
+        source = f"{cfg.resume} (aşama {state.get('stage')}, adım {state.get('step')})"
+    engine = engine.to(device).eval()
+    perceptual = VGGPerceptual(cfg.vgg_weights).to(device) if cfg.vgg_weights else None
+    lpips_fn = load_lpips(device) if use_lpips else None
+    metrics = evaluate(engine, cfg, device, clips=cfg.val_clips, perceptual=perceptual, lpips_fn=lpips_fn)
+    return tester_audit(metrics, source)
 
 
 # =============================================================================
@@ -1226,6 +1377,48 @@ def selftest(device: torch.device) -> None:
     check("Mod A (14+1+15) = Mod B'nin 14. karesi", torch.allclose(out_a["restored"][:, 0], out_b["restored"][:, TARGET_A], atol=1e-4))
     check("Mod B 30 kare, Mod A 1 kare üretir", out_b["restored"].shape[1] == WINDOW and out_a["restored"].shape[1] == 1 and HALF * 2 == WINDOW)
 
+    # Dinamik ROI tüpü ve akıllı bypass (çıkarım yolu)
+    with torch.no_grad():
+        empty = torch.zeros_like(mask)
+        bypass = full(batch["frames"], batch["valid"], mode="B", override={**override, "mask_soft": empty.float(), "mask_hard": empty})
+        small = torch.zeros_like(mask)
+        small[..., 8:24, 8:40] = True
+        margin, full.config.roi_margin = full.config.roi_margin, 8     # 64×96 denetim karesinde 32 px pay tüm kareyi kaplar
+        try:
+            cropped = full(batch["frames"], batch["valid"], mode="B", override={**override, "mask_soft": small.float(), "mask_hard": small})
+        finally:
+            full.config.roi_margin = margin
+    check("akıllı bypass: maske yoksa model atlanır, çıktı = girdi", bypass["roi"] == (0, 0, 0, 0) and torch.equal(bypass["restored"], batch["frames"]))
+    roi = cropped["roi"]
+    check("ROI tüpü: küçük maskede kırpım, dışarısı bit-exact",
+          isinstance(roi, tuple) and roi != (0, 0, 0, 0) and (roi[1] - roi[0]) * (roi[3] - roi[2]) < 64 * 96
+          and torch.equal(cropped["restored"][~small.expand_as(batch["frames"])], batch["frames"][~small.expand_as(batch["frames"])]),
+          f"ROI {roi}")
+
+    # SEDiT tarzı bağlam aktarımı: Mod B penceresi bir özet üretir; FiLM sıfırla başladığı için
+    # eğitilmemiş modelde bağlam çıktıyı DEĞİŞTİRMEZ (eğitim kararlılığı).
+    state = out_b["context_state"]
+    check("context_state üretilir", state is not None and state.dim() == 2 and state.shape[0] == 1 and bool(torch.isfinite(state).all()),
+          f"boyut {tuple(state.shape) if state is not None else None}")
+    with torch.no_grad():
+        carried = full(batch["frames"], batch["valid"], mode="B", override=override, context_state=torch.randn_like(state))
+    check("bağlam köprüsü sıfır başlatılmış (çıktı değişmez)", torch.allclose(carried["restored"], out_b["restored"], atol=1e-5))
+
+    # Geçerlilik maskeli zamansal kayıp: sahne geçişi olan çift tamamen, örtülen pikseller dışlanır.
+    spliced = batch["clean"].clone()
+    spliced[:, 15:] = 1 - spliced[:, 15:].flip(-1)
+    keep, _ = temporal_validity(spliced, batch["flow_fw"], batch["valid"])
+    check("sahne geçişi çifti (14→15) zamansal kayıptan dışlanır", not bool(keep[:, 14].any()) and bool(keep[:, :14].any()))
+    unreliable = torch.zeros_like(keep)
+    keep2, _ = temporal_validity(batch["clean"], batch["flow_fw"], batch["valid"], unreliable)
+    check("VC-Flow'un güvenmediği pikseller dışlanır", not bool(keep2.any()))
+
+    # VC-Tester kapı mantığı (ölçülmeyen kapı asla geçmiş sayılmaz)
+    good = {"preservation_max": 0.0, "scene_text_erased": 0.0, "restoration_psnr": 31.0, "temporal_ewarp": 0.001, "boundary_jump": 0.0}
+    check("VC-Tester: LPIPS/TER ölçülmeden genel karar EKSİK", tester_audit(good)["overall"] == "EKSİK")
+    check("VC-Tester: tüm kapılar ölçülüp sağlanınca GEÇTİ", tester_audit({**good, "restoration_lpips": 0.02, "restoration_ter": 0.001})["overall"] == "GEÇTİ")
+    check("VC-Tester: koruma ihlali KALDI", tester_audit({**good, "preservation_max": 1 / 255})["axes"]["preservation"]["status"] == "KALDI")
+
     for stage in ("detector", "flow", "mamba", "joint"):
         stage_cfg = copy.deepcopy(cfg)
         stage_cfg.stage, stage_cfg.steps = stage, 8
@@ -1233,6 +1426,10 @@ def selftest(device: torch.device) -> None:
         check(f"eğitim adımı: {stage}", math.isfinite(report["final_loss"]), f"kayıp {report['final_loss']:.4f}, adım {report['step_s']:.2f} s")
     metrics = evaluate(VideoCleaner(tiny_engine_config()).to(device), cfg, device, clips=2)
     check("değerlendirme: koruma hatası tam 0", metrics["preservation_max"] == 0.0, f"ölçütler: {sorted(metrics)}")
+    report = tester_audit(metrics, "küçük, eğitilmemiş model")
+    print(format_audit(report))
+    check("VC-Tester raporu üretildi (eğitilmemiş modelde kapıların kalması beklenir)",
+          set(report["axes"]) == {"preservation", "restoration", "temporal"} and report["axes"]["preservation"]["gates"][0]["status"] == "GEÇTİ")
     print("Kurulum denetimi BAŞARILI.")
 
 
@@ -1247,6 +1444,9 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--benchmark", type=int, default=0, metavar="N", help="N adım ölç, süre/bellek raporu ver, eğitme")
     p.add_argument("--selftest", action="store_true", help="kurulum denetimini çalıştır")
     p.add_argument("--export", default="", metavar="DİZİN", help="FP16 ağırlıkları dışa aktar")
+    p.add_argument("--audit", action="store_true", help="VC-Tester: --resume ağırlıklarını sürüm kapılarıyla denetle (JSON + tablo)")
+    p.add_argument("--audit-json", default="", metavar="DOSYA", help="VC-Tester raporunu bu dosyaya da yaz")
+    p.add_argument("--lpips", action="store_true", help="VC-Tester'da LPIPS ölç (lpips paketi gerekir)")
     p.add_argument("--crop", default="256x448", help="eğitim kırpımı YxG (16'nın katı); tam kare için 720x1280")
     p.add_argument("--batch", type=int, default=1)
     p.add_argument("--accum", type=int, default=4)
@@ -1305,6 +1505,14 @@ def main(argv: Optional[List[str]] = None) -> None:
     if args.export:
         export(cfg, args.export)
         return
+    if args.audit:
+        report = audit(cfg, device, args.lpips)
+        print(format_audit(report))
+        text = json.dumps(report, ensure_ascii=False, indent=2)
+        print(text)
+        if args.audit_json:
+            Path(args.audit_json).write_text(text, encoding="utf-8")
+        raise SystemExit(0 if report["overall"] == "GEÇTİ" else 1)
     try:        # veri yapılandırmasını işçi süreçler başlamadan, anlaşılır bir hatayla doğrula
         train_clips, val_clips = clip_folders(cfg, "train"), clip_folders(cfg, "val")
     except (ValueError, OSError) as error:

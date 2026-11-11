@@ -1,4 +1,4 @@
-"""Video_Flow — maskeli karelerden çift yönlü optik akış ve güven tahmini.
+"""Video_Flow (VC-Flow) — maskeli karelerden çift yönlü optik akış ve güven tahmini.
 
 Görev: komşu kareler arasında ARKA PLANIN hareketini kestirmek. Kaplama (altyazı)
 ekranda sabit durduğu için ham eşleştirme maske içinde yanlış "hareketsiz" akış

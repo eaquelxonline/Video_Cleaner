@@ -1,8 +1,9 @@
-"""Video_Cleaner v2.0 — ortak çekirdek ve iki modlu birleşik motor.
+"""VC-Core (Python) — Video_Cleaner v2.0 ortak çekirdeği ve iki modlu birleşik motor.
 
-Bu dosya üç modelin (Video_Detector, Video_Flow, Video_Mamba) paylaştığı yapı
-taşlarını ve onları tek üretim hattında birleştiren ``VideoCleaner`` motorunu
-içerir.
+Bu dosya üç modelin (VC-Detector = Video_Detector, VC-Flow = Video_Flow, VC-Mamba =
+Video_Mamba) paylaştığı yapı taşlarını ve onları tek üretim hattında birleştiren
+``VideoCleaner`` motorunu içerir. Android tarafındaki karşılığı Rust/Core.rs (halka, pencere
+zamanlayıcı, bit-exact kapı) ve Kotlin/Core.kt'dir (paket com.video.cleaner).
 
     kareler ─► Detector ─► maske, alfa, kaplama rengi, sahne yazısı, güven
             ─► Flow     ─► ileri/geri akış + güven            (maskeli karelerden)
@@ -11,6 +12,7 @@ içerir.
                    2) tek seferlik piksel çekme (akış haritaları taşınır,
                       renk kaynak kareden yalnızca BİR kez örneklenir)
             ─► Mamba    ─► kalan belirsiz bölge için onarım + belirsizlik
+                           (çıkarımda yalnızca dinamik ROI tüpünde; maske yoksa hiç çalışmaz)
             ─► Bit-exact kapı: maskesiz pikseller ``torch.where`` ile aynen geçer
 
 Tensör sözleşmesi (tüm modeller için ortak)
@@ -48,6 +50,8 @@ TARGET_A = 14        # Mod A'da hedef karenin konumu (14 geçmiş + hedef + 15 g
 # Başlangıç parametre bütçeleri. Bunlar ÜST SINIRDIR: modeller bu sayıları
 # doldurmak için kullanılmayan parametre içermez (bkz. parameter_report).
 PARAM_BUDGET = {"detector": 1 << 22, "flow": 1 << 23, "mamba": 1 << 25}
+# Resmi sistem adları (rapor ve kayıtlarda kullanılır).
+SYSTEM_NAMES = {"detector": "VC-Detector", "flow": "VC-Flow", "mamba": "VC-Mamba", "total": "toplam"}
 
 
 # =============================================================================
@@ -259,6 +263,8 @@ def pull_pixels(
     reliable_bw: torch.Tensor,
     valid: Optional[torch.Tensor] = None,
     decay: float = 0.92,
+    select: str = "block",
+    block: int = 8,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Maskeli pikselleri, başka karelerdeki temiz karşılıklarından TEK örneklemeyle çeker.
 
@@ -276,6 +282,12 @@ def pull_pixels(
         reliable_bw [B, T-1, 1, H, W] bool
         valid       [B, T] bool — dolgu kareleri kaynak olamaz, zincir onlardan geçemez
         decay       her sıçramada güvenin çarpıldığı katsayı
+        select      ileri (gelecek) ve geri (geçmiş) zincirden gelen iki adayın birleşimi:
+                    "blend": güvenle ağırlıklı ortalama;
+                    "block": ``block``×``block`` alt blok başına ortalama güveni yüksek olan YÖN
+                    seçilir (anizotropik komşu seçimi): blok içinde tek kaynak yönü kalır, iki
+                    farklı kaynağın ortalamasından doğan hayalet/çift kenar oluşmaz. Seçilen yönün
+                    çözemediği pikselde diğer yön kullanılır.
 
     Returns:
         pulled [B, T, 3, H, W] — çekilen renk (çözülemeyen piksellerde orijinal)
@@ -326,6 +338,15 @@ def pull_pixels(
     xy_p, src_p, hops_p, ok_p = sweep(-1)
     w_f = ok_f.to(frames.dtype) * decay ** hops_f.to(frames.dtype)
     w_p = ok_p.to(frames.dtype) * decay ** hops_p.to(frames.dtype)
+    if select == "block" and h % block == 0 and w % block == 0:
+        mf = F.avg_pool2d(w_f.flatten(0, 1), block)
+        mp = F.avg_pool2d(w_p.flatten(0, 1), block)
+        prefer_f = F.interpolate((mf >= mp).to(frames.dtype), scale_factor=block, mode="nearest").view_as(w_f) > 0.5
+        use_f = torch.where(prefer_f, w_f > 0, w_p <= 0)
+        w_f = torch.where(use_f, w_f, torch.zeros_like(w_f))
+        w_p = torch.where(use_f, torch.zeros_like(w_p), w_p)
+    elif select not in ("blend", "block"):
+        raise ValueError("select 'blend' veya 'block' olmalı")
     total = w_f + w_p
     mixed = (w_f * gather(xy_f, src_f) + w_p * gather(xy_p, src_p)) / total.clamp_min(1e-6)
     solved = total > 0
@@ -383,6 +404,42 @@ class EngineConfig:
     flow_confidence: float = 0.5       # akışın güvenilir sayılması için alt sınır
     alpha_max: float = 0.95            # bunun üstünde analitik çözüm kullanılmaz
     pull_decay: float = 0.92           # piksel çekmede sıçrama başına güven çarpanı
+    pull_select: str = "block"         # ileri/geri kaynak birleşimi: "block" (anizotropik seçim) | "blend"
+    pull_block: int = 8                # anizotropik seçim alt blok boyu (piksel)
+    roi_tube: bool = True              # çıkarımda VC-Mamba yalnızca maskenin zamansal sınır kutusunda çalışsın
+    roi_margin: int = 32               # ROI çevresinde bırakılan bağlam payı (piksel)
+    roi_max_fraction: float = 0.6      # ROI karenin bu oranından büyükse tam kare işlenir
+
+
+def roi_tube(
+    mask: torch.Tensor, valid: torch.Tensor, margin: int, max_fraction: float, multiple: int = 16
+) -> Optional[Tuple[int, int, int, int]]:
+    """Pencere boyunca silinecek bölgenin (tüm karelerin birleşimi) sınır kutusu: (y0, y1, x0, x1).
+
+    Kutu ``margin`` kadar genişletilir ve kenarları ``multiple``'ın katına oturtulur (model
+    sözleşmesi). Maske boşsa ``(0, 0, 0, 0)`` (hiçbir şey çalıştırma); kutu karenin
+    ``max_fraction`` oranından büyükse ``None`` (tam kare).
+    """
+    h, w = mask.shape[-2:]
+    m = (mask.bool() & valid.view(*valid.shape, 1, 1, 1)).flatten(0, 2).any(0)       # [H, W]
+    if not bool(m.any()):
+        return (0, 0, 0, 0)
+    ys = torch.nonzero(m.any(1)).flatten()
+    xs = torch.nonzero(m.any(0)).flatten()
+
+    def span(lo: int, hi: int, size: int) -> Tuple[int, int]:
+        lo = max(0, lo - margin) // multiple * multiple
+        hi = min(size, -(-(hi + margin) // multiple) * multiple)
+        if (hi - lo) % multiple:
+            hi = min(size, lo + -(-(hi - lo) // multiple) * multiple)
+            lo = max(0, hi - -(-(hi - lo) // multiple) * multiple)
+        return lo, hi
+
+    y0, y1 = span(int(ys[0]), int(ys[-1]) + 1, h)
+    x0, x1 = span(int(xs[0]), int(xs[-1]) + 1, w)
+    if (y1 - y0) % multiple or (x1 - x0) % multiple or (y1 - y0) * (x1 - x0) > max_fraction * h * w:
+        return None
+    return (y0, y1, x0, x1)
 
 
 def dilate(mask: torch.Tensor, radius: int) -> torch.Tensor:
@@ -463,6 +520,7 @@ class VideoCleaner(nn.Module):
         mode: str = "B",
         override: Optional[Dict[str, torch.Tensor]] = None,
         detach_priors: bool = True,
+        context_state: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """Bir 30 karelik pencereyi onarır.
 
@@ -477,6 +535,7 @@ class VideoCleaner(nn.Module):
                      hiç çalıştırılmaz.
             detach_priors True ise önseller (analitik çözüm, çekilen pikseller) Mamba'ya
                      gradyansız verilir (aşamalı eğitim). Ortak ince ayarda False.
+            context_state önceki Mod B penceresinin VC-Mamba özeti (sahne başında None).
 
         Returns (sözlük):
             restored [B, T', 3, H, W]  kapıdan geçmiş çıktı (maskesiz pikseller girdiyle birebir aynı)
@@ -485,6 +544,8 @@ class VideoCleaner(nn.Module):
             confidence [B, T', 1, H, W] 0..1 güven (Rust çekirdeğine harmanlama ağırlığı olarak gider)
             mask     [B, T', 1, H, W]  bool sert maske
             index    çözülen pencere konumları (liste)
+            context_state bir sonraki pencereye aktarılacak özet (ROI/bypass'ta önceki aynen)
+            roi      (y0, y1, x0, x1) VC-Mamba'nın çalıştığı bölge, None = tam kare, boş = atlandı
             + ara çıktılar: det, flows, mask_soft, priors
         T' = 30 (Mod B) veya 1 (Mod A).
         """
@@ -527,7 +588,8 @@ class VideoCleaner(nn.Module):
             bg_gamma, bg_linear, reliability = analytic_background(f32, alpha.float(), fg_rgb.float(), self.config.alpha_max)
             analytic_conf = reliability * det_conf.float() * mask_hard.to(f32.dtype)
             pulled, pulled_conf = pull_pixels(
-                f32, ~mask_hard, flows["flow_fw"].float(), flows["flow_bw"].float(), rel_fw, rel_bw, valid, self.config.pull_decay
+                f32, ~mask_hard, flows["flow_fw"].float(), flows["flow_bw"].float(), rel_fw, rel_bw, valid,
+                self.config.pull_decay, self.config.pull_select, self.config.pull_block,
             )
         priors = {
             "bg_gamma": bg_gamma, "bg_linear": bg_linear, "analytic_conf": analytic_conf,
@@ -536,10 +598,38 @@ class VideoCleaner(nn.Module):
         if detach_priors:
             priors = {k: v.detach() for k, v in priors.items()}
 
-        # 4) Mamba
+        # 4) Mamba — çıkarımda dinamik ROI tüpü: yalnızca maskenin pencere boyunca kapladığı kutu
+        #    (+ bağlam payı) işlenir; maske hiç yoksa model atlanır (akıllı bypass). Eğitimde tam kare.
         target = TARGET_A if mode == "A" else None
-        out = self.mamba(frames, mask_soft, priors, valid, target=target)
         index = [TARGET_A] if mode == "A" else list(range(t))
+        roi = None
+        if self.config.roi_tube and not torch.is_grad_enabled():
+            roi = roi_tube(mask_hard, valid, self.config.roi_margin, self.config.roi_max_fraction)
+        if roi == (0, 0, 0, 0):
+            src_frames = frames[:, index]
+            out = {
+                "rgb": src_frames,
+                "log_b": torch.full_like(src_frames[:, :, :1], -7.0, dtype=torch.float32),
+                "confidence": torch.ones_like(src_frames[:, :, :1], dtype=torch.float32),
+                "context_state": context_state,
+            }
+        elif roi is not None:
+            y0, y1, x0, x1 = roi
+            crop = lambda z: z[..., y0:y1, x0:x1]
+            part = self.mamba(
+                crop(frames), crop(mask_soft), {k: crop(v) for k, v in priors.items()}, valid,
+                target=target, context_state=context_state,
+            )
+            src_frames = frames[:, index]
+            rgb = src_frames.clone()
+            rgb[..., y0:y1, x0:x1] = part["rgb"].to(rgb.dtype)
+            log_b = torch.full_like(src_frames[:, :, :1], -7.0, dtype=torch.float32)
+            log_b[..., y0:y1, x0:x1] = part["log_b"]
+            conf = torch.ones_like(log_b)
+            conf[..., y0:y1, x0:x1] = part["confidence"]
+            out = {"rgb": rgb, "log_b": log_b, "confidence": conf, "context_state": part["context_state"]}
+        else:
+            out = self.mamba(frames, mask_soft, priors, valid, target=target, context_state=context_state)
 
         # 5) Bit-exact koruma kapısı: maskesiz piksel girdiden AYNEN seçilir (çarpma/yuvarlama yok).
         src = frames[:, index]
@@ -559,6 +649,8 @@ class VideoCleaner(nn.Module):
             "reliable_fw": rel_fw,
             "reliable_bw": rel_bw,
             "priors": priors,
+            "context_state": out.get("context_state"),
+            "roi": roi,
         }
 
     # ---- uzun video: kayan pencere -------------------------------------------
@@ -598,11 +690,13 @@ class VideoCleaner(nn.Module):
             # Pencere [e+j-15, e+j+15); konum [15-j, 15) kesinleşir, [15, 30) bir sonraki
             # pencereyle harmanlanır. Her kare böylece (en çok) iki tahmin alır.
             e = seg_lo
+            context = None          # sahne başında bloklar arası bağlam sıfırlanır
             while e < seg_hi:
                 j = min(HALF, seg_hi - e)
                 base = e + j - HALF
                 frames, ok = window(base, seg_lo, seg_hi)
-                out = self(frames, ok, mode="B")
+                out = self(frames, ok, mode="B", context_state=context)
+                context = out["context_state"]
                 okv = ok[0]
                 past = torch.cumsum(okv.int(), 0) - okv.int()
                 future = okv.int().sum() - past - okv.int()
@@ -639,14 +733,15 @@ def build_engine(config: Optional[EngineConfig] = None) -> VideoCleaner:
 
 def format_parameter_report(report: Dict[str, Dict[str, float]]) -> str:
     """``parameter_report`` çıktısını okunur tabloya çevirir."""
-    lines = [f"{'model':<10}{'parametre':>14}{'bütçe':>14}{'kullanım':>10}{'BF16 MiB':>10}"]
+    lines = [f"{'model':<14}{'parametre':>14}{'bütçe':>14}{'kullanım':>10}{'BF16 MiB':>10}"]
     for name, r in report.items():
-        lines.append(f"{name:<10}{int(r['params']):>14,}{int(r['budget']):>14,}{r['usage']:>9.1%}{r['bf16_mib']:>10.1f}")
+        label = SYSTEM_NAMES.get(name, name)
+        lines.append(f"{label:<14}{int(r['params']):>14,}{int(r['budget']):>14,}{r['usage']:>9.1%}{r['bf16_mib']:>10.1f}")
     return "\n".join(lines)
 
 
 __all__ = [
-    "WINDOW", "HALF", "TARGET_A", "PARAM_BUDGET",
+    "WINDOW", "HALF", "TARGET_A", "PARAM_BUDGET", "SYSTEM_NAMES", "roi_tube",
     "LayerNorm2d", "ConvBlock", "Downsample", "Upsample", "run_block",
     "flatten_time", "unflatten_time", "count_parameters", "check_window",
     "srgb_to_linear", "linear_to_srgb", "composite", "analytic_background",

@@ -1,4 +1,4 @@
-"""Video_Mamba — çok ölçekli, çift yönlü durum uzayı (Bi-SSM) restorasyon omurgası.
+"""VC-Mamba (Video_Mamba) — çok ölçekli, çift yönlü durum uzayı (Bi-SSM) restorasyon omurgası.
 
 Görev: deterministik aşamaların (analitik alfa çözümü, piksel çekme) kurtaramadığı
 bölgeyi 30 karelik zamansal bağlamla tamamlamak ve her piksel için belirsizlik
@@ -9,6 +9,10 @@ taban görüntünün üzerine ARTIK (residual) tahmin eder.
     Bi-SSM zamansal çekirdek (1/8, 1/16) 30 kare boyunca ileri + geri bilgi aktarımı
     Yerel dikkat (1/16)                  pencere içi uzun menzilli uzamsal ilişki
     Kare başına çözücü (1/8 → tam)       atlama bağlantılarıyla ince detay
+    Bloklar arası bağlam köprüsü         önceki 15 karelik bloğun özeti (context_state) bir
+                                         sonraki pencereye FiLM ile tek adımda aktarılır
+                                         (SEDiT tarifindeki "tek adımlı koşullandırma" ilkesi;
+                                         makalenin kendisi değil, bu ilkenin hafif bir uyarlaması)
 
 Tasarım kararları
     * Mamba taraması milyonlarca tam çözünürlüklü pikselde değil, 1/8 ve 1/16
@@ -26,11 +30,13 @@ Girdi
     priors: bg_gamma [.., 3], bg_linear [.., 3], analytic_conf [.., 1],
             pulled [.., 3], pulled_conf [.., 1]      (hepsi [B, T, C, H, W])
     valid [B, T], target: None (tüm kareler) veya çözülecek tek konum
+    context_state [B, C₄] veya None: önceki pencerenin son 15 karesinin özeti (sahne geçişinde None)
 
 Çıktı (T' = T veya 1)
     rgb        [B, T', 3, H, W]  0..1 onarılmış görüntü (kapı ÖNCESİ)
     log_b      [B, T', 1, H, W]  Laplace ölçeğinin logaritması
     confidence [B, T', 1, H, W]  exp(−b / b₀) ∈ (0, 1]
+    context_state [B, C₄]        bu pencerenin son 15 geçerli karesinin özeti (bir sonraki pencereye)
 
 Başlangıç bütçesi: 2²⁵ = 33.554.432 parametre (üst sınır).
 """
@@ -250,6 +256,12 @@ class VideoMamba(nn.Module):
         self.enc3 = nn.ModuleList([SpatioTemporalBlock(w[2], cfg, attention=False) for _ in range(d[2])])
         self.enc4 = nn.ModuleList([SpatioTemporalBlock(w[3], cfg, attention=True) for _ in range(d[3])])
         self.down = nn.ModuleList([Downsample(w[i], w[i + 1]) for i in range(3)])
+        # Bloklar arası bağlam köprüsü: özet → (ölçek, kaydırma). Sıfırla başlar: ilk eğitimde ve
+        # context_state=None iken model köprüsüz modelle birebir aynıdır.
+        self.context = nn.Sequential(nn.LayerNorm(w[3]), nn.Linear(w[3], 2 * w[3]))
+        with torch.no_grad():
+            self.context[1].weight.zero_()
+            self.context[1].bias.zero_()
 
         self.up = nn.ModuleList([Upsample(w[3 - i], w[2 - i]) for i in range(3)])
         self.fuse = nn.ModuleList([nn.Conv2d(2 * w[2 - i], w[2 - i], 1) for i in range(3)])
@@ -284,6 +296,7 @@ class VideoMamba(nn.Module):
         priors: Dict[str, torch.Tensor],
         valid: Optional[torch.Tensor] = None,
         target: Optional[int] = None,
+        context_state: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         valid = check_window(frames, valid)
         cfg = self.config
@@ -323,8 +336,16 @@ class VideoMamba(nn.Module):
             x = run_block(blk, x, vf, use_checkpoint=ckpt)
         s3 = x
         x = self.down[2](x)
+        if context_state is not None:
+            film = self.context(context_state.to(dtype))                       # [B, 2·C₄]
+            scale, shift = film.view(b, 1, 2, -1, 1, 1).unbind(2)
+            x = (x.view(b, t, *x.shape[1:]) * (1 + scale) + shift).flatten(0, 1)
         for blk in self.enc4:
             x = run_block(blk, x, vf, use_checkpoint=ckpt)
+        # Bir sonraki pencere için özet: son 15 konumdaki GEÇERLİ karelerin 1/16 özelliklerinin ortalaması.
+        tail = x.view(b, t, *x.shape[1:])[:, -min(t, 15):].float().mean((-2, -1))      # [B, 15, C₄]
+        tail_valid = vf[:, -min(t, 15):].float().unsqueeze(-1)
+        next_state = (tail * tail_valid).sum(1) / tail_valid.sum(1).clamp_min(1.0)
 
         # ---- çözücü (kare başına; Mod A'da yalnızca hedef kare) ----
         if target is not None:
@@ -350,4 +371,4 @@ class VideoMamba(nn.Module):
         rgb = (base + out[:, :, :3]).clamp(0.0, 1.0)
         log_b = out[:, :, 3:4].float().clamp(-7.0, 2.0)
         confidence = torch.exp(-torch.exp(log_b) / CONFIDENCE_SCALE)
-        return {"rgb": rgb, "log_b": log_b, "confidence": confidence}
+        return {"rgb": rgb, "log_b": log_b, "confidence": confidence, "context_state": next_state}
