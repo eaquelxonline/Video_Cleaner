@@ -55,7 +55,9 @@ class EncoderCalibrationTest {
                         "modes=${modes.ifEmpty { "-" }} quality=${enc.qualityRange} complexity=${enc.complexityRange} " +
                         "bitrate=${video?.bitrateRange} qpBounds=$qpBounds intraRefresh=${caps.isFeatureSupported(MediaCodecInfo.CodecCapabilities.FEATURE_IntraRefresh)} " +
                         "1080p30=${video?.areSizeAndRateSupported(1920, 1080, 30.0)} 1080p60=${video?.areSizeAndRateSupported(1920, 1080, 60.0)} " +
-                        "maxInstances=${caps.maxSupportedInstances}",
+                        "widths=${video?.supportedWidths} heights=${video?.supportedHeights} align=${video?.widthAlignment}x${video?.heightAlignment} " +
+                        "sizeOk(640x360,1280x720,1920x1080,576x1024)=${listOf(640 to 360, 1280 to 720, 1920 to 1080, 576 to 1024).map { (w, h) -> video?.isSizeSupported(w, h) }} " +
+                        "profiles=${caps.profileLevels.joinToString(",") { "${it.profile}/${it.level}" }} maxInstances=${caps.maxSupportedInstances}",
                 )
             }
         }
@@ -70,6 +72,7 @@ class EncoderCalibrationTest {
         val mode: Int?,
         val cqFraction: Float? = null,
         val gopFromSource: Boolean = false,
+        val qpMax: Int? = null,
         val bitrate: (Clip) -> Long,
     )
 
@@ -85,26 +88,27 @@ class EncoderCalibrationTest {
     fun g_bitrateCalibration() {
         assumeTrue("yalnızca calibrate=true ile", InstrumentationRegistry.getArguments().getString("calibrate") == "true")
         val vbr = EncoderCapabilities.BITRATE_MODE_VBR
+        val cqMode = EncoderCapabilities.BITRATE_MODE_CQ
+        // 2. tur: 1. turda kaynağın anahtar kare aralığını kullanmak aynı boyutta belirgin kalite kazandırdı;
+        // adaylar bunu temel alır (_g). QP üst sınırı yalnızca "qp-bounds" destekleyen kodlayıcılarda koşar.
         val candidates = listOf(
-            // Bugünkü sistem: kapsayıcı beyanı ×1.25 ile 0.14 bpppf tabanının büyüğü, mod verilmez.
             Candidate("avc_legacy", false, null) { c -> maxOf(c.declaredBps * 5L / 4, c.bpppf(0.14)) },
-            Candidate("avc_f050", false, vbr) { c -> maxOf(c.videoBps, c.bpppf(0.05)) },
-            Candidate("avc_f060", false, vbr) { c -> maxOf(c.videoBps, c.bpppf(0.06)) },
-            Candidate("avc_f070", false, vbr) { c -> maxOf(c.videoBps, c.bpppf(0.07)) },
-            Candidate("avc_s100", false, vbr) { c -> c.videoBps },
-            Candidate("avc_s125", false, vbr) { c -> c.videoBps * 5 / 4 },
-            Candidate("avc_s150", false, vbr) { c -> c.videoBps * 3 / 2 },
-            Candidate("avc_s200", false, vbr) { c -> c.videoBps * 2 },
-            Candidate("avc_s100_gopsrc", false, vbr, gopFromSource = true) { c -> c.videoBps },
+            Candidate("avc_s100_g", false, vbr, gopFromSource = true) { c -> c.videoBps },
+            Candidate("avc_s125_g", false, vbr, gopFromSource = true) { c -> c.videoBps * 5 / 4 },
+            Candidate("avc_s150_g", false, vbr, gopFromSource = true) { c -> c.videoBps * 3 / 2 },
+            Candidate("avc_s200_g", false, vbr, gopFromSource = true) { c -> c.videoBps * 2 },
+            Candidate("avc_s100_g_qp38", false, vbr, gopFromSource = true, qpMax = 38) { c -> c.videoBps },
+            Candidate("avc_s100_g_qp34", false, vbr, gopFromSource = true, qpMax = 34) { c -> c.videoBps },
+            Candidate("avc_s100_g_qp30", false, vbr, gopFromSource = true, qpMax = 30) { c -> c.videoBps },
             Candidate("hevc_legacy", true, null) { c -> maxOf(c.declaredBps * 5L / 4, c.bpppf(0.14)) },
-            Candidate("hevc_s100", true, vbr) { c -> c.videoBps },
-            Candidate("hevc_s085", true, vbr) { c -> c.videoBps * 85 / 100 },
-            Candidate("hevc_s070", true, vbr) { c -> c.videoBps * 70 / 100 },
-            Candidate("hevc_s055", true, vbr) { c -> c.videoBps * 55 / 100 },
-            Candidate("hevc_cq50", true, EncoderCapabilities.BITRATE_MODE_CQ, cqFraction = 0.5f) { c -> c.videoBps },
-            Candidate("hevc_cq70", true, EncoderCapabilities.BITRATE_MODE_CQ, cqFraction = 0.7f) { c -> c.videoBps },
-            Candidate("hevc_cq90", true, EncoderCapabilities.BITRATE_MODE_CQ, cqFraction = 0.9f) { c -> c.videoBps },
-            Candidate("avc_cq70", false, EncoderCapabilities.BITRATE_MODE_CQ, cqFraction = 0.7f) { c -> c.videoBps },
+            Candidate("hevc_s050_g", true, vbr, gopFromSource = true) { c -> c.videoBps / 2 },
+            Candidate("hevc_s070_g", true, vbr, gopFromSource = true) { c -> c.videoBps * 70 / 100 },
+            Candidate("hevc_s085_g", true, vbr, gopFromSource = true) { c -> c.videoBps * 85 / 100 },
+            Candidate("hevc_s100_g", true, vbr, gopFromSource = true) { c -> c.videoBps },
+            Candidate("hevc_s150_g", true, vbr, gopFromSource = true) { c -> c.videoBps * 3 / 2 },
+            Candidate("hevc_cq50_g", true, cqMode, cqFraction = 0.5f, gopFromSource = true) { c -> c.videoBps },
+            Candidate("hevc_cq70_g", true, cqMode, cqFraction = 0.7f, gopFromSource = true) { c -> c.videoBps },
+            Candidate("hevc_cq90_g", true, cqMode, cqFraction = 0.9f, gopFromSource = true) { c -> c.videoBps },
         )
         val only = InstrumentationRegistry.getArguments().getString("calibrateClips")?.split(',')?.toSet()
         val names = testAssets.list("calib")!!.sorted().filter { only == null || it.substringBefore('.') in only }
@@ -119,16 +123,16 @@ class EncoderCalibrationTest {
                 val mime = if (candidate.hevc) MediaFormat.MIMETYPE_VIDEO_HEVC else MediaFormat.MIMETYPE_VIDEO_AVC
                 // VBR desteklenmiyorsa kodlayıcının varsayılan moduna düşülür (sonuç satırında mode=varsayılan görünür).
                 val mode = if (candidate.mode == vbr && modeSupport(mime, vbr, clip.width, clip.height) == null) null else candidate.mode
-                val supported = modeSupport(mime, mode, clip.width, clip.height)
+                val supported = modeSupport(mime, mode, clip.width, clip.height, candidate.qpMax != null)
                 if (supported == null) {
-                    Log.i(CAL, "RESULT clip=${clip.name} cand=${candidate.id} status=UNSUPPORTED")
+                    Log.i(CAL, "RESULT clip=${clip.name} cand=${candidate.id} status=UNSUPPORTED reason=\"${unsupportedReason(mime, mode, clip.width, clip.height, candidate.qpMax != null)}\"")
                     continue
                 }
                 val cq = candidate.cqFraction?.let { f -> supported.lower + ((supported.upper - supported.lower) * f).toInt() }
                 val gop = if (candidate.gopFromSource) clip.avgGopSec.coerceIn(1.0, 10.0).toFloat() else 1f
                 val tuning = EncoderTuning(
                     bitrateBps = candidate.bitrate(clip).coerceIn(64_000L, Int.MAX_VALUE.toLong()).toInt(),
-                    bitrateMode = mode, cqQuality = cq, iFrameIntervalSec = gop,
+                    bitrateMode = mode, cqQuality = cq, iFrameIntervalSec = gop, qpMax = candidate.qpMax,
                 )
                 val output = File(app.cacheDir, "${clip.name}__${candidate.id}.mp4")
                 output.delete()
@@ -139,7 +143,7 @@ class EncoderCalibrationTest {
                     Log.i(
                         CAL,
                         "RESULT clip=${clip.name} cand=${candidate.id} status=OK encoder=${result.encoderName} mime=${result.outputMime} " +
-                            "mode=${s.bitrateMode} cq=${s.cqQuality} targetBps=${s.bitrateBps} gopSec=${s.iFrameIntervalSec} " +
+                            "mode=${s.bitrateMode} cq=${s.cqQuality} qpMax=${s.qpMax} targetBps=${s.bitrateBps} gopSec=${s.iFrameIntervalSec} " +
                             "outVideoBps=${out?.videoBitsPerSecond ?: 0} outBytes=${output.length()} srcBytes=${clip.file.length()} " +
                             "frames=${result.framesDecoded}/${result.framesEncoded} outSamples=${out?.samples ?: 0} outSync=${out?.syncSamples ?: 0} " +
                             "ms=${result.elapsedMs} size=${result.width}x${result.height} audio=\"${result.audio}\"",
@@ -156,17 +160,26 @@ class EncoderCalibrationTest {
     }
 
     /** İlk uygun kodlayıcının bu modu destekleyip desteklemediği; destekliyorsa kalite aralığı (CQ için). */
-    private fun modeSupport(mime: String, mode: Int?, width: Int, height: Int): android.util.Range<Int>? {
+    private fun modeSupport(mime: String, mode: Int?, width: Int, height: Int, needQp: Boolean = false): android.util.Range<Int>? {
         for (info in MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos) {
             if (!info.isEncoder) continue
             val type = info.supportedTypes.firstOrNull { it.equals(mime, ignoreCase = true) } ?: continue
             val caps = runCatching { info.getCapabilitiesForType(type) }.getOrNull() ?: continue
             if (caps.videoCapabilities?.isSizeSupported(width, height) != true) continue
+            if (needQp && (Build.VERSION.SDK_INT < 31 || !caps.isFeatureSupported("qp-bounds"))) continue
             val enc = caps.encoderCapabilities ?: continue
             if (mode == null || enc.isBitrateModeSupported(mode)) return enc.qualityRange
         }
         return null
     }
+
+    private fun unsupportedReason(mime: String, mode: Int?, width: Int, height: Int, needQp: Boolean): String =
+        MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.filter { it.isEncoder && it.supportedTypes.any { t -> t.equals(mime, ignoreCase = true) } }.joinToString("; ") { info ->
+            val caps = runCatching { info.getCapabilitiesForType(mime) }.getOrNull()
+            val v = caps?.videoCapabilities
+            "${info.name}: size=${v?.isSizeSupported(width, height)} w=${v?.supportedWidths} h=${v?.supportedHeights} hFor$width=${runCatching { v?.getSupportedHeightsFor(width) }.getOrNull()} " +
+                "mode=${mode?.let { caps?.encoderCapabilities?.isBitrateModeSupported(it) }} qp=${if (needQp) Build.VERSION.SDK_INT >= 31 && caps?.isFeatureSupported("qp-bounds") == true else "-"}"
+        }.ifEmpty { "bu türde kodlayıcı yok" }
 
     private fun loadClip(name: String): Clip {
         val file = File(app.cacheDir, "calib_$name")

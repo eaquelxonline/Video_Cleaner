@@ -87,7 +87,7 @@ def video_info(path):
 
 def psnr_ssim(ref, dist):
     proc = subprocess.run(
-        ["ffmpeg", "-hide_banner", "-nostats", "-i", dist, "-i", ref, "-lavfi", "[0:v]setpts=N[d];[1:v]setpts=N[r];[d][r]psnr;[0:v]setpts=N[d2];[1:v]setpts=N[r2];[d2][r2]ssim", "-f", "null", "-"],
+        ["ffmpeg", "-hide_banner", "-nostats", "-i", dist, "-i", ref, "-lavfi", "[0:v]split[d1][d2];[1:v]split[r1][r2];[d1][r1]psnr;[d2][r2]ssim", "-f", "null", "-"],
         capture_output=True, text=True,
     )
     psnr = re.search(r"PSNR y:([\d.]+|inf)", proc.stderr)
@@ -125,7 +125,7 @@ def main():
     rows, src_cache = [], {}
     for r in results:
         if r.get("status") != "OK":
-            rows.append({"clip": r["clip"], "cand": r["cand"], "status": r.get("status"), "error": r.get("error", "")})
+            rows.append({"clip": r["clip"], "cand": r["cand"], "status": r.get("status"), "error": r.get("error", "") or r.get("reason", "")})
             continue
         clip, cand = r["clip"], r["cand"]
         src = os.path.join(args.sources, clip + ".mp4")
@@ -145,7 +145,7 @@ def main():
         psnr, ssim = psnr_ssim(src, out)
         vmaf = vmaf_score(args.vmaf, src, out, args.threads)
         rows.append({
-            "clip": clip, "cand": cand, "status": "OK", "encoder": r.get("encoder"), "mode": r.get("mode"), "cq": r.get("cq"),
+            "clip": clip, "cand": cand, "status": "OK", "encoder": r.get("encoder"), "mode": r.get("mode"), "cq": r.get("cq"), "qp_max": r.get("qpMax", "-1"),
             "target_kbps": int(r.get("targetBps", 0)) // 1000, "gop_s": r.get("gopSec"), "encode_ms": int(r.get("ms", 0)),
             "src_bytes": s["bytes"], "out_bytes": o["bytes"], "size_ratio": round(o["bytes"] / s["bytes"], 3),
             "src_vkbps": s["vbps"] // 1000, "out_vkbps": vbps // 1000, "vbitrate_ratio": round(vbps / s["vbps"], 3) if s["vbps"] else 0,

@@ -448,6 +448,8 @@ data class EncoderTuning(
     val bitrateMode: Int? = null,
     val cqQuality: Int? = null,
     val iFrameIntervalSec: Float? = null,
+    /** QP üst sınırı; yalnızca kodlayıcı "qp-bounds" özelliğini destekliyorsa uygulanır (API 31+). */
+    val qpMax: Int? = null,
 )
 
 /** Kaynak video akışının örnek tablosundan ölçülen gerçek değerleri (kapsayıcının beyan ettiği değil). */
@@ -860,8 +862,15 @@ class VideoJob(
                 format.setFloat(MediaFormat.KEY_FRAME_RATE, rate)
                 val gop = tuning?.iFrameIntervalSec ?: 1f
                 format.setFloat(MediaFormat.KEY_I_FRAME_INTERVAL, gop)
+                var qpMax = -1
+                val wantedQpMax = tuning?.qpMax
+                if (wantedQpMax != null) {
+                    if (Build.VERSION.SDK_INT < 31 || !caps.isFeatureSupported(FEATURE_QP_BOUNDS)) continue
+                    format.setInteger(KEY_VIDEO_QP_MAX, wantedQpMax)
+                    qpMax = wantedQpMax
+                }
                 val settings = EncoderSettings(
-                    bitrateBps = bitrate, bitrateMode = modeLabel, cqQuality = cq, iFrameIntervalSec = gop, frameRate = rate,
+                    bitrateBps = bitrate, bitrateMode = modeLabel, cqQuality = cq, qpMax = qpMax, iFrameIntervalSec = gop, frameRate = rate,
                     reason = if (tuning?.bitrateBps != null) "elle (kalibrasyon)" else "eski: max(beyan×1.25, 0.14 bpppf)×${options.quality}",
                 )
                 if (color != null) {
@@ -1215,6 +1224,10 @@ class VideoJob(
     companion object {
         private const val CODEC_TIMEOUT_US = 10_000L
         private const val MAX_DECODER_ATTEMPTS = 4
+
+        /** MediaCodecInfo.CodecCapabilities.FEATURE_QpBounds ve MediaFormat.KEY_VIDEO_QP_MAX (API 31). */
+        const val FEATURE_QP_BOUNDS = "qp-bounds"
+        const val KEY_VIDEO_QP_MAX = "video-qp-max"
 
         fun bitrateModeName(mode: Int): String = when (mode) {
             MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CQ -> "CQ"
