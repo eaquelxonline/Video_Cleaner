@@ -9,6 +9,9 @@
 #   Secrets → GCP_SA_KEY      : Test Lab yetkili hizmet hesabının JSON anahtarı
 #   Variables → GCP_PROJECT_ID: Firebase/Google Cloud proje kimliği
 # Sır yoksa iş "atlandı" olarak biter; diğer iş akışlarını etkilemez.
+#
+# Yalnızca elle çalışır (Actions → Run workflow): Spark planında günde 5 fiziksel cihaz testi hakkı var ve
+# her cihaz bir test sayılır; her push'ta çalışması kotayı tüketirdi.
 
 name: Video Cleaner Real Device Test
 
@@ -23,12 +26,6 @@ on:
         description: "Otomatik seçimde en fazla cihaz (Spark planı: günde 5 fiziksel test)"
         required: false
         default: "3"
-  pull_request:
-    paths:
-      - 'Kotlin/**'
-      - 'AndroidTest/**'
-      - '.github/workflows/firebase-device-test.yml'
-      - '.github/scripts/**'
 
 concurrency:
   group: firebase-device-test-${{ github.ref }}
