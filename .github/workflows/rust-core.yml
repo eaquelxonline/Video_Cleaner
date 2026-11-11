@@ -32,8 +32,13 @@ jobs:
 
       - name: Install QEMU and ARM64 cross linker
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq qemu-user gcc-aarch64-linux-gnu libc6-dev-arm64-cross > /dev/null
+          # Paket sunucusuna geçici erişim hatalarına (DNS) karşı 3 deneme.
+          for attempt in 1 2 3; do
+            sudo apt-get update -qq && sudo apt-get install -y -qq --fix-missing qemu-user gcc-aarch64-linux-gnu libc6-dev-arm64-cross > /dev/null && exit 0
+            echo "apt denemesi $attempt başarısız; 20 sn sonra yeniden"
+            sleep 20
+          done
+          exit 1
 
       - name: rustfmt
         run: cargo fmt --check
