@@ -267,7 +267,13 @@ class VideoPipelineTest {
         val format = extractor.getTrackFormat(index)
         extractor.selectTrack(index)
         format.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible)
-        val codec = MediaCodec.createDecoderByType(format.getString(MediaFormat.KEY_MIME)!!)
+        // Referans yol: tekrarlanabilir olsun diye varsa yazılım çözücü (donanım çözücüleri cihazdan cihaza değişir;
+        // API 37 emülatöründe c2.goldfish çözücüsü stop() sırasında CodecException veriyor).
+        val mime = format.getString(MediaFormat.KEY_MIME)!!
+        val software = MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.firstOrNull { info ->
+            !info.isEncoder && !info.isAlias && info.isSoftwareOnly && info.supportedTypes.any { it.equals(mime, ignoreCase = true) }
+        }
+        val codec = if (software != null) MediaCodec.createByCodecName(software.name) else MediaCodec.createDecoderByType(mime)
         codec.configure(format, null, null, 0)
         codec.start()
         val frames = ArrayList<Planes>()
