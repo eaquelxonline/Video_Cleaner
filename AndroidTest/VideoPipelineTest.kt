@@ -172,6 +172,26 @@ class VideoPipelineTest {
         }
     }
 
+    private fun averageFps(times: List<Long>): Double =
+        if (times.size > 1 && times.last() > times.first()) (times.size - 1) * 1_000_000.0 / (times.last() - times.first()) else 0.0
+
+    private fun videoBytes(file: File): Long {
+        val extractor = MediaExtractor()
+        try {
+            extractor.setDataSource(file.path)
+            val index = (0 until extractor.trackCount).firstOrNull { extractor.getTrackFormat(it).getString(MediaFormat.KEY_MIME)?.startsWith("video/") == true } ?: return 0
+            extractor.selectTrack(index)
+            var bytes = 0L
+            while (extractor.sampleTrackIndex >= 0) {
+                bytes += extractor.sampleSize.coerceAtLeast(0)
+                if (!extractor.advance()) break
+            }
+            return bytes
+        } finally {
+            extractor.release()
+        }
+    }
+
     private fun canDecode(format: MediaFormat): Boolean {
         val probe = MediaFormat(format)
         probe.setString(MediaFormat.KEY_FRAME_RATE, null)     // findDecoderForFormat kare hızı ister-istemez
@@ -233,6 +253,30 @@ class VideoPipelineTest {
                         if (worst > 1000) problems += "zaman damgası sapması $worst µs"
                     }
                     if (sourceAudio != null && audio == null) problems += "ses kayboldu (${sourceAudio.mime}): ${result.audio}"
+                    // Kaynağın kare hızı, çözünürlüğü ve yönü korunmalı (tek sayılı boyutta yalnızca son satır/sütun kırpılır).
+                    val srcW = source.format.getInteger(MediaFormat.KEY_WIDTH)
+                    val srcH = source.format.getInteger(MediaFormat.KEY_HEIGHT)
+                    if (result.width != (srcW and 1.inv()) || result.height != (srcH and 1.inv())) problems += "çözünürlük değişti: ${srcW}x$srcH → ${result.width}x${result.height}"
+                    val srcFps = averageFps(source.times)
+                    val outFps = averageFps(video.times)
+                    if (srcFps > 0 && abs(outFps - srcFps) / srcFps > 0.005) problems += "kare hızı değişti: ${"%.3f".format(srcFps)} → ${"%.3f".format(outFps)}"
+                    val srcRot = if (source.format.containsKey(MediaFormat.KEY_ROTATION)) source.format.getInteger(MediaFormat.KEY_ROTATION) else 0
+                    val outRot = if (video.format.containsKey(MediaFormat.KEY_ROTATION)) video.format.getInteger(MediaFormat.KEY_ROTATION) else 0
+                    if (srcRot != outRot) problems += "yön değişti: $srcRot → $outRot"
+                    // Bit hızı: kodlayıcıya İSTENEN hedef sınırlanır (politika). Çıktının gerçek boyutu kodlayıcıya göre
+                    // değişir (bazı yazılım/donanım kodlayıcıları alt sınır uygular); o yalnızca raporlanır.
+                    val srcVideoBps = result.sourceVideo?.videoBitsPerSecond ?: 0L
+                    val requested = result.encoderSettings.bitrateBps.toLong()
+                    if (srcVideoBps > 0 && requested > maxOf((srcVideoBps * BitratePolicy.STANDARD_SOURCE_FACTOR).toLong(), BitratePolicy.MIN_BITRATE) + 1) {
+                        problems += "Standart hedef kaynağın ${BitratePolicy.STANDARD_SOURCE_FACTOR} katını aşıyor: $requested > $srcVideoBps×${BitratePolicy.STANDARD_SOURCE_FACTOR}"
+                    }
+                    val outVideoBytes = videoBytes(output)
+                    val outVideoBps = if (video.times.size > 1) outVideoBytes * 8_000_000L * (video.times.size - 1) / video.times.size / maxOf(1L, video.times.last() - video.times.first()) else 0L
+                    log(
+                        "BITRATE name=$name srcVideoBps=$srcVideoBps declared=${result.sourceDeclaredBitrate} requested=$requested mode=${result.encoderSettings.bitrateMode} " +
+                            "gop=${result.encoderSettings.iFrameIntervalSec} outVideoBps=$outVideoBps ratio=${if (srcVideoBps > 0) "%.2f".format(outVideoBps.toDouble() / srcVideoBps) else "-"} " +
+                            "fps=${"%.3f".format(srcFps)}→${"%.3f".format(outFps)} reason=\"${result.encoderSettings.reason}\"",
+                    )
                     log(
                         "VIDEO name=$name status=${if (problems.isEmpty()) "PASS" else "FAIL"} source=${source.mime} " +
                             "size=${result.width}x${result.height} decoded=${result.framesDecoded} encoded=${result.framesEncoded} " +

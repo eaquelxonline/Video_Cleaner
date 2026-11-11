@@ -73,6 +73,8 @@ class EncoderCalibrationTest {
         val cqFraction: Float? = null,
         val gopFromSource: Boolean = false,
         val qpMax: Int? = null,
+        /** Doluysa ayar verilmez; üretimdeki BitratePolicy bu kalite ayarıyla çalışır. */
+        val policyQuality: Float? = null,
         val bitrate: (Clip) -> Long,
     )
 
@@ -88,27 +90,16 @@ class EncoderCalibrationTest {
     fun g_bitrateCalibration() {
         assumeTrue("yalnızca calibrate=true ile", InstrumentationRegistry.getArguments().getString("calibrate") == "true")
         val vbr = EncoderCapabilities.BITRATE_MODE_VBR
-        val cqMode = EncoderCapabilities.BITRATE_MODE_CQ
-        // 2. tur: 1. turda kaynağın anahtar kare aralığını kullanmak aynı boyutta belirgin kalite kazandırdı;
-        // adaylar bunu temel alır (_g). QP üst sınırı yalnızca "qp-bounds" destekleyen kodlayıcılarda koşar.
+        // 3. tur: üretim politikası (policy_*) eski kurala karşı; çapraz kodek kaynaklar (c12 HEVC, c13 HEVC,
+        // c14 VP9 → H.264) için kaynak katı taraması. 1-2. turlarda HEVC kodlayıcı emülatörde ≤512 px olduğundan,
+        // CQ AVC'de olmadığından ve QP sınırı ölçülebilir fark yaratmadığından bu adaylar çıkarıldı.
         val candidates = listOf(
             Candidate("avc_legacy", false, null) { c -> maxOf(c.declaredBps * 5L / 4, c.bpppf(0.14)) },
-            Candidate("avc_s100_g", false, vbr, gopFromSource = true) { c -> c.videoBps },
-            Candidate("avc_s125_g", false, vbr, gopFromSource = true) { c -> c.videoBps * 5 / 4 },
+            Candidate("policy_std", false, null, policyQuality = 1f) { 0 },
+            Candidate("policy_high", false, null, policyQuality = 2f) { 0 },
             Candidate("avc_s150_g", false, vbr, gopFromSource = true) { c -> c.videoBps * 3 / 2 },
             Candidate("avc_s200_g", false, vbr, gopFromSource = true) { c -> c.videoBps * 2 },
-            Candidate("avc_s100_g_qp38", false, vbr, gopFromSource = true, qpMax = 38) { c -> c.videoBps },
-            Candidate("avc_s100_g_qp34", false, vbr, gopFromSource = true, qpMax = 34) { c -> c.videoBps },
-            Candidate("avc_s100_g_qp30", false, vbr, gopFromSource = true, qpMax = 30) { c -> c.videoBps },
-            Candidate("hevc_legacy", true, null) { c -> maxOf(c.declaredBps * 5L / 4, c.bpppf(0.14)) },
-            Candidate("hevc_s050_g", true, vbr, gopFromSource = true) { c -> c.videoBps / 2 },
-            Candidate("hevc_s070_g", true, vbr, gopFromSource = true) { c -> c.videoBps * 70 / 100 },
-            Candidate("hevc_s085_g", true, vbr, gopFromSource = true) { c -> c.videoBps * 85 / 100 },
-            Candidate("hevc_s100_g", true, vbr, gopFromSource = true) { c -> c.videoBps },
-            Candidate("hevc_s150_g", true, vbr, gopFromSource = true) { c -> c.videoBps * 3 / 2 },
-            Candidate("hevc_cq50_g", true, cqMode, cqFraction = 0.5f, gopFromSource = true) { c -> c.videoBps },
-            Candidate("hevc_cq70_g", true, cqMode, cqFraction = 0.7f, gopFromSource = true) { c -> c.videoBps },
-            Candidate("hevc_cq90_g", true, cqMode, cqFraction = 0.9f, gopFromSource = true) { c -> c.videoBps },
+            Candidate("avc_s300_g", false, vbr, gopFromSource = true) { c -> c.videoBps * 3 },
         )
         val only = InstrumentationRegistry.getArguments().getString("calibrateClips")?.split(',')?.toSet()
         val names = testAssets.list("calib")!!.sorted().filter { only == null || it.substringBefore('.') in only }
@@ -137,7 +128,9 @@ class EncoderCalibrationTest {
                 val output = File(app.cacheDir, "${clip.name}__${candidate.id}.mp4")
                 output.delete()
                 try {
-                    val result = VideoJob(app, Uri.fromFile(clip.file), Uri.fromFile(output), JobOptions(preferHevc = candidate.hevc, tuning = tuning)).run()
+                    val options = candidate.policyQuality?.let { JobOptions(preferHevc = candidate.hevc, quality = it) }
+                        ?: JobOptions(preferHevc = candidate.hevc, tuning = tuning)
+                    val result = VideoJob(app, Uri.fromFile(clip.file), Uri.fromFile(output), options).run()
                     val out = measure(output)
                     val s = result.encoderSettings
                     Log.i(
@@ -145,7 +138,7 @@ class EncoderCalibrationTest {
                         "RESULT clip=${clip.name} cand=${candidate.id} status=OK encoder=${result.encoderName} mime=${result.outputMime} " +
                             "mode=${s.bitrateMode} cq=${s.cqQuality} qpMax=${s.qpMax} targetBps=${s.bitrateBps} gopSec=${s.iFrameIntervalSec} " +
                             "outVideoBps=${out?.videoBitsPerSecond ?: 0} outBytes=${output.length()} srcBytes=${clip.file.length()} " +
-                            "frames=${result.framesDecoded}/${result.framesEncoded} outSamples=${out?.samples ?: 0} outSync=${out?.syncSamples ?: 0} " +
+                            "frames=${result.framesDecoded}/${result.framesEncoded} outSamples=${out?.samples ?: 0} outSync=${out?.syncSamples ?: 0} reason=\"${s.reason}\" " +
                             "ms=${result.elapsedMs} size=${result.width}x${result.height} audio=\"${result.audio}\"",
                     )
                     publish(output, output.name)

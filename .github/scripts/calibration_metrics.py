@@ -128,7 +128,7 @@ def main():
             rows.append({"clip": r["clip"], "cand": r["cand"], "status": r.get("status"), "error": r.get("error", "") or r.get("reason", "")})
             continue
         clip, cand = r["clip"], r["cand"]
-        src = os.path.join(args.sources, clip + ".mp4")
+        src = next((os.path.join(args.sources, f) for f in sorted(os.listdir(args.sources)) if f.rsplit(".", 1)[0] == clip), os.path.join(args.sources, clip + ".mp4"))
         out = os.path.join(args.outputs, f"{clip}__{cand}.mp4")
         if not os.path.exists(out):
             rows.append({"clip": clip, "cand": cand, "status": "MISSING"})
