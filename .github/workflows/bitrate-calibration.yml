@@ -12,13 +12,8 @@ name: Video Cleaner Bitrate Calibration
 
 on:
   workflow_dispatch:
-  pull_request:
-    # Uzun sürer (≈ 1 saat): yalnızca kalibrasyonun kendi dosyaları değişince; gerisi için elle çalıştırın.
-    paths:
-      - 'AndroidTest/EncoderCalibrationTest.kt'
-      - 'AndroidTest/assets/calib/**'
-      - '.github/workflows/bitrate-calibration.yml'
-      - '.github/scripts/calibration_metrics.py'
+  # Uzun sürer (≈ 1 saat) ve PR yol filtresi bütün PR farkına bakar (her push'ta tetiklenirdi):
+  # yalnızca elle çalıştırılır (Actions → Run workflow).
 
 concurrency:
   group: bitrate-calibration-${{ github.ref }}
