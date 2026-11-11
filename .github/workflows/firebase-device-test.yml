@@ -7,8 +7,8 @@
 #
 # Gerekenler (bir kez, depo ayarlarında):
 #   Secrets → GCP_SA_KEY      : Test Lab yetkili hizmet hesabının JSON anahtarı
-#   Variables → GCP_PROJECT_ID: Firebase/Google Cloud proje kimliği
-# Sır yoksa iş "atlandı" olarak biter; diğer iş akışlarını etkilemez.
+#   Variables → GCP_PROJECT_ID: Firebase/Google Cloud proje kimliği (isteğe bağlı; yoksa JSON'daki project_id)
+# Sır yoksa iş "atlandı" olarak biter (özet hangi adın görünmediğini yazar); diğer iş akışlarını etkilemez.
 #
 # Yalnızca elle çalışır (Actions → Run workflow): Spark planında günde 5 fiziksel cihaz testi hakkı var ve
 # her cihaz bir test sayılır; her push'ta çalışması kotayı tüketirdi.
@@ -38,14 +38,29 @@ jobs:
     timeout-minutes: 120
     env:
       HAS_KEY: ${{ secrets.GCP_SA_KEY != '' }}
+      HAS_PROJECT_VAR: ${{ vars.GCP_PROJECT_ID != '' }}
+      HAS_PROJECT_SECRET: ${{ secrets.GCP_PROJECT_ID != '' }}
     steps:
       - name: Check credentials
         id: creds
         run: |
-          if [ "$HAS_KEY" != "true" ] || [ -z "${{ vars.GCP_PROJECT_ID }}" ]; then
+          # Değerler yazdırılmaz; yalnızca tanımlı olup olmadıkları raporlanır.
+          echo "GCP_SA_KEY sırrı: $HAS_KEY · GCP_PROJECT_ID değişkeni: $HAS_PROJECT_VAR · GCP_PROJECT_ID sırrı: $HAS_PROJECT_SECRET"
+          if [ "$HAS_KEY" != "true" ]; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "## Gerçek cihaz testi atlandı" >> "$GITHUB_STEP_SUMMARY"
-            echo "GCP_SA_KEY sırrı veya GCP_PROJECT_ID değişkeni tanımlı değil (README: firebase-device-test.yml başı)." >> "$GITHUB_STEP_SUMMARY"
+            {
+              echo "## Gerçek cihaz testi atlandı"
+              echo "Bu iş akışı **GCP_SA_KEY** adlı depo sırrını göremiyor (Settings → Secrets and variables → Actions → **Repository secrets**)."
+              echo "Ortam (Environment) sırrı, Codespaces veya Dependabot sırrı olarak eklenen anahtar buradan görünmez."
+              echo
+              echo "| ad | tanımlı mı |"
+              echo "|---|---|"
+              echo "| GCP_SA_KEY (secret) | $HAS_KEY |"
+              echo "| GCP_PROJECT_ID (variable) | $HAS_PROJECT_VAR |"
+              echo "| GCP_PROJECT_ID (secret) | $HAS_PROJECT_SECRET |"
+              echo
+              echo "Proje kimliği zorunlu değildir: verilmezse JSON anahtarındaki project_id kullanılır."
+            } >> "$GITHUB_STEP_SUMMARY"
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
@@ -99,6 +114,7 @@ jobs:
 
       - name: Authenticate to Google Cloud
         if: steps.creds.outputs.skip == 'false'
+        id: auth
         uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
@@ -110,7 +126,11 @@ jobs:
       - name: Pick physical devices
         if: steps.creds.outputs.skip == 'false'
         run: |
-          gcloud config set project "${{ vars.GCP_PROJECT_ID }}"
+          project="${{ vars.GCP_PROJECT_ID }}"
+          [ -n "$project" ] || project="${{ secrets.GCP_PROJECT_ID }}"
+          [ -n "$project" ] || project="${{ steps.auth.outputs.project_id }}"
+          [ -n "$project" ] || { echo "::error::Proje kimliği bulunamadı (değişken, sır veya JSON anahtarı)"; exit 1; }
+          gcloud config set project "$project"
           if [ -n "${{ inputs.devices }}" ]; then
             echo "${{ inputs.devices }}" | tr ';' '\n' | sed 's/^/--device=/' > devices.txt
           else
