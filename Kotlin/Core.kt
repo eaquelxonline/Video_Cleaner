@@ -496,6 +496,15 @@ private interface AudioPath {
     fun release()
 }
 
+/**
+ * Çoklayıcıya gidecek ses zaman damgası: negatif değerler (ön dolgu) 0'a çekilir ve damgalar
+ * kesin artan tutulur. MPEG4Writer negatif veya geri giden ses damgasında izi sessizce boş bırakır.
+ */
+internal fun monotonicAudioPts(timeUs: Long, lastPtsUs: Long): Long {
+    val clamped = max(timeUs, 0L)
+    return if (lastPtsUs == Long.MIN_VALUE) clamped else max(clamped, lastPtsUs + 1)
+}
+
 /** MP4'ün doğrudan taşıyabildiği ses (AAC, AMR): örnekler yeniden kodlanmadan kopyalanır. */
 private class AudioCopy(private val extractor: MediaExtractor, override val trackFormat: MediaFormat) : AudioPath {
     override val label = "yeniden kodlanmadan kopyalandı"
@@ -503,14 +512,17 @@ private class AudioCopy(private val extractor: MediaExtractor, override val trac
         private set
     private val info = MediaCodec.BufferInfo()
     private val buffer: ByteBuffer = ByteBuffer.allocateDirect(max(trackFormat.intOr(MediaFormat.KEY_MAX_INPUT_SIZE, 0), 1 shl 20))
+    private var lastPtsUs = Long.MIN_VALUE
 
     override fun pump(muxer: MediaMuxer, track: Int, untilUs: Long) {
         while (!finished) {
-            val time = extractor.sampleTime
-            if (time < 0) {
+            // Akış sonu sampleTrackIndex ile anlaşılır: MP4'te AAC/MP3/Opus ön dolgu (priming) paketleri
+            // edit list yüzünden NEGATİF zaman damgası taşır (ör. −21 333 µs); sampleTime < 0 akış sonu değildir.
+            if (extractor.sampleTrackIndex < 0) {
                 finished = true
                 break
             }
+            val time = extractor.sampleTime
             if (time > untilUs) break
             val size = extractor.readSampleData(buffer, 0)
             if (size < 0) {
@@ -518,7 +530,11 @@ private class AudioCopy(private val extractor: MediaExtractor, override val trac
                 break
             }
             val key = if (extractor.sampleFlags and MediaExtractor.SAMPLE_FLAG_SYNC != 0) MediaCodec.BUFFER_FLAG_KEY_FRAME else 0
-            info.set(0, size, time, key)
+            val pts = monotonicAudioPts(time, lastPtsUs)
+            lastPtsUs = pts
+            buffer.position(0)
+            buffer.limit(size)
+            info.set(0, size, pts, key)
             muxer.writeSampleData(track, buffer, info)
             extractor.advance()
         }
@@ -605,7 +621,8 @@ private class AudioTranscode(private val extractor: MediaExtractor, source: Medi
                     decoder.queueInputBuffer(index, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
                     inputDone = true
                 } else {
-                    decoder.queueInputBuffer(index, 0, size, extractor.sampleTime, 0)
+                    // Ön dolgu paketlerinin negatif damgası çözücüye 0 olarak verilir.
+                    decoder.queueInputBuffer(index, 0, size, max(extractor.sampleTime, 0L), 0)
                     extractor.advance()
                 }
             }
@@ -667,7 +684,7 @@ private class AudioTranscode(private val extractor: MediaExtractor, source: Medi
                 val data = enc.getOutputBuffer(index) ?: throw JobException("Ses kodlayıcı çıkışı alınamadı")
                 if (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG == 0 && info.size > 0) {
                     // Çoklayıcı kesin artan olmayan ses damgalarını reddeder.
-                    val pts = if (lastPtsUs == Long.MIN_VALUE) info.presentationTimeUs else max(info.presentationTimeUs, lastPtsUs + 1)
+                    val pts = monotonicAudioPts(info.presentationTimeUs, lastPtsUs)
                     val meta = MediaCodec.BufferInfo().apply { set(0, info.size, pts, info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) }
                     lastPtsUs = pts
                     data.position(info.offset)
