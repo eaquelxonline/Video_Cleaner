@@ -88,7 +88,8 @@ class VcCoreTest {
         decoder.start()
 
         val ctx = Core.vcInitEngine(Core.ENGINE_MODE_AUTO, false)
-        assertTrue("vcInitEngine: $ctx", ctx > 0)
+        // ARM64'te (TBI/MTE) yığın adreslerinin üst baytı etiketlidir: geçerli tutamak NEGATİF görünebilir.
+        assertTrue("vcInitEngine: $ctx", ctx !in -4096L..0L)
         val info = direct(Core.POLL_INFO_BYTES)
         val out = direct(w * h * 3 / 2)
         val meta = direct(Core.OUTPUT_META_BYTES)
@@ -189,6 +190,7 @@ class VcCoreTest {
         val frame = direct(w * h * 3 / 2)
         for (mode in listOf(Core.ENGINE_MODE_AUTO, Core.ENGINE_MODE_A)) {
             val ctx = Core.vcInitEngine(mode, true)
+            assertTrue("vcInitEngine: $ctx", ctx !in -4096L..0L)
             val info = direct(Core.POLL_INFO_BYTES)
             val out = direct(w * h * 3 / 2)
             val meta = direct(Core.OUTPUT_META_BYTES)

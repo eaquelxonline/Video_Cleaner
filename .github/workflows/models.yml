@@ -1,0 +1,50 @@
+# Video Cleaner — Python modelleri (VC-Detector / VC-Flow / VC-Mamba / VC-Core) ve VC-Trainer / VC-Tester.
+#
+# Eğitim YAPILMAZ (GPU ve veri gerekir). Kurulum denetimi çalışır: parametre bütçeleri, veri sözleşmesi,
+# bit-exact kapı, Mod A/B eşdeğerliği, ROI tüpü / akıllı bypass, bağlam köprüsü, geçerlilik maskeli
+# zamansal kayıp, her eğitim aşamasından birkaç adım ve VC-Tester kapı mantığı. Eğitilmemiş modelde
+# onarım/zamansal kapıların KALMASI beklenir; denetim yalnızca raporun üretildiğini doğrular.
+
+name: Video Cleaner Models
+
+on:
+  workflow_dispatch:
+  pull_request:
+
+concurrency:
+  group: models-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  selftest:
+    name: VC-Trainer kurulum denetimi (CPU)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install PyTorch (CPU), NumPy, Pillow
+        run: |
+          python -m pip install --quiet --upgrade pip
+          python -m pip install --quiet torch==2.15.0 --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install --quiet numpy pillow
+          python -c "import torch; print('torch', torch.__version__)"
+
+      - name: Selftest
+        run: python Models/Trainer.py --selftest --device cpu
+
+      - name: VC-Tester raporu (eğitilmemiş, küçük model — kapıların kalması beklenir)
+        run: |
+          python Models/Trainer.py --audit --tiny --val-clips 4 --crop 64x96 --device cpu --audit-json vc-tester.json || true
+          {
+            echo '## VC-Tester (eğitilmemiş küçük model)'
+            echo '```json'
+            cat vc-tester.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

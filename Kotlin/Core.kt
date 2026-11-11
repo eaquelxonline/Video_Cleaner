@@ -3,6 +3,10 @@
 //   Core      Rust çekirdeğinin (libvideo_cleaner.so) JNI yüzeyi
 //   CleanerSession  Tutamağı ve tamponları saran güvenli Kotlin arayüzü
 //   VideoJob        MediaCodec ile çöz → Rust halkası/zamanlayıcı → MediaCodec ile kodla → MP4
+//                   (ayrı altyazı izi varsa: yeniden kodlamadan remux, 0 yapay zekâ)
+//   CodecNegotiator H.264 / HEVC / AV1 / APV ve HDR10 kodlayıcı yeteneklerine göre çıktı türü
+//   InferenceRuntime Vulkan / LiteRT / ONNX köprüsünün ve model ağırlıklarının durumu
+//   JobCheckpoint   Ön plan hizmeti süre sınırı (Android 15+: mediaProcessing 6 saat) için iş kaydı
 //   CleanerService  Uzun işi taşıyan ön plan hizmeti
 //
 // DURUM: Onarım modeli (Vulkan çıkarımı) henüz bağlı değildir. `WindowRestorer`
@@ -21,10 +25,12 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.graphics.ImageFormat
 import android.hardware.HardwareBuffer
 import android.media.Image
+import android.media.ImageReader
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaCodecList
@@ -46,6 +52,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.Locale
 import kotlin.math.max
 
 // =============================================================================
@@ -139,7 +146,10 @@ object Core {
     const val ENGINE_MODE_B = 1
     const val ENGINE_MODE_A = 2
 
-    /** VC-Core'u başlatır; bağlam tutamağı (> 0) veya negatif hata kodu. */
+    /**
+     * VC-Core'u başlatır; bağlam tutamağı veya hata kodu (-4096..0). Tutamak bir adrestir ve ARM64'te
+     * etiketli olduğundan NEGATİF görünebilir: geçerlilik `!in CleanerSession.ERROR_CODES` ile denetlenir.
+     */
     @JvmStatic external fun vcInitEngine(mode: Int, preferVulkan: Boolean): Long
 
     /** YUV 4:2:0 donanım tamponunu (ImageReader `Image.hardwareBuffer`) Java yığınına kopyalamadan iter. */
@@ -388,11 +398,11 @@ class CleanerSession(val width: Int, val height: Int) : AutoCloseable {
         }
     }
 
-    private companion object {
-        /** nativeCreate'in hata olarak döndürebileceği aralık (0 ve CoreError kodları). */
+    companion object {
+        /** nativeCreate / vcInitEngine'in hata olarak döndürebileceği aralık (0 ve CoreError kodları). */
         val ERROR_CODES = -4096L..0L
 
-        fun direct(bytes: Int): ByteBuffer = ByteBuffer.allocateDirect(bytes).order(ByteOrder.nativeOrder())
+        private fun direct(bytes: Int): ByteBuffer = ByteBuffer.allocateDirect(bytes).order(ByteOrder.nativeOrder())
     }
 }
 
@@ -414,7 +424,8 @@ fun interface WindowRestorer {
 // kare hızı (değişken dahil) ve bit hızı. 720p veya belirli bir biçim ZORUNLU DEĞİLDİR.
 //
 // Bilinen sınırlar (kodda sessizce geçiştirilmez, sonuçta bildirilir):
-//   * Çıktı her zaman MP4'tür (H.264 veya HEVC, 8 bit 4:2:0).
+//   * Çıktı her zaman MP4'tür (H.264 veya HEVC; açıkça istenirse AV1 — CodecNegotiator; 8 bit 4:2:0).
+//   * Ayrı altyazı izi çıkarma (softSubtitleRemux) yeniden kodlamaz; VP8/VP9 video MP4'e kopyalanamaz.
 //   * Tek sayılı genişlik/yükseklik 4:2:0'da kodlanamaz; son sütun/satır kırpılır.
 //   * 10 bit / HDR kaynak ton eşlemesi yapılmadan 8 bite indirilir.
 //   * Çözünürlük üst sınırı cihazın kodlayıcısına bağlıdır.
@@ -429,6 +440,8 @@ data class VideoInfo(
     val videoMime: String = "",
     val audioMime: String? = null,
     val bitrate: Int = 0,
+    /** Ayrı (yumuşak) altyazı izlerinin türleri; bunlar görüntüye gömülü değildir, yeniden kodlamadan atılabilir. */
+    val subtitleTracks: List<String> = emptyList(),
 ) {
     companion object {
         /** Dosyanın akış bilgilerini okur; okunamazsa null. */
@@ -448,6 +461,9 @@ data class VideoInfo(
                     videoMime = format.getString(MediaFormat.KEY_MIME) ?: "",
                     audioMime = audio,
                     bitrate = format.intOr(MediaFormat.KEY_BIT_RATE, 0),
+                    subtitleTracks = (0 until extractor.trackCount)
+                        .mapNotNull { extractor.getTrackFormat(it).getString(MediaFormat.KEY_MIME) }
+                        .filter(::isSubtitleMime),
                 )
             } catch (e: Exception) {
                 null
@@ -459,6 +475,277 @@ data class VideoInfo(
 }
 
 private fun MediaFormat.intOr(key: String, fallback: Int): Int = if (containsKey(key)) getInteger(key) else fallback
+
+/** Ayrı (yumuşak) altyazı veya kapalı başlık izi mi? Görüntüye gömülü değildir: kareler değiştirilmeden atılabilir. */
+internal fun isSubtitleMime(mime: String?): Boolean {
+    val m = mime?.lowercase(Locale.ROOT) ?: return false
+    return m.startsWith("text/") || m in SUBTITLE_MIMES
+}
+
+private val SUBTITLE_MIMES = setOf(
+    "application/x-subrip", "application/x-ssa", "application/x-ass", "application/ttml+xml", "application/x-quicktime-tx3g",
+    "application/cea-608", "application/cea-708", "application/dvbsubs", "application/pgs", "application/vobsub", "application/x-media3-cues",
+)
+
+// =============================================================================
+// 3a. Kodek anlaşması (CodecNegotiator)
+// =============================================================================
+
+/**
+ * Çıktı kodeğini cihazın GERÇEK kodlayıcı yeteneklerine göre seçer: H.264, HEVC, AV1, APV ve HDR10.
+ *
+ * Varsayılan sıra değişmez (H.264 veya kullanıcı HEVC seçtiyse HEVC, sonra diğeri); AV1/APV yalnızca
+ * açıkça istenirse ve MP4 çoklayıcı o türü yazabiliyorsa denenir. HDR10 yeteneği raporlanır; VC-Core
+ * halkası 8 bit 4:2:0 olduğundan HDR kaynak bu sürümde 8 bit SDR etiketli kodlanır (ton eşlemesi yok) —
+ * bu, sonuç notlarında açıkça yazılır.
+ */
+object CodecNegotiator {
+    const val AVC = MediaFormat.MIMETYPE_VIDEO_AVC
+    const val HEVC = MediaFormat.MIMETYPE_VIDEO_HEVC
+    const val AV1 = MediaFormat.MIMETYPE_VIDEO_AV1
+
+    /** MediaFormat.MIMETYPE_VIDEO_APV (API 36). */
+    const val APV = "video/apv"
+    val ALL = listOf(AVC, HEVC, AV1, APV)
+
+    data class Support(
+        val mime: String,
+        val label: String,
+        val encoders: List<String>,
+        val hardware: Boolean,
+        val tenBit: Boolean,
+        val hdr10: Boolean,
+        val muxable: Boolean,
+        val maxWidth: Int,
+        val maxHeight: Int,
+    ) {
+        /** Bu cihazda bu türde MP4 üretilebilir mi? */
+        val usable: Boolean get() = encoders.isNotEmpty() && muxable
+
+        fun describe(): String = buildString {
+            append(label).append(": ")
+            if (encoders.isEmpty()) {
+                append("kodlayıcı yok")
+                return@buildString
+            }
+            append(if (hardware) "donanım" else "yalnız yazılım")
+            append(", en çok ${maxWidth}×$maxHeight")
+            if (tenBit) append(", 10 bit")
+            if (hdr10) append(", HDR10")
+            if (!muxable) append(", MP4'e yazılamaz")
+        }
+    }
+
+    fun label(mime: String): String = when (mime) {
+        AVC -> "H.264"
+        HEVC -> "HEVC"
+        AV1 -> "AV1"
+        APV -> "APV"
+        else -> mime.substringAfter('/')
+    }
+
+    /**
+     * MP4 çoklayıcının (MediaMuxer MPEG_4) bu türü yazabildiği sürüm. AV1: Android 14 (API 34).
+     * APV: bu sürümde MP4 çoklayıcı desteği cihazda doğrulanmadığından seçilmez (yalnızca raporlanır).
+     */
+    fun muxable(mime: String): Boolean = when (mime) {
+        AVC, HEVC -> true
+        AV1 -> Build.VERSION.SDK_INT >= 34
+        else -> false
+    }
+
+    /** Cihazdaki kodlayıcıların taranması (MediaCodecList, takma adlar hariç). */
+    fun survey(): List<Support> {
+        val encoders = MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.filter { it.isEncoder && !it.isAlias }
+        return ALL.map { mime ->
+            var hardware = false
+            var tenBit = false
+            var hdr10 = false
+            var maxW = 0
+            var maxH = 0
+            val names = ArrayList<String>()
+            for (info in encoders) {
+                val type = info.supportedTypes.firstOrNull { it.equals(mime, ignoreCase = true) } ?: continue
+                val caps = runCatching { info.getCapabilitiesForType(type) }.getOrNull() ?: continue
+                names += info.name
+                if (info.isHardwareAccelerated) hardware = true
+                caps.videoCapabilities?.let {
+                    maxW = max(maxW, it.supportedWidths.upper)
+                    maxH = max(maxH, it.supportedHeights.upper)
+                }
+                for (pl in caps.profileLevels) {
+                    when (mime) {
+                        HEVC -> {
+                            if (pl.profile == MediaCodecInfo.CodecProfileLevel.HEVCProfileMain10) tenBit = true
+                            if (pl.profile == MediaCodecInfo.CodecProfileLevel.HEVCProfileMain10HDR10 ||
+                                pl.profile == MediaCodecInfo.CodecProfileLevel.HEVCProfileMain10HDR10Plus
+                            ) {
+                                tenBit = true
+                                hdr10 = true
+                            }
+                        }
+                        AV1 -> {
+                            if (pl.profile == MediaCodecInfo.CodecProfileLevel.AV1ProfileMain10) tenBit = true
+                            if (pl.profile == MediaCodecInfo.CodecProfileLevel.AV1ProfileMain10HDR10 ||
+                                pl.profile == MediaCodecInfo.CodecProfileLevel.AV1ProfileMain10HDR10Plus
+                            ) {
+                                tenBit = true
+                                hdr10 = true
+                            }
+                        }
+                        APV -> tenBit = true      // APV profilleri 10 bit ve üzeridir
+                    }
+                }
+            }
+            Support(mime, label(mime), names, hardware, tenBit, hdr10, muxable(mime), maxW, maxH)
+        }
+    }
+
+    /** Kodlayıcı deneme sırası: açıkça istenen (yazılabiliyorsa) önce, ardından H.264/HEVC (tercihe göre). */
+    fun order(options: JobOptions): List<String> {
+        val base = if (options.preferHevc) listOf(HEVC, AVC) else listOf(AVC, HEVC)
+        val explicit = options.codec?.takeIf { muxable(it) }
+        return (listOfNotNull(explicit) + base).distinct()
+    }
+
+    /** Kaynak HDR aktarım eğrisi (PQ / HLG) taşıyor mu? */
+    fun isHdr(format: MediaFormat?): Boolean {
+        val transfer = format?.intOr(MediaFormat.KEY_COLOR_TRANSFER, 0) ?: 0
+        return transfer == MediaFormat.COLOR_TRANSFER_ST2084 || transfer == MediaFormat.COLOR_TRANSFER_HLG
+    }
+
+    fun summary(): String = survey().joinToString(" · ") { it.describe() }
+}
+
+// =============================================================================
+// 3b. Çıkarım köprüsü (Vulkan / LiteRT / ONNX) — durum raporu
+// =============================================================================
+
+/**
+ * VC-Detector / VC-Flow / VC-Mamba'yı çalıştıracak arka ucun durumu.
+ *
+ * DURUM: Bu sürümde çıkarım arka ucu YOKTUR. Vulkan hesap gölgelendiricileri, LiteRT ve ONNX
+ * kitaplıkları uygulamaya bağlı değildir ve eğitilmiş ağırlık dağıtılmaz. [restorer] bu yüzden
+ * her zaman null döner; kareler değiştirilmeden işlenir. Bu nesne yalnızca cihazın neyi
+ * desteklediğini ve neyin eksik olduğunu dürüstçe raporlar.
+ */
+object InferenceRuntime {
+    /** Trainer.py --export çıktısı (models/ klasörüne konur). */
+    val MODEL_FILES = listOf("video_detector.safetensors", "video_flow.safetensors", "video_mamba.safetensors")
+
+    data class Report(
+        /** Desteklenen en yüksek Vulkan sürümü ("1.3" gibi) veya "yok". */
+        val vulkan: String,
+        val vulkanCompute: Boolean,
+        val liteRt: Boolean,
+        val onnx: Boolean,
+        val weightsFound: List<String>,
+        val weightsMissing: List<String>,
+        /** Gerçekte kullanılan onarıcı. */
+        val active: String,
+        val reason: String,
+    )
+
+    private fun hasClass(name: String): Boolean = runCatching { Class.forName(name, false, InferenceRuntime::class.java.classLoader) }.isSuccess
+
+    fun probe(context: Context): Report {
+        val pm = context.packageManager
+        // FEATURE_VULKAN_HARDWARE_VERSION sürümü VK_MAKE_API_VERSION(0, büyük, küçük, 0) = büyük<<22 | küçük<<12.
+        val vulkan = listOf(4, 3, 2, 1, 0).firstOrNull { minor ->
+            pm.hasSystemFeature(PackageManager.FEATURE_VULKAN_HARDWARE_VERSION, (1 shl 22) or (minor shl 12))
+        }?.let { "1.$it" } ?: "yok"
+        val compute = pm.hasSystemFeature(PackageManager.FEATURE_VULKAN_HARDWARE_COMPUTE, 0)
+        val liteRt = hasClass("com.google.ai.edge.litert.Interpreter") || hasClass("org.tensorflow.lite.Interpreter")
+        val onnx = hasClass("ai.onnxruntime.OrtEnvironment")
+        val dir = java.io.File(context.filesDir, "models")
+        val found = MODEL_FILES.filter { java.io.File(dir, it).isFile }
+        return Report(
+            vulkan, compute, liteRt, onnx, found, MODEL_FILES - found.toSet(),
+            active = "kimlik (kareler değiştirilmez)",
+            reason = buildString {
+                append("çıkarım arka ucu bu sürümde yok")
+                if (found.size < MODEL_FILES.size) append("; eğitilmiş ağırlık yok (${MODEL_FILES.size - found.size}/${MODEL_FILES.size} eksik)")
+            },
+        )
+    }
+
+    /** Pencere onarıcısı. Arka uç ve ağırlıklar olmadığından null: kareler değiştirilmeden işlenir. */
+    @Suppress("UNUSED_PARAMETER")
+    fun restorer(context: Context): WindowRestorer? = null
+
+    fun describe(report: Report): String =
+        "Vulkan ${report.vulkan}${if (report.vulkanCompute) " (hesap)" else ""} · LiteRT ${if (report.liteRt) "var" else "yok"} · " +
+            "ONNX ${if (report.onnx) "var" else "yok"} · ağırlık ${report.weightsFound.size}/${MODEL_FILES.size} · " +
+            "etkin: ${report.active} — ${report.reason}"
+}
+
+// =============================================================================
+// 3c. Cihaz tanılaması (VC-Tester çalışma zamanı denetimi)
+// =============================================================================
+
+object Diagnostics {
+    /**
+     * Küçük bir VC-Core motorunu sentetik karelerle çalıştırır ve VC-Tester raporunu (JSON) döndürür:
+     * halka belleği (AHardwareBuffer / yığın), sayfa boyutu, .so LOAD hizası, kare/PTS bütünlüğü.
+     */
+    fun runtimeAudit(): String {
+        val ctx = Core.vcInitEngine(Core.ENGINE_MODE_AUTO, false)
+        if (ctx in CleanerSession.ERROR_CODES) return "{\"error\":$ctx}"
+        try {
+            val (w, h) = 64 to 32
+            val frame = ByteBuffer.allocateDirect(w * h * 3 / 2).order(ByteOrder.nativeOrder())
+            val info = ByteBuffer.allocateDirect(Core.POLL_INFO_BYTES).order(ByteOrder.nativeOrder())
+            val out = ByteBuffer.allocateDirect(w * h * 3 / 2).order(ByteOrder.nativeOrder())
+            val meta = ByteBuffer.allocateDirect(Core.OUTPUT_META_BYTES).order(ByteOrder.nativeOrder())
+            fun drain(): Int {
+                while (true) {
+                    when (val step = Core.vcPoll(ctx, info)) {
+                        Core.STEP_WINDOW -> Core.vcProcessWindow(ctx, false)
+                        Core.STEP_OUTPUT -> while (Core.vcPopOutputNv12(ctx, out, meta) == 1) out.clear()
+                        else -> return step
+                    }
+                }
+            }
+            for (i in 0 until 8) {
+                for (b in 0 until frame.capacity()) frame.put(b, ((b + i * 7) and 0xff).toByte())
+                if (Core.vcPushNv12(ctx, w, h, frame, i * 33_333L, 0) == -3) {
+                    drain()
+                    Core.vcPushNv12(ctx, w, h, frame, i * 33_333L, 0)
+                }
+            }
+            Core.vcFinish(ctx)
+            var guard = 0
+            while (drain() != Core.STEP_FINISHED && guard++ < 100) Unit
+            return Core.vcRunTesterAudit(ctx)
+        } finally {
+            Core.vcDestroy(ctx)
+        }
+    }
+
+    /** Arayüz ve logcat (VCDIAG) için satırlar. */
+    fun collect(context: Context): List<Pair<String, String>> {
+        val rows = ArrayList<Pair<String, String>>()
+        rows += "Cihaz" to "${Build.MANUFACTURER} ${Build.MODEL} · Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})"
+        rows += "Çekirdek" to runCatching { "ABI ${Core.nativeAbiVersion()} · ${Core.kernelBackendName()} · sayfa ${Core.nativePageSize() / 1024} KB" }
+            .getOrElse { "yüklenemedi: ${it.message}" }
+        rows += "VC-Tester" to runCatching { summarizeAudit(runtimeAudit()) }.getOrElse { "çalışmadı: ${it.message}" }
+        rows += "Kodlayıcılar" to runCatching { CodecNegotiator.summary() }.getOrElse { "taranamadı: ${it.message}" }
+        rows += "Çıkarım" to runCatching { InferenceRuntime.describe(InferenceRuntime.probe(context)) }.getOrElse { "taranamadı: ${it.message}" }
+        for ((k, v) in rows) Log.i("VCDIAG", "$k: $v")
+        return rows
+    }
+
+    private fun field(json: String, key: String): String? =
+        Regex("\"$key\":(\"[^\"]*\"|[^,}]+)").find(json)?.groupValues?.get(1)?.trim('"')
+
+    /** Tester JSON'unun okunur özeti. */
+    fun summarizeAudit(json: String): String {
+        val ok = field(json, "frames_equal") == "true" && field(json, "bit_exact") == "true" && field(json, "violations") == "0"
+        return "bütünlük ${if (ok) "GEÇTİ" else "KALDI"} · halka ${field(json, "storage") ?: "?"} · " +
+            ".so hizası ${field(json, "elf_load_align") ?: "?"} B (16 KB ${if (field(json, "elf_16k_ok") == "true") "uygun" else "UYGUN DEĞİL"}) · " +
+            "model: ${field(json, "models") ?: "?"}"
+    }
+}
 
 /**
  * Video bit hızı ve anahtar kare politikası (saf hesap; Android'e bağımlı değildir, birim testlenir).
@@ -547,6 +834,18 @@ data class JobOptions(
     val quality: Float = 1.0f,
     /** Yalnızca ölçüm/kalibrasyon testleri için: bit hızı politikasını atlayıp kodlayıcıyı doğrudan ayarlar. */
     val tuning: EncoderTuning? = null,
+    /** Açıkça istenen çıktı türü (CodecNegotiator.AV1 gibi); null = [preferHevc]'ye göre H.264/HEVC. */
+    val codec: String? = null,
+    /**
+     * true: yalnızca AYRI altyazı izleri atılır; video paketleri yeniden kodlanmadan, bayt bayt kopyalanır
+     * (0 yapay zekâ, kalite kaybı yok). Görüntüye gömülü yazıya dokunmaz.
+     */
+    val softSubtitleRemux: Boolean = false,
+    /**
+     * true: çözücü çıktısı Surface → ImageReader (HardwareBuffer) yolundan alınır. Bu yol ilk karede
+     * başarısız olursa iş, bayt tamponu yoluyla baştan yapılır ve bu bir notla bildirilir.
+     */
+    val hardwareBufferDecode: Boolean = false,
 )
 
 /**
@@ -620,12 +919,20 @@ data class JobResult(
     /** Kapsayıcının video izi için beyan ettiği bit hızı (MediaFormat.KEY_BIT_RATE); yoksa 0. */
     val sourceDeclaredBitrate: Int = 0,
     val sourceFrameRate: Float = 0f,
+    /** true: video yeniden kodlanmadı, paketler aynen kopyalandı (ayrı altyazı izi çıkarma). */
+    val remuxed: Boolean = false,
+    /** Çıktıdan atılan ayrı altyazı izlerinin türleri. */
+    val removedSubtitleTracks: List<String> = emptyList(),
 ) {
     /** Kare kaybı ve sıra hatası yok mu? (çözülen = çekirdekten çıkan = kodlayıcıya verilen = kodlanan) */
     val intact: Boolean
-        get() = framesDecoded == framesEncoded && framesQueued == framesDecoded &&
-            stats.framesIn == framesDecoded && stats.framesOut == framesDecoded &&
-            stats.orderViolations == 0L && stats.preservationViolations == 0L
+        get() = if (remuxed) {
+            framesDecoded == framesEncoded && framesQueued == framesDecoded
+        } else {
+            framesDecoded == framesEncoded && framesQueued == framesDecoded &&
+                stats.framesIn == framesDecoded && stats.framesOut == framesDecoded &&
+                stats.orderViolations == 0L && stats.preservationViolations == 0L
+        }
 
     val framesPerSecond: Double get() = if (elapsedMs > 0) framesEncoded * 1000.0 / elapsedMs else 0.0
 }
@@ -906,17 +1213,29 @@ class VideoJob(
      */
     private class DecoderFailedException(val decoderName: String, cause: Exception) : Exception(cause.message, cause)
 
+    /** Surface → ImageReader yolu daha tek kare vermeden başarısız oldu. */
+    private class HardwarePathFailedException(message: String, cause: Throwable? = null) : Exception(message, cause)
+
     /** İşi çağıran iş parçacığında baştan sona çalıştırır. Hata veya iptalde yarım çıktı silinir. */
     fun run(): JobResult {
         val skipped = LinkedHashSet<String>()
+        var hardwarePath = options.hardwareBufferDecode
+        val carried = ArrayList<String>()
         try {
+            if (options.softSubtitleRemux) return remux()
             while (true) {
                 try {
-                    return transcode(skipped)
+                    val result = transcode(skipped, hardwarePath)
+                    return if (carried.isEmpty()) result else result.copy(notes = carried + result.notes)
                 } catch (e: DecoderFailedException) {
                     deleteOutput()
                     Log.w(CleanerService.TAG, "Çözücü ${e.decoderName} kare vermeden hata verdi; sıradaki çözücü deneniyor", e.cause)
                     if (!skipped.add(e.decoderName) || skipped.size > MAX_DECODER_ATTEMPTS) throw e.cause ?: e
+                } catch (e: HardwarePathFailedException) {
+                    deleteOutput()
+                    Log.w(CleanerService.TAG, "HardwareBuffer çözme yolu ilk karede başarısız; bayt tamponu yoluna geçildi", e.cause)
+                    hardwarePath = false
+                    carried += "HardwareBuffer çözme yolu bu cihazda çalışmadı (${e.message}); bayt tamponu yolu kullanıldı."
                 }
             }
         } catch (e: Exception) {
@@ -942,8 +1261,7 @@ class VideoJob(
     private fun startEncoder(
         width: Int, height: Int, frameRate: Float, source: SourceVideoStats?, sourceMime: String, color: MediaFormat?, sar: Pair<Int, Int>?,
     ): Encoder {
-        val order = if (options.preferHevc) listOf(MediaFormat.MIMETYPE_VIDEO_HEVC, MediaFormat.MIMETYPE_VIDEO_AVC)
-        else listOf(MediaFormat.MIMETYPE_VIDEO_AVC, MediaFormat.MIMETYPE_VIDEO_HEVC)
+        val order = CodecNegotiator.order(options)
         val codecs = MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.filter { it.isEncoder }
         var lastError: Exception? = null
         for (mime in order) {
@@ -1033,7 +1351,7 @@ class VideoJob(
                 }
             }
         }
-        throw JobException("Bu cihazda ${width}×$height çözünürlüğünü kodlayabilen bir H.264/HEVC kodlayıcı yok", lastError)
+        throw JobException("Bu cihazda ${width}×$height çözünürlüğünü kodlayabilen bir ${order.joinToString("/") { CodecNegotiator.label(it) }} kodlayıcı yok", lastError)
     }
 
     /**
@@ -1078,7 +1396,131 @@ class VideoJob(
             .sortedBy { if (it.isSoftwareOnly) 1 else 0 }
             .map { it.name }
 
-    private fun transcode(skippedDecoders: Set<String>): JobResult {
+    /**
+     * Ayrı altyazı izi çıkarma (0 yapay zekâ): video paketleri ve uyumlu ses paketleri YENİDEN KODLANMADAN,
+     * bayt bayt ve zaman damgalarıyla birlikte yeni bir MP4'e kopyalanır; altyazı / kapalı başlık izleri yazılmaz.
+     * Görüntüye gömülü (yakılmış) yazıya dokunmaz. Video türü MP4'e kopyalanamıyorsa (VP8/VP9) iş reddedilir.
+     */
+    private fun remux(): JobResult {
+        val started = SystemClock.elapsedRealtime()
+        val extractor = MediaExtractor()
+        val audioPaths = ArrayList<Pair<AudioPath, MediaExtractor>>()
+        val opened = ArrayList<MediaExtractor>()
+        var muxer: MediaMuxer? = null
+        var descriptor: ParcelFileDescriptor? = null
+        var muxerStarted = false
+        val notes = ArrayList<String>()
+        try {
+            try {
+                extractor.setDataSource(context, input, null)
+            } catch (e: Exception) {
+                throw JobException("Dosya açılamadı veya kapsayıcı biçimi tanınmadı", e)
+            }
+            val formats = (0 until extractor.trackCount).map { extractor.getTrackFormat(it) }
+            val mimes = formats.map { it.getString(MediaFormat.KEY_MIME) ?: "" }
+            val videoTrack = mimes.indexOfFirst { it.startsWith("video/") }.takeIf { it >= 0 } ?: throw JobException("Dosyada video akışı bulunamadı")
+            val videoFormat = formats[videoTrack]
+            val videoMime = mimes[videoTrack]
+            if (videoMime !in REMUX_VIDEO_TYPES && !(videoMime == CodecNegotiator.AV1 && Build.VERSION.SDK_INT >= 34)) {
+                throw JobException("${CodecNegotiator.label(videoMime)} videosu MP4'e yeniden kodlanmadan taşınamıyor; normal temizleme kullanın")
+            }
+            val subtitles = mimes.filter(::isSubtitleMime)
+            val skippedOther = mimes.filterIndexed { i, m -> i != videoTrack && !m.startsWith("audio/") && !isSubtitleMime(m) && m.startsWith("video/") }
+            if (skippedOther.isNotEmpty()) notes += "Ek video izleri (${skippedOther.size}) çıktıya alınmadı."
+            val width = videoFormat.intOr(MediaFormat.KEY_WIDTH, 0)
+            val height = videoFormat.intOr(MediaFormat.KEY_HEIGHT, 0)
+
+            val fd = context.contentResolver.openFileDescriptor(output, "rw") ?: throw JobException("Çıktı dosyası açılamadı")
+            descriptor = fd
+            val mux = MediaMuxer(fd.fileDescriptor, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+            muxer = mux
+            mux.setOrientationHint(videoFormat.intOr(MediaFormat.KEY_ROTATION, 0))
+
+            // Ön dolgu nedeniyle negatif damgalı ilk paket varsa bütün çıktı aynı miktarda kaydırılır (bkz. AudioCopy).
+            extractor.selectTrack(videoTrack)
+            var offsetUs = max(0L, -extractor.sampleTime)
+            val audioTracks = mimes.indices.filter { mimes[it].startsWith("audio/") }
+            val audioExtractors = audioTracks.map { track ->
+                MediaExtractor().also {
+                    opened += it
+                    it.setDataSource(context, input, null)
+                    it.selectTrack(track)
+                    offsetUs = max(offsetUs, -it.sampleTime)
+                }
+            }
+            offsetUs = offsetUs.coerceAtMost(MAX_TIMELINE_OFFSET_US)
+            val audioLabels = ArrayList<String>()
+            for ((i, track) in audioTracks.withIndex()) {
+                val source = audioExtractors[i]
+                val format = formats[track]
+                try {
+                    val path: AudioPath = if (mimes[track] in MP4_AUDIO_TYPES) AudioCopy(source, format, offsetUs)
+                    else AudioTranscode(source, format, offsetUs).also { it.prepare() }
+                    audioPaths += path to source
+                    audioLabels += path.label
+                } catch (e: Exception) {
+                    audioLabels += "ses izi atlandı (${mimes[track]}: ${e.message ?: e.javaClass.simpleName})"
+                    notes += "Bir ses izi çıktıya alınamadı."
+                }
+            }
+            val videoOut = mux.addTrack(videoFormat)
+            val audioOut = audioPaths.map { (path, _) -> mux.addTrack(path.trackFormat) }
+            mux.start()
+            muxerStarted = true
+
+            val capacity = maxOf(videoFormat.intOr(MediaFormat.KEY_MAX_INPUT_SIZE, 0), width * height * 3 / 2, 1 shl 20)
+            val buffer = ByteBuffer.allocateDirect(capacity)
+            val sampleInfo = MediaCodec.BufferInfo()
+            var copied = 0L
+            var lastPts = 0L
+            var lastReport = 0L
+            val durationUs = if (videoFormat.containsKey(MediaFormat.KEY_DURATION)) videoFormat.getLong(MediaFormat.KEY_DURATION) else 0L
+            while (extractor.sampleTrackIndex >= 0) {
+                if (cancelled) throw JobCancelledException()
+                val size = extractor.readSampleData(buffer, 0)
+                if (size < 0) break
+                val pts = extractor.sampleTime + offsetUs
+                val flags = if (extractor.sampleFlags and MediaExtractor.SAMPLE_FLAG_SYNC != 0) MediaCodec.BUFFER_FLAG_KEY_FRAME else 0
+                buffer.position(0)
+                buffer.limit(size)
+                sampleInfo.set(0, size, pts, flags)
+                mux.writeSampleData(videoOut, buffer, sampleInfo)
+                buffer.clear()
+                copied++
+                lastPts = pts
+                for ((k, entry) in audioPaths.withIndex()) entry.first.pump(mux, audioOut[k], pts)
+                extractor.advance()
+                val now = SystemClock.elapsedRealtime()
+                if (now - lastReport >= PROGRESS_INTERVAL_MS) {
+                    lastReport = now
+                    val elapsed = (now - started).coerceAtLeast(1)
+                    onProgress(JobProgress(copied, copied, lastPts - offsetUs, durationUs, copied * 1000.0 / elapsed, elapsed, width, height))
+                }
+            }
+            for ((k, entry) in audioPaths.withIndex()) entry.first.pump(mux, audioOut[k], Long.MAX_VALUE)
+            mux.stop()
+            muxerStarted = false
+            notes += if (subtitles.isEmpty()) "Dosyada ayrı altyazı izi yoktu; video ve ses yeniden kodlanmadan kopyalandı."
+            else "${subtitles.size} ayrı altyazı izi çıkarıldı (${subtitles.joinToString()}); video yeniden kodlanmadı."
+            return JobResult(
+                framesDecoded = copied, framesEncoded = copied, elapsedMs = SystemClock.elapsedRealtime() - started,
+                width = width, height = height, framesQueued = copied,
+                audio = if (audioLabels.isEmpty()) "ses akışı yok" else audioLabels.joinToString("; "),
+                outputMime = videoMime, encoderName = "yok (remux, yeniden kodlama yok)", restorerAttached = false,
+                notes = notes, stats = CoreStats(), remuxed = true, removedSubtitleTracks = subtitles,
+                sourceFrameRate = videoFormat.getNumber(MediaFormat.KEY_FRAME_RATE)?.toFloat() ?: 0f,
+            )
+        } finally {
+            for ((path, _) in audioPaths) runCatching { path.release() }
+            for (source in opened) runCatching { source.release() }
+            if (muxerStarted) runCatching { muxer?.stop() }
+            runCatching { muxer?.release() }
+            runCatching { descriptor?.close() }
+            runCatching { extractor.release() }
+        }
+    }
+
+    private fun transcode(skippedDecoders: Set<String>, hardwarePath: Boolean): JobResult {
         val started = SystemClock.elapsedRealtime()
         val extractor = MediaExtractor()
         var audioExtractor: MediaExtractor? = null
@@ -1088,6 +1530,7 @@ class VideoJob(
         var muxer: MediaMuxer? = null
         var descriptor: ParcelFileDescriptor? = null
         var session: CleanerSession? = null
+        var reader: ImageReader? = null
         var muxerStarted = false
         val notes = ArrayList<String>()
         try {
@@ -1116,14 +1559,32 @@ class VideoJob(
             val measuredFps = sourceVideo?.let { if (it.durationUs > 0) it.samples * 1_000_000f / it.durationUs else null }
             val frameRate = (sourceFormat.getNumber(MediaFormat.KEY_FRAME_RATE)?.toFloat() ?: measuredFps ?: 30f).coerceIn(1f, 960f)
 
-            sourceFormat.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible)
+            if (CodecNegotiator.isHdr(sourceFormat)) {
+                val hdr10 = runCatching { CodecNegotiator.survey().any { it.hdr10 && it.usable } }.getOrDefault(false)
+                notes += "HDR kaynak (PQ/HLG): VC-Core 8 bit çalıştığından çıktı 8 bit SDR etiketli (ton eşlemesi yok)." +
+                    if (hdr10) " Cihazda HDR10 kodlayıcı var; 10 bit hat sonraki sürümün işi." else ""
+            }
+            // HardwareBuffer yolu: çözücü Surface'e (ImageReader) yazar; kareler HardwareBuffer olarak alınır.
+            val surfaceReader = if (hardwarePath) {
+                val w = sourceFormat.intOr(MediaFormat.KEY_WIDTH, 0)
+                val h = sourceFormat.intOr(MediaFormat.KEY_HEIGHT, 0)
+                if (w <= 0 || h <= 0) throw HardwarePathFailedException("kaynak boyutu bilinmiyor")
+                try {
+                    ImageReader.newInstance(w, h, ImageFormat.YUV_420_888, 4, HardwareBuffer.USAGE_CPU_READ_OFTEN).also { reader = it }
+                } catch (e: Exception) {
+                    throw HardwarePathFailedException("ImageReader açılamadı: ${e.message}", e)
+                }
+            } else {
+                sourceFormat.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible)
+                null
+            }
             // Yapılandırılamayan çözücü atlanır; sıradaki denenir (ör. tek sayılı boyutu reddeden VP9 çözücü).
             var decoderError: Exception? = null
             var decoderName = ""
             for (name in decoderNames(sourceMime, skippedDecoders)) {
                 val codec = runCatching { MediaCodec.createByCodecName(name) }.getOrElse { decoderError = it as? Exception; null } ?: continue
                 try {
-                    codec.configure(sourceFormat, null, null, 0)
+                    codec.configure(sourceFormat, surfaceReader?.surface, null, 0)
                     codec.start()
                     decoder = codec
                     decoderName = name
@@ -1229,6 +1690,35 @@ class VideoJob(
                 }
             }
 
+            fun pushDecoded(image: Image, ptsUs: Long) {
+                if (image.format != ImageFormat.YUV_420_888 && image.format != ImageFormat.YCBCR_P010) {
+                    if (surfaceReader != null && framesDecoded == 0L) throw HardwarePathFailedException("piksel biçimi ${image.format}")
+                    throw JobException("Desteklenmeyen piksel biçimi (${image.format}); 4:2:0 olmayan kaynak")
+                }
+                val crop = image.cropRect
+                // 4:2:0 kodlama çift boyut ister: tek sayılı boyutta son sütun/satır kırpılır.
+                val width = crop.width() and 1.inv()
+                val height = crop.height() and 1.inv()
+                val active = session ?: run {
+                    if (width < 2 || height < 2) throw JobException("Kare boyutu çok küçük: ${crop.width()}×${crop.height()}")
+                    if (width != crop.width() || height != crop.height()) {
+                        notes += "Tek sayılı boyut (${crop.width()}×${crop.height()}) ${width}×$height olarak kırpıldı."
+                    }
+                    if (image.format == ImageFormat.YCBCR_P010) notes += "10 bit kaynak 8 bite indirildi (ton eşlemesi yok)."
+                    if (surfaceReader != null) notes += "Çözme yolu: Surface → ImageReader (HardwareBuffer)."
+                    encoder = startEncoder(width, height, frameRate, sourceVideo, sourceMime, colorFormat, sourceSar)
+                    CleanerSession(width, height).also { session = it }
+                }
+                if (width != active.width || height != active.height) {
+                    throw JobException("Çözünürlük akış ortasında değişti (${active.width}×${active.height} → ${width}×$height); desteklenmiyor")
+                }
+                // Çekirdek kesin artan zaman damgası ister; bozuk akışlarda en az 1 µs ilerlet.
+                val pts = if (lastPtsIn == Long.MIN_VALUE) ptsUs else max(ptsUs, lastPtsIn + 1)
+                active.push(image, pts)
+                lastPtsIn = pts
+                framesDecoded++
+            }
+
             fun decodeStepUnchecked() {
                 if (!inputDone) {
                     val index = dec.dequeueInputBuffer(CODEC_TIMEOUT_US)
@@ -1247,34 +1737,31 @@ class VideoJob(
                 val index = dec.dequeueOutputBuffer(info, CODEC_TIMEOUT_US)
                 if (index == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                     colorFormat = dec.outputFormat
+                } else if (index >= 0 && surfaceReader != null) {
+                    val end = info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0
+                    // Surface kipinde bazı çözücüler boyutu 0 bildirir: akış sonu dışındaki her tampon çizilir.
+                    val render = info.size > 0 || !end
+                    dec.releaseOutputBuffer(index, render)
+                    if (render) {
+                        var image: Image? = null
+                        val deadline = SystemClock.uptimeMillis() + SURFACE_FRAME_TIMEOUT_MS
+                        while (image == null && SystemClock.uptimeMillis() < deadline) {
+                            image = surfaceReader.acquireNextImage()
+                            if (image == null) SystemClock.sleep(1)
+                        }
+                        if (image == null) {
+                            if (framesDecoded == 0L) throw HardwarePathFailedException("ImageReader kare vermedi")
+                            if (info.size > 0) throw JobException("ImageReader kare vermedi (kare ${framesDecoded + 1})")
+                        } else {
+                            image.use { img -> pushDecoded(img, info.presentationTimeUs) }
+                        }
+                    }
+                    if (end) decoderDone = true
                 } else if (index >= 0) {
                     val end = info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0
                     if (info.size > 0) {
                         val image = dec.getOutputImage(index) ?: throw JobException("Çözücü görüntüsü alınamadı")
-                        if (image.format != ImageFormat.YUV_420_888 && image.format != ImageFormat.YCBCR_P010) {
-                            throw JobException("Desteklenmeyen piksel biçimi (${image.format}); 4:2:0 olmayan kaynak")
-                        }
-                        val crop = image.cropRect
-                        // 4:2:0 kodlama çift boyut ister: tek sayılı boyutta son sütun/satır kırpılır.
-                        val width = crop.width() and 1.inv()
-                        val height = crop.height() and 1.inv()
-                        val active = session ?: run {
-                            if (width < 2 || height < 2) throw JobException("Kare boyutu çok küçük: ${crop.width()}×${crop.height()}")
-                            if (width != crop.width() || height != crop.height()) {
-                                notes += "Tek sayılı boyut (${crop.width()}×${crop.height()}) ${width}×$height olarak kırpıldı."
-                            }
-                            if (image.format == ImageFormat.YCBCR_P010) notes += "10 bit kaynak 8 bite indirildi (ton eşlemesi yok)."
-                            encoder = startEncoder(width, height, frameRate, sourceVideo, sourceMime, colorFormat, sourceSar)
-                            CleanerSession(width, height).also { session = it }
-                        }
-                        if (width != active.width || height != active.height) {
-                            throw JobException("Çözünürlük akış ortasında değişti (${active.width}×${active.height} → ${width}×$height); desteklenmiyor")
-                        }
-                        // Çekirdek kesin artan zaman damgası ister; bozuk akışlarda en az 1 µs ilerlet.
-                        val pts = if (lastPtsIn == Long.MIN_VALUE) info.presentationTimeUs else max(info.presentationTimeUs, lastPtsIn + 1)
-                        active.push(image, pts)
-                        lastPtsIn = pts
-                        framesDecoded++
+                        pushDecoded(image, info.presentationTimeUs)
                     }
                     dec.releaseOutputBuffer(index, false)
                     if (end) decoderDone = true
@@ -1285,6 +1772,7 @@ class VideoJob(
                 try {
                     decodeStepUnchecked()
                 } catch (e: MediaCodec.CodecException) {
+                    if (framesDecoded == 0L && surfaceReader != null) throw HardwarePathFailedException("çözücü hatası: ${e.diagnosticInfo}", e)
                     if (framesDecoded == 0L) throw DecoderFailedException(decoderName, e)
                     throw e
                 }
@@ -1365,6 +1853,7 @@ class VideoJob(
             session?.close()
             runCatching { decoder?.stop() }
             runCatching { decoder?.release() }
+            runCatching { reader?.close() }
             runCatching { encoder?.codec?.stop() }
             runCatching { encoder?.codec?.release() }
             runCatching { audio?.release() }
@@ -1378,6 +1867,7 @@ class VideoJob(
 
     companion object {
         private const val CODEC_TIMEOUT_US = 10_000L
+        private const val SURFACE_FRAME_TIMEOUT_MS = 2_000L
         private const val MAX_DECODER_ATTEMPTS = 4
 
         /** Ön dolgu kaydırması için üst sınır: AAC/Opus/MP3 ön dolgusu bir iki paketi geçmez (≤ 100 ms). */
@@ -1395,6 +1885,11 @@ class VideoJob(
             else -> "mod($mode)"
         }
         private const val PROGRESS_INTERVAL_MS = 250L
+
+        /** Yeniden kodlamadan MP4'e taşınabilen video türleri (AV1 ayrıca API 34+). */
+        private val REMUX_VIDEO_TYPES = setOf(
+            MediaFormat.MIMETYPE_VIDEO_AVC, MediaFormat.MIMETYPE_VIDEO_HEVC, MediaFormat.MIMETYPE_VIDEO_MPEG4, MediaFormat.MIMETYPE_VIDEO_H263,
+        )
 
         /** MP4 çoklayıcının doğrudan yazabildiği ses türleri; diğerleri AAC'ye dönüştürülür. */
         private val MP4_AUDIO_TYPES = setOf(
@@ -1429,6 +1924,84 @@ object JobState {
 }
 
 /**
+ * Uzun işin kalıcı kaydı (checkpoint).
+ *
+ * Android 15+ `mediaProcessing` ön plan hizmetine 24 saatte toplam 6 saat tanır; süre dolunca sistem
+ * `onTimeout` çağırır ve hizmet birkaç saniye içinde durmalıdır. Süreç öldürülebilir de. Bu kayıt işin
+ * girdisini, çıktısını, ayarlarını ve ilerlemesini saklar; uygulama yeniden açıldığında yarım kalan iş
+ * nedeniyle birlikte gösterilir ve tek dokunuşla yeniden başlatılabilir.
+ *
+ * Sınır (dürüstçe): MP4 çoklayıcı yarım dosyaya ekleme yapamadığı için iş kaldığı kareden DEVAM ETMEZ;
+ * aynı ayarlarla baştan çalışır. Yarım çıktı dosyası silinir.
+ */
+object JobCheckpoint {
+    const val STATE_RUNNING = "running"
+    const val STATE_TIMEOUT = "timeout"
+    const val STATE_INTERRUPTED = "interrupted"
+
+    data class Record(
+        val input: String,
+        val output: String,
+        val options: JobOptions,
+        val state: String,
+        val framesDone: Long,
+        val positionUs: Long,
+        val durationUs: Long,
+        val updatedMs: Long,
+    ) {
+        val fraction: Float get() = if (durationUs > 0) (positionUs.toDouble() / durationUs).coerceIn(0.0, 1.0).toFloat() else 0f
+    }
+
+    private const val PREFS = "vc_checkpoint"
+
+    fun save(context: Context, record: Record) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .putString("input", record.input)
+            .putString("output", record.output)
+            .putBoolean("hevc", record.options.preferHevc)
+            .putFloat("quality", record.options.quality)
+            .putString("codec", record.options.codec)
+            .putBoolean("remux", record.options.softSubtitleRemux)
+            .putBoolean("hwDecode", record.options.hardwareBufferDecode)
+            .putString("state", record.state)
+            .putLong("frames", record.framesDone)
+            .putLong("position", record.positionUs)
+            .putLong("duration", record.durationUs)
+            .putLong("updated", record.updatedMs)
+            .commit()
+    }
+
+    fun load(context: Context): Record? {
+        val p = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val input = p.getString("input", null) ?: return null
+        val output = p.getString("output", null) ?: return null
+        return Record(
+            input, output,
+            JobOptions(
+                preferHevc = p.getBoolean("hevc", false), quality = p.getFloat("quality", 1f), codec = p.getString("codec", null),
+                softSubtitleRemux = p.getBoolean("remux", false), hardwareBufferDecode = p.getBoolean("hwDecode", false),
+            ),
+            p.getString("state", STATE_RUNNING) ?: STATE_RUNNING,
+            p.getLong("frames", 0), p.getLong("position", 0), p.getLong("duration", 0), p.getLong("updated", 0),
+        )
+    }
+
+    /** Hizmet çalışmıyorken "çalışıyor" görünen kayıt: süreç öldürülmüş demektir. */
+    fun pending(context: Context): Record? {
+        val record = load(context) ?: return null
+        return if (record.state == STATE_RUNNING && !JobState.running) record.copy(state = STATE_INTERRUPTED) else record.takeIf { it.state != STATE_RUNNING }
+    }
+
+    fun mark(context: Context, state: String) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString("state", state).commit()
+    }
+
+    fun clear(context: Context) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().clear().commit()
+    }
+}
+
+/**
  * Video işini taşıyan ön plan hizmeti. Android 15+ üzerinde `mediaProcessing`,
  * Android 11-14 üzerinde `dataSync` türüyle çalışır.
  */
@@ -1436,6 +2009,9 @@ class CleanerService : Service() {
     private val main = Handler(Looper.getMainLooper())
     private var job: VideoJob? = null
     private var worker: Thread? = null
+
+    @Volatile
+    private var timedOut = false
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -1448,6 +2024,9 @@ class CleanerService : Service() {
                 val options = JobOptions(
                     preferHevc = intent.getBooleanExtra(EXTRA_HEVC, false),
                     quality = intent.getFloatExtra(EXTRA_QUALITY, 1.0f),
+                    codec = intent.getStringExtra(EXTRA_CODEC),
+                    softSubtitleRemux = intent.getBooleanExtra(EXTRA_REMUX, false),
+                    hardwareBufferDecode = intent.getBooleanExtra(EXTRA_HW_DECODE, false),
                 )
                 if (input == null || output == null || worker != null) {
                     if (worker == null) stopSelf(startId)
@@ -1476,9 +2055,20 @@ class CleanerService : Service() {
         JobState.output = null
 
         var lastNotified = 0L
-        val videoJob = VideoJob(applicationContext, input, output, options) { progress ->
+        var lastSaved = 0L
+        timedOut = false
+        val checkpoint = JobCheckpoint.Record(input.toString(), output.toString(), options, JobCheckpoint.STATE_RUNNING, 0, 0, 0, System.currentTimeMillis())
+        JobCheckpoint.save(applicationContext, checkpoint)
+        val videoJob = VideoJob(applicationContext, input, output, options, InferenceRuntime.restorer(applicationContext)) { progress ->
             main.post { JobState.progress = progress }
             val now = SystemClock.elapsedRealtime()
+            if (now - lastSaved >= CHECKPOINT_INTERVAL_MS) {
+                lastSaved = now
+                JobCheckpoint.save(
+                    applicationContext,
+                    checkpoint.copy(framesDone = progress.framesEncoded, positionUs = progress.positionUs, durationUs = progress.durationUs, updatedMs = System.currentTimeMillis()),
+                )
+            }
             if (now - lastNotified >= 1000) {
                 lastNotified = now
                 manager.notify(NOTIFICATION_ID, notification("${progress.framesEncoded} kare · ${"%.0f".format(progress.framesPerSecond)} kare/sn", progress.fraction))
@@ -1493,7 +2083,11 @@ class CleanerService : Service() {
             try {
                 result = videoJob.run()
             } catch (e: JobCancelledException) {
-                error = "İptal edildi"
+                error = if (timedOut) {
+                    "Android ön plan işleme süresi (24 saatte 6 saat) doldu. İş kaydedildi; uygulamadan yeniden başlatabilirsiniz (baştan işlenir)."
+                } else {
+                    "İptal edildi"
+                }
             } catch (e: Throwable) {
                 error = e.message ?: e.javaClass.simpleName
             } finally {
@@ -1512,6 +2106,8 @@ class CleanerService : Service() {
             } else {
                 Log.e(TAG, "RESULT ok=false error=\"$error\"")
             }
+            // Başarı veya kullanıcı iptali: kayıt silinir. Süre dolması: kayıt "timeout" olarak kalır.
+            if (timedOut) JobCheckpoint.mark(applicationContext, JobCheckpoint.STATE_TIMEOUT) else JobCheckpoint.clear(applicationContext)
             main.post {
                 JobState.output = if (result != null) output else null
                 JobState.result = result
@@ -1525,9 +2121,16 @@ class CleanerService : Service() {
         }, "video-cleaner-job").also { it.start() }
     }
 
-    /** Android 15+: ön plan hizmeti süre sınırı doldu. */
+    /**
+     * Android 15+: ön plan hizmeti süre sınırı doldu. Sistem birkaç saniye içinde durmamızı bekler:
+     * iş iptal edilir, kayıt "timeout" olarak işaretlenir ve hizmet hemen ön plandan çıkıp durur.
+     */
     override fun onTimeout(startId: Int, fgsType: Int) {
+        timedOut = true
+        JobCheckpoint.mark(applicationContext, JobCheckpoint.STATE_TIMEOUT)
         job?.cancel()
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
     }
 
     override fun onDestroy() {
@@ -1559,6 +2162,10 @@ class CleanerService : Service() {
         private const val EXTRA_OUTPUT = "output"
         private const val EXTRA_HEVC = "hevc"
         private const val EXTRA_QUALITY = "quality"
+        private const val EXTRA_CODEC = "codec"
+        private const val EXTRA_REMUX = "remux"
+        private const val EXTRA_HW_DECODE = "hwDecode"
+        private const val CHECKPOINT_INTERVAL_MS = 5_000L
         const val TAG = "VideoCleaner"
         private const val CHANNEL_ID = "video_cleaner_job"
         private const val NOTIFICATION_ID = 1
@@ -1571,6 +2178,9 @@ class CleanerService : Service() {
                 .putExtra(EXTRA_OUTPUT, output.toString())
                 .putExtra(EXTRA_HEVC, options.preferHevc)
                 .putExtra(EXTRA_QUALITY, options.quality)
+                .putExtra(EXTRA_CODEC, options.codec)
+                .putExtra(EXTRA_REMUX, options.softSubtitleRemux)
+                .putExtra(EXTRA_HW_DECODE, options.hardwareBufferDecode)
             context.startForegroundService(intent)
         }
 

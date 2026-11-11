@@ -102,7 +102,12 @@ class App : ComponentActivity() {
         val autoInput = intent.getStringExtra("vc_input")
         val autoOutput = intent.getStringExtra("vc_output")
         if (debuggable && autoInput != null && autoOutput != null) {
-            val options = JobOptions(preferHevc = intent.getBooleanExtra("vc_hevc", false))
+            val options = JobOptions(
+                preferHevc = intent.getBooleanExtra("vc_hevc", false),
+                codec = intent.getStringExtra("vc_codec"),
+                softSubtitleRemux = intent.getBooleanExtra("vc_remux", false),
+                hardwareBufferDecode = intent.getBooleanExtra("vc_hw_decode", false),
+            )
             CleanerService.start(this, Uri.fromFile(java.io.File(autoInput)), Uri.fromFile(java.io.File(autoOutput)), options)
             return
         }
@@ -185,7 +190,15 @@ fun MainScreen(incoming: Uri? = null, onIncomingConsumed: () -> Unit = {}) {
     var inputName by rememberSaveable { mutableStateOf("") }
     var preferHevc by rememberSaveable { mutableStateOf(false) }
     var highQuality by rememberSaveable { mutableStateOf(false) }
+    var softRemux by rememberSaveable { mutableStateOf(false) }
+    var diagnostics by remember { mutableStateOf<List<Pair<String, String>>?>(null) }
+    var showDiagnostics by rememberSaveable { mutableStateOf(false) }
+    var checkpointVersion by remember { mutableStateOf(0) }
     val coreInfo = remember { describeCore() }
+    val pending = remember(JobState.running, checkpointVersion) { if (JobState.running) null else JobCheckpoint.pending(context) }
+    LaunchedEffect(showDiagnostics) {
+        if (showDiagnostics && diagnostics == null) diagnostics = withContext(Dispatchers.IO) { Diagnostics.collect(context) }
+    }
 
     LaunchedEffect(incoming) {
         if (incoming != null) {
@@ -201,14 +214,21 @@ fun MainScreen(incoming: Uri? = null, onIncomingConsumed: () -> Unit = {}) {
 
     val pickVideo = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) {
+            // Kalıcı okuma izni: iş yarım kalırsa (6 saat sınırı, süreç sonlanması) yeniden başlatılabilsin.
+            runCatching { context.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) }
             input = uri
             inputName = displayName(context, uri)
+            softRemux = false
         }
     }
     val createOutput = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("video/mp4")) { uri ->
         val source = input
         if (uri != null && source != null) {
-            CleanerService.start(context, source, uri, JobOptions(preferHevc, if (highQuality) 2.0f else 1.0f))
+            runCatching {
+                context.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+            }
+            val remux = softRemux && info?.subtitleTracks?.isNotEmpty() == true
+            CleanerService.start(context, source, uri, JobOptions(preferHevc, if (highQuality) 2.0f else 1.0f, softSubtitleRemux = remux))
         }
     }
     // Bildirim izni reddedilse de iş çalışır; yalnızca ilerleme bildirimi görünmez.
@@ -244,7 +264,21 @@ fun MainScreen(incoming: Uri? = null, onIncomingConsumed: () -> Unit = {}) {
         progress = JobState.progress,
         result = JobState.result,
         error = JobState.error,
+        softRemux = softRemux,
+        pending = pending,
+        diagnostics = diagnostics.takeIf { showDiagnostics },
+        diagnosticsOpen = showDiagnostics,
         onPick = { pickVideo.launch(arrayOf("video/*")) },
+        onSoftRemux = { softRemux = it },
+        onResume = { record ->
+            CleanerService.start(context, Uri.parse(record.input), Uri.parse(record.output), record.options)
+            checkpointVersion++
+        },
+        onDiscard = {
+            JobCheckpoint.clear(context)
+            checkpointVersion++
+        },
+        onDiagnostics = { showDiagnostics = !showDiagnostics },
         onCodec = { preferHevc = it },
         onQuality = { highQuality = it },
         onStart = onStart,
@@ -265,7 +299,15 @@ fun MainContent(
     progress: JobProgress,
     result: JobResult?,
     error: String?,
+    softRemux: Boolean = false,
+    pending: JobCheckpoint.Record? = null,
+    diagnostics: List<Pair<String, String>>? = null,
+    diagnosticsOpen: Boolean = false,
     onPick: () -> Unit,
+    onSoftRemux: (Boolean) -> Unit = {},
+    onResume: (JobCheckpoint.Record) -> Unit = {},
+    onDiscard: () -> Unit = {},
+    onDiagnostics: () -> Unit = {},
     onCodec: (Boolean) -> Unit,
     onQuality: (Boolean) -> Unit,
     onStart: () -> Unit,
@@ -295,6 +337,22 @@ fun MainContent(
                     )
                 }
 
+                if (pending != null && !running) {
+                    SectionCard(title = "Yarım kalan iş", isError = true) {
+                        Text(
+                            (if (pending.state == JobCheckpoint.STATE_TIMEOUT) "Android ön plan işleme süresi (24 saatte 6 saat) doldu."
+                            else "Uygulama işlem sürerken kapatıldı.") +
+                                " %d kare işlenmişti (%%%d). Yeniden başlatınca iş aynı ayarlarla BAŞTAN işlenir."
+                                    .format(Locale.ROOT, pending.framesDone, (pending.fraction * 100).toInt()),
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
+                        Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.padding(top = 8.dp)) {
+                            FilledTonalButton(onClick = { onResume(pending) }) { Text("Yeniden başlat") }
+                            OutlinedButton(onClick = onDiscard) { Text("Kaydı sil") }
+                        }
+                    }
+                }
+
                 SectionCard(title = "Kaynak") {
                     if (inputName == null) {
                         Text(
@@ -316,6 +374,7 @@ fun MainContent(
                                     append(" · ${codecLabel(info.videoMime)}")
                                     append(" · ses: ${codecLabel(info.audioMime)}")
                                     if (info.rotation != 0) append(" · ${info.rotation}° döndürülmüş")
+                                    if (info.subtitleTracks.isNotEmpty()) append(" · ${info.subtitleTracks.size} ayrı altyazı izi")
                                 },
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -333,6 +392,22 @@ fun MainContent(
                         Spacer(Modifier.width(8.dp))
                         FilterChip(selected = !highQuality, onClick = { onQuality(false) }, enabled = !running, label = { Text("Standart") })
                         FilterChip(selected = highQuality, onClick = { onQuality(true) }, enabled = !running, label = { Text("Yüksek") })
+                    }
+                    if (info != null && info.subtitleTracks.isNotEmpty()) {
+                        FilterChip(
+                            selected = softRemux,
+                            onClick = { onSoftRemux(!softRemux) },
+                            enabled = !running,
+                            label = { Text("Yalnızca ayrı altyazı izini çıkar") },
+                        )
+                        if (softRemux) {
+                            Text(
+                                "Bu dosyadaki altyazı görüntüye gömülü değil, ayrı bir izde. Video yeniden kodlanmadan, " +
+                                    "bayt bayt kopyalanır; kalite kaybı olmaz. Görüntüye gömülü yazılara dokunulmaz.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
                     }
                     Text(
                         (if (preferHevc) "HEVC: daha küçük dosya. " else "H.264: en geniş uyumluluk. ") +
@@ -408,6 +483,24 @@ fun MainContent(
                         Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.padding(top = 12.dp)) {
                             FilledTonalButton(onClick = onOpen) { Text("Aç") }
                             OutlinedButton(onClick = onShare) { Text("Paylaş") }
+                        }
+                    }
+                }
+
+                SectionCard(title = "Cihaz tanılaması") {
+                    TextButton(onClick = onDiagnostics) { Text(if (diagnosticsOpen) "Gizle" else "VC-Tester denetimini çalıştır") }
+                    if (diagnosticsOpen) {
+                        if (diagnostics == null) {
+                            LinearProgressIndicator(modifier = Modifier.fillMaxWidth().padding(top = 4.dp))
+                        } else {
+                            for ((key, value) in diagnostics) {
+                                Text(
+                                    "$key: $value",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.padding(top = 4.dp),
+                                )
+                            }
                         }
                     }
                 }
