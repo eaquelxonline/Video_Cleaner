@@ -335,21 +335,73 @@ struct RingTable {
 /// Okuyucusu olan bir yuva halkadan çıkarılsa bile üzerine yazılamaz
 /// ([`CoreError::SlotBusy`]); bu yüzden yapı `Sync`'tir ve çözücü, çıkarım ve
 /// kodlayıcı iş parçacıkları arasında güvenle paylaşılabilir.
+/// Halka belleğinin nerede durduğu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageKind {
+    /// Süreç yığınında tek parça, sayfa hizalı blok (masaüstü, test ve geri dönüş yolu).
+    Heap,
+    /// Android: her yuva ayrı bir `AHardwareBuffer` (BLOB; CPU okuma/yazma + GPU veri tamponu
+    /// kullanımıyla ayrılır, Vulkan dış bellek olarak içe aktarılabilir). Yuvalar ömür boyu
+    /// CPU için kilitli tutulur; Java yığınına kopya yoktur.
+    HardwareBuffer,
+}
+
+/// Halka belleği: yığın bloğu veya (Android'de) yuva başına bir donanım tamponu.
+enum RingStorage {
+    Heap(AlignedBlock),
+    #[cfg(target_os = "android")]
+    Hardware(hwbuf::SlotBuffers),
+}
+
+impl RingStorage {
+    fn kind(&self) -> StorageKind {
+        match self {
+            RingStorage::Heap(_) => StorageKind::Heap,
+            #[cfg(target_os = "android")]
+            RingStorage::Hardware(_) => StorageKind::HardwareBuffer,
+        }
+    }
+
+    fn slot_base(&self, slot: usize, stride: usize) -> *mut u8 {
+        match self {
+            // SAFETY: slot < 30 olduğundan ofset ayrılan bloğun içindedir.
+            RingStorage::Heap(block) => unsafe { block.ptr.as_ptr().add(slot * stride) },
+            #[cfg(target_os = "android")]
+            RingStorage::Hardware(slots) => slots.ptr(slot),
+        }
+    }
+}
+
 pub struct FrameRing {
     geo: FrameGeometry,
     stride: usize,
-    block: AlignedBlock,
+    storage: RingStorage,
     table: Mutex<RingTable>,
 }
 
 impl FrameRing {
-    /// Verilen geometri için 30 yuvalı halka ayırır.
+    /// Verilen geometri için 30 yuvalı halka ayırır (yığın belleği).
     pub fn new(geo: FrameGeometry) -> Result<Self, CoreError> {
+        Self::with_storage(geo, StorageKind::Heap)
+    }
+
+    /// İstenen bellek türüyle halka ayırır. Donanım tamponu ayrılamazsa (Android dışı, sürücü
+    /// reddi, hizasız adres) yığın belleğine düşülür; gerçekte kullanılan tür [`Self::storage_kind`].
+    pub fn with_storage(geo: FrameGeometry, kind: StorageKind) -> Result<Self, CoreError> {
         let stride = round_up(geo.frame_bytes(), 64);
         let total = stride
             .checked_mul(WINDOW_FRAMES)
             .ok_or(CoreError::OutOfMemory)?;
-        let block = AlignedBlock::zeroed(total, page_size().max(64))?;
+        let storage = match kind {
+            #[cfg(target_os = "android")]
+            StorageKind::HardwareBuffer => {
+                match hwbuf::SlotBuffers::allocate(stride, WINDOW_FRAMES) {
+                    Some(slots) => RingStorage::Hardware(slots),
+                    None => RingStorage::Heap(AlignedBlock::zeroed(total, page_size().max(64))?),
+                }
+            }
+            _ => RingStorage::Heap(AlignedBlock::zeroed(total, page_size().max(64))?),
+        };
         let empty = SlotInfo {
             state: SlotState::Free,
             readers: 0,
@@ -362,7 +414,7 @@ impl FrameRing {
         Ok(Self {
             geo,
             stride,
-            block,
+            storage,
             table: Mutex::new(RingTable {
                 slots: [empty; WINDOW_FRAMES],
                 head: 0,
@@ -383,9 +435,14 @@ impl FrameRing {
         self.stride * WINDOW_FRAMES
     }
 
-    /// Bloğun başlangıç adresi (hizalama testleri ve tanılama için).
+    /// İlk yuvanın adresi (hizalama testleri ve tanılama için).
     pub fn base_addr(&self) -> usize {
-        self.block.ptr.as_ptr() as usize
+        self.slot_ptr(0) as usize
+    }
+
+    /// Gerçekte kullanılan bellek türü.
+    pub fn storage_kind(&self) -> StorageKind {
+        self.storage.kind()
     }
 
     /// `[en eski kare, bir sonraki kare)` sıra numarası aralığı.
@@ -407,8 +464,7 @@ impl FrameRing {
 
     fn slot_ptr(&self, slot: usize) -> *mut u8 {
         debug_assert!(slot < WINDOW_FRAMES);
-        // SAFETY: slot < 30 olduğundan ofset ayrılan bloğun içindedir.
-        unsafe { self.block.ptr.as_ptr().add(slot * self.stride) }
+        self.storage.slot_base(slot, self.stride)
     }
 
     /// Bir sonraki kare için yazma kirası alır. Kira `commit` edilmeden düşerse
@@ -590,6 +646,155 @@ impl ReadLease<'_> {
 impl Drop for ReadLease<'_> {
     fn drop(&mut self) {
         self.ring.release_read(self.slot);
+    }
+}
+
+// ============================================================================
+// 3b. Android donanım tamponları (AHardwareBuffer, NDK API 26+; lockPlanes API 29+)
+// ============================================================================
+
+#[cfg(target_os = "android")]
+pub mod hwbuf {
+    use std::ffi::c_void;
+
+    /// `AHardwareBuffer` (opak).
+    #[repr(C)]
+    pub struct AHardwareBuffer {
+        _private: [u8; 0],
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    pub struct Desc {
+        pub width: u32,
+        pub height: u32,
+        pub layers: u32,
+        pub format: u32,
+        pub usage: u64,
+        pub stride: u32,
+        pub rfu0: u32,
+        pub rfu1: u64,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct Plane {
+        pub data: *mut c_void,
+        pub pixel_stride: u32,
+        pub row_stride: u32,
+    }
+
+    #[repr(C)]
+    pub struct Planes {
+        pub plane_count: u32,
+        pub planes: [Plane; 4],
+    }
+
+    pub const FORMAT_BLOB: u32 = 0x21;
+    pub const FORMAT_Y8CB8CR8_420: u32 = 0x23;
+    pub const USAGE_CPU_READ_OFTEN: u64 = 3;
+    pub const USAGE_CPU_WRITE_OFTEN: u64 = 3 << 4;
+    pub const USAGE_GPU_DATA_BUFFER: u64 = 1 << 24;
+
+    #[link(name = "nativewindow")]
+    unsafe extern "C" {
+        fn AHardwareBuffer_allocate(desc: *const Desc, out: *mut *mut AHardwareBuffer) -> i32;
+        fn AHardwareBuffer_release(buffer: *mut AHardwareBuffer);
+        pub fn AHardwareBuffer_describe(buffer: *const AHardwareBuffer, out: *mut Desc);
+        fn AHardwareBuffer_lock(
+            buffer: *mut AHardwareBuffer,
+            usage: u64,
+            fence: i32,
+            rect: *const c_void,
+            out: *mut *mut c_void,
+        ) -> i32;
+        pub fn AHardwareBuffer_lockPlanes(
+            buffer: *mut AHardwareBuffer,
+            usage: u64,
+            fence: i32,
+            rect: *const c_void,
+            out: *mut Planes,
+        ) -> i32;
+        pub fn AHardwareBuffer_unlock(buffer: *mut AHardwareBuffer, fence: *mut i32) -> i32;
+    }
+
+    #[link(name = "android")]
+    unsafe extern "C" {
+        /// `android.hardware.HardwareBuffer` → `AHardwareBuffer*` (başvuru sayısı artmaz).
+        pub fn AHardwareBuffer_fromHardwareBuffer(
+            env: *mut c_void,
+            object: *mut c_void,
+        ) -> *mut AHardwareBuffer;
+    }
+
+    /// Halkanın 30 yuvası: her biri ayrı BLOB donanım tamponu, ömür boyu CPU için kilitli.
+    pub struct SlotBuffers {
+        slots: Vec<(*mut AHardwareBuffer, *mut u8)>,
+    }
+
+    // SAFETY: tamponlar bu yapıya aittir; içeriğe erişim FrameRing'in kira durum makinesiyle eşzamanlanır.
+    unsafe impl Send for SlotBuffers {}
+    unsafe impl Sync for SlotBuffers {}
+
+    impl SlotBuffers {
+        /// `count` adet `bytes` boyutlu BLOB tamponu ayırıp kilitler. Herhangi biri başarısız olursa
+        /// (sürücü BLOB+GPU kullanımını desteklemiyor, bellek yok, adres 64 bayta hizalı değil) `None`.
+        pub fn allocate(bytes: usize, count: usize) -> Option<Self> {
+            let mut out = Self {
+                slots: Vec::with_capacity(count),
+            };
+            for _ in 0..count {
+                let desc = Desc {
+                    width: u32::try_from(bytes).ok()?,
+                    height: 1,
+                    layers: 1,
+                    format: FORMAT_BLOB,
+                    usage: USAGE_CPU_READ_OFTEN | USAGE_CPU_WRITE_OFTEN | USAGE_GPU_DATA_BUFFER,
+                    ..Desc::default()
+                };
+                let mut buffer = std::ptr::null_mut();
+                // SAFETY: desc geçerli; çıktı işaretçisi yerel değişkendir.
+                if unsafe { AHardwareBuffer_allocate(&desc, &mut buffer) } != 0 || buffer.is_null()
+                {
+                    return None;
+                }
+                let mut ptr = std::ptr::null_mut();
+                let usage = USAGE_CPU_READ_OFTEN | USAGE_CPU_WRITE_OFTEN;
+                // SAFETY: buffer az önce ayrıldı; çit yok (-1), tüm tampon.
+                let locked =
+                    unsafe { AHardwareBuffer_lock(buffer, usage, -1, std::ptr::null(), &mut ptr) };
+                if locked != 0 || ptr.is_null() || !(ptr as usize).is_multiple_of(64) {
+                    // SAFETY: kilitlenemeyen tamponu bırak.
+                    unsafe {
+                        if locked == 0 {
+                            AHardwareBuffer_unlock(buffer, std::ptr::null_mut());
+                        }
+                        AHardwareBuffer_release(buffer);
+                    }
+                    return None;
+                }
+                // SAFETY: yeni kilitlenen bellek yazılabilir ve `bytes` uzunluğundadır.
+                unsafe { std::ptr::write_bytes(ptr as *mut u8, 0, bytes) };
+                out.slots.push((buffer, ptr as *mut u8));
+            }
+            Some(out)
+        }
+
+        pub fn ptr(&self, slot: usize) -> *mut u8 {
+            self.slots[slot].1
+        }
+    }
+
+    impl Drop for SlotBuffers {
+        fn drop(&mut self) {
+            for &(buffer, _) in &self.slots {
+                // SAFETY: her tampon bir kez kilitlendi ve bir kez bırakılıyor.
+                unsafe {
+                    AHardwareBuffer_unlock(buffer, std::ptr::null_mut());
+                    AHardwareBuffer_release(buffer);
+                }
+            }
+        }
     }
 }
 
@@ -2285,8 +2490,13 @@ pub struct Pipeline {
 }
 
 impl Pipeline {
-    /// Verilen geometri için hat kurar.
+    /// Verilen geometri için hat kurar (yığın belleği).
     pub fn new(geo: FrameGeometry) -> Result<Self, CoreError> {
+        Self::with_storage(geo, StorageKind::Heap)
+    }
+
+    /// Halka belleğinin türünü seçerek hat kurar (bkz. [`FrameRing::with_storage`]).
+    pub fn with_storage(geo: FrameGeometry, kind: StorageKind) -> Result<Self, CoreError> {
         let estimates = || {
             (0..HALF_WINDOW)
                 .map(|_| Estimate::new(geo))
@@ -2294,7 +2504,7 @@ impl Pipeline {
         };
         Ok(Self {
             geo,
-            ring: FrameRing::new(geo)?,
+            ring: FrameRing::with_storage(geo, kind)?,
             sched: Scheduler::new(),
             scene: SceneDetector::new(geo, SceneCutConfig::default()),
             est_emit: estimates(),
@@ -2678,6 +2888,414 @@ pub unsafe fn unpack_nv12(
         }
     }
     Ok(())
+}
+
+// ============================================================================
+// 9b. VC-Core motoru (planın JNI arayüzü: vcInitEngine / vcPush* / vcProcessWindow / vcRunTesterAudit)
+// ============================================================================
+
+/// Motorun pencere politikası.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EngineMode {
+    /// Mod B (15+15); zor kare ipucu gelirse Mod A (14+1+15). Varsayılan üretim modu.
+    Auto,
+    /// Yalnızca Mod B (zor kare ipuçları yok sayılır).
+    B,
+    /// Her kare Mod A ile (en yüksek hassasiyet, en yavaş).
+    A,
+}
+
+impl EngineMode {
+    /// JNI tamsayısından: 0 = otomatik, 1 = yalnız B, 2 = yalnız A.
+    pub fn from_i32(v: i32) -> Option<Self> {
+        match v {
+            0 => Some(EngineMode::Auto),
+            1 => Some(EngineMode::B),
+            2 => Some(EngineMode::A),
+            _ => None,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            EngineMode::Auto => "auto",
+            EngineMode::B => "B",
+            EngineMode::A => "A",
+        }
+    }
+}
+
+/// VC-Tester çalışma zamanı sayaçları (motor düzeyi; hat sayaçlarına ek).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AuditCounters {
+    /// Donanım tamponundan (HardwareBuffer) itilen kareler.
+    pub frames_hw: u64,
+    /// CPU tamponundan itilen kareler.
+    pub frames_cpu: u64,
+    /// Zaman damgası artan sırada olmadığı için reddedilen kareler.
+    pub pts_rejected: u64,
+    /// İşlenen pencere sayısı ve süreleri (µs).
+    pub windows_processed: u64,
+    pub window_us_total: u64,
+    pub window_us_max: u64,
+    /// Giriş ve çıkış Y düzlemlerinin sırayla FNV-1a özetleri (kimlik onarıcıda eşit olmalı).
+    pub input_digest: u64,
+    pub output_digest: u64,
+}
+
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+fn fnv1a(mut hash: u64, bytes: &[u8]) -> u64 {
+    for &b in bytes {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+/// Yüklü `.so` (veya test ikilisinin) PT_LOAD bölütlerinin en küçük hizası. 16 KB sayfalı cihazlar
+/// için ≥ 16384 olmalıdır. Bulunamazsa 0.
+pub fn elf_load_alignment() -> u64 {
+    #[cfg(all(
+        any(target_os = "linux", target_os = "android"),
+        target_pointer_width = "64"
+    ))]
+    {
+        use std::ffi::c_char;
+        #[repr(C)]
+        struct Phdr {
+            p_type: u32,
+            p_flags: u32,
+            p_offset: u64,
+            p_vaddr: u64,
+            p_paddr: u64,
+            p_filesz: u64,
+            p_memsz: u64,
+            p_align: u64,
+        }
+        #[repr(C)]
+        struct DlPhdrInfo {
+            addr: usize,
+            name: *const c_char,
+            phdr: *const Phdr,
+            phnum: u16,
+        }
+        unsafe extern "C" {
+            fn dl_iterate_phdr(
+                cb: unsafe extern "C" fn(*mut DlPhdrInfo, usize, *mut c_void) -> i32,
+                data: *mut c_void,
+            ) -> i32;
+        }
+        struct Search {
+            target: usize,
+            align: u64,
+        }
+        unsafe extern "C" fn visit(info: *mut DlPhdrInfo, _size: usize, data: *mut c_void) -> i32 {
+            // SAFETY: dinamik bağlayıcı geçerli bilgi verir; data bizim Search yapımızdır.
+            unsafe {
+                let info = &*info;
+                let search = &mut *(data as *mut Search);
+                let headers = std::slice::from_raw_parts(info.phdr, info.phnum as usize);
+                let contains = headers.iter().any(|h| {
+                    h.p_type == 1 && {
+                        let start = info.addr + h.p_vaddr as usize;
+                        search.target >= start && search.target < start + h.p_memsz as usize
+                    }
+                });
+                if contains {
+                    search.align = headers
+                        .iter()
+                        .filter(|h| h.p_type == 1)
+                        .map(|h| h.p_align)
+                        .min()
+                        .unwrap_or(0);
+                    return 1;
+                }
+                0
+            }
+        }
+        let mut search = Search {
+            target: elf_load_alignment as fn() -> u64 as usize,
+            align: 0,
+        };
+        // SAFETY: geri çağırma yalnızca bu çağrı boyunca kullanılır.
+        unsafe { dl_iterate_phdr(visit, &mut search as *mut Search as *mut c_void) };
+        search.align
+    }
+    #[cfg(not(all(
+        any(target_os = "linux", target_os = "android"),
+        target_pointer_width = "64"
+    )))]
+    {
+        0
+    }
+}
+
+/// VC-Core motoru: hat (halka + zamanlayıcı) geometrisi ilk karede belirlenir.
+pub struct Engine {
+    mode: EngineMode,
+    prefer_vulkan: bool,
+    storage: StorageKind,
+    pipeline: Option<Pipeline>,
+    force_a: bool,
+    audit: AuditCounters,
+}
+
+impl Engine {
+    /// `storage`: halka belleği tercihi (Android'de donanım tamponu; yoksa yığın).
+    pub fn new(mode: EngineMode, prefer_vulkan: bool, storage: StorageKind) -> Self {
+        Self {
+            mode,
+            prefer_vulkan,
+            storage,
+            pipeline: None,
+            force_a: mode == EngineMode::A,
+            audit: AuditCounters::default(),
+        }
+    }
+
+    /// Hat (ilk karede kurulur).
+    pub fn pipeline(&self) -> Option<&Pipeline> {
+        self.pipeline.as_ref()
+    }
+
+    /// Hattı ilk karede kurar; sonraki karelerde geometri değişemez.
+    fn ensure(&mut self, width: usize, height: usize) -> Result<&mut Pipeline, CoreError> {
+        let geo = FrameGeometry::new(width & !1, height & !1)?;
+        if self.pipeline.is_none() {
+            let mut pipeline = Pipeline::with_storage(geo, self.storage)?;
+            pipeline.set_integrity_check(true);
+            self.pipeline = Some(pipeline);
+        }
+        let pipeline = self.pipeline.as_mut().ok_or(CoreError::Internal)?;
+        if pipeline.geometry() != geo {
+            return Err(CoreError::InvalidGeometry);
+        }
+        Ok(pipeline)
+    }
+
+    fn after_push(
+        &mut self,
+        result: Result<FrameMeta, CoreError>,
+        hardware: bool,
+    ) -> Result<u64, CoreError> {
+        match result {
+            Ok(meta) => {
+                if hardware {
+                    self.audit.frames_hw += 1;
+                } else {
+                    self.audit.frames_cpu += 1;
+                }
+                let pipeline = self.pipeline.as_mut().ok_or(CoreError::Internal)?;
+                if let Ok(frame) = pipeline.ring().read(meta.seq) {
+                    self.audit.input_digest = fnv1a(
+                        self.audit.input_digest ^ FNV_OFFSET,
+                        &frame.data()[..pipeline.geometry().luma_bytes()],
+                    );
+                }
+                if self.force_a && self.mode != EngineMode::B {
+                    let _ = pipeline.set_hint(meta.seq, Hint::Precision);
+                }
+                Ok(meta.seq)
+            }
+            Err(CoreError::NonMonotonicPts) => {
+                self.audit.pts_rejected += 1;
+                Err(CoreError::NonMonotonicPts)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Üç düzlemli YUV 4:2:0 kare (MediaCodec Image veya kilitlenmiş AHardwareBuffer düzlemleri).
+    ///
+    /// # Safety
+    /// Düzlem işaretçileri çağrı boyunca okunabilir olmalıdır.
+    pub unsafe fn push_planes(
+        &mut self,
+        width: usize,
+        height: usize,
+        y: RawPlane,
+        u: RawPlane,
+        v: RawPlane,
+        pts_us: i64,
+        flags: u32,
+        hardware: bool,
+    ) -> Result<u64, CoreError> {
+        let pipeline = self.ensure(width, height)?;
+        let geo = pipeline.geometry();
+        let result = pipeline
+            .push_with(|dst| {
+                // SAFETY: çağıranın sözleşmesi.
+                unsafe { pack_nv12(geo, y, u, v, dst)? };
+                Ok(Some((pts_us, flags)))
+            })
+            .and_then(|m| m.ok_or(CoreError::Internal));
+        self.after_push(result, hardware)
+    }
+
+    /// Sıkı NV12 kare (CPU yolu).
+    pub fn push_nv12(
+        &mut self,
+        width: usize,
+        height: usize,
+        nv12: &[u8],
+        pts_us: i64,
+        flags: u32,
+    ) -> Result<u64, CoreError> {
+        let pipeline = self.ensure(width, height)?;
+        let result = pipeline.push_frame(nv12, pts_us, flags);
+        self.after_push(result, false)
+    }
+
+    /// Sıradaki adım (hat kurulmadıysa kare ister).
+    pub fn poll(&mut self) -> Step {
+        match self.pipeline.as_mut() {
+            Some(p) => p.poll(),
+            None => Step::NeedFrames(WINDOW_FRAMES),
+        }
+    }
+
+    /// Hazır pencere varsa onarıcıyla işler. 0: pencere yok, 1: Mod B, 2: Mod A.
+    /// `force_mode_a`: bundan sonra itilen karelere Mod A ipucu verilir (yalnız-B modunda yok sayılır).
+    pub fn process_window(
+        &mut self,
+        force_mode_a: bool,
+        restorer: &mut dyn Restorer,
+    ) -> Result<i32, CoreError> {
+        if force_mode_a {
+            self.force_a = true;
+        }
+        let Some(pipeline) = self.pipeline.as_mut() else {
+            return Ok(0);
+        };
+        let Step::Window(plan) = pipeline.poll() else {
+            return Ok(0);
+        };
+        let started = std::time::Instant::now();
+        {
+            let mut io = pipeline.window_io()?;
+            restorer.restore(&mut io)?;
+        }
+        pipeline.complete_window()?;
+        let us = started.elapsed().as_micros() as u64;
+        self.audit.windows_processed += 1;
+        self.audit.window_us_total += us;
+        self.audit.window_us_max = self.audit.window_us_max.max(us);
+        Ok(if plan.mode == Mode::A { 2 } else { 1 })
+    }
+
+    /// Sıradaki çıkış karesi (NV12).
+    pub fn pop_output(&mut self, dst: &mut [u8]) -> Result<Option<OutputMeta>, CoreError> {
+        let Some(pipeline) = self.pipeline.as_mut() else {
+            return Ok(None);
+        };
+        let out = pipeline.pop_output(dst)?;
+        if out.is_some() {
+            let luma = pipeline.geometry().luma_bytes();
+            self.audit.output_digest = fnv1a(self.audit.output_digest ^ FNV_OFFSET, &dst[..luma]);
+        }
+        Ok(out)
+    }
+
+    /// Kaynak bitti.
+    pub fn finish(&mut self) {
+        if let Some(p) = self.pipeline.as_mut() {
+            p.finish();
+        }
+    }
+
+    /// Motor sayaçları.
+    pub fn audit(&self) -> AuditCounters {
+        self.audit
+    }
+
+    /// VC-Tester çalışma zamanı raporu (JSON, yalnız ASCII). Alanlar:
+    /// mediaSync (kare/PTS/sıra), preservation (koruma kapısı, özet eşitliği), scheduler (Mod A/B),
+    /// platform (sayfa boyutu, ELF LOAD hizası, bellek türü ve boyutu), runtime (model durumu).
+    pub fn tester_audit_json(&self) -> String {
+        let st = self
+            .pipeline
+            .as_ref()
+            .map(|p| p.stats())
+            .unwrap_or_default();
+        let ring_bytes = self
+            .pipeline
+            .as_ref()
+            .map(|p| p.ring().pool_bytes())
+            .unwrap_or(0);
+        let storage = match self.pipeline.as_ref().map(|p| p.ring().storage_kind()) {
+            Some(StorageKind::HardwareBuffer) => "hardware_buffer",
+            Some(StorageKind::Heap) => "heap",
+            None => "none",
+        };
+        let (w, h) = self
+            .pipeline
+            .as_ref()
+            .map(|p| (p.geometry().width(), p.geometry().height()))
+            .unwrap_or((0, 0));
+        let align = elf_load_alignment();
+        let page = page_size();
+        let a = self.audit;
+        let frames_ok = st.frames_in == st.frames_out;
+        let bit_exact = st.modified_pixels == 0 && a.input_digest == a.output_digest;
+        let kernel = match kernels::backend_id() {
+            1 => "avx2",
+            2 => "neon",
+            _ => "portable",
+        };
+        let avg = a
+            .window_us_total
+            .checked_div(a.windows_processed)
+            .unwrap_or(0);
+        format!(
+            concat!(
+                "{{\"abi\":{},\"version\":\"{}\",\"mode\":\"{}\",\"size\":\"{}x{}\",",
+                "\"mediaSync\":{{\"frames_in\":{},\"frames_out\":{},\"frames_equal\":{},\"pts_rejected\":{},\"order_violations\":{},\"frames_hw\":{},\"frames_cpu\":{}}},",
+                "\"preservation\":{{\"violations\":{},\"modified_pixels\":{},\"input_digest\":\"{:016x}\",\"output_digest\":\"{:016x}\",\"bit_exact\":{}}},",
+                "\"scheduler\":{{\"windows_a\":{},\"windows_b\":{},\"bridges\":{},\"bypassed\":{},\"fused\":{},\"scene_cuts\":{},\"window_us_avg\":{},\"window_us_max\":{}}},",
+                "\"platform\":{{\"page_size\":{},\"elf_load_align\":{},\"elf_16k_ok\":{},\"kernel\":\"{}\",\"storage\":\"{}\",\"ring_bytes\":{},\"max_occupancy\":{}}},",
+                "\"runtime\":{{\"vulkan\":\"{}\",\"models\":\"none (identity restorer; weights not loaded)\"}}}}"
+            ),
+            ABI_VERSION,
+            version(),
+            self.mode.name(),
+            w,
+            h,
+            st.frames_in,
+            st.frames_out,
+            frames_ok,
+            a.pts_rejected,
+            st.order_violations,
+            a.frames_hw,
+            a.frames_cpu,
+            st.preservation_violations,
+            st.modified_pixels,
+            a.input_digest,
+            a.output_digest,
+            bit_exact,
+            st.sched.windows_a,
+            st.sched.windows_b,
+            st.sched.bridges,
+            st.sched.bypassed,
+            st.sched.fused,
+            st.scene_cuts,
+            avg,
+            a.window_us_max,
+            page,
+            align,
+            align >= 16384,
+            kernel,
+            storage,
+            ring_bytes,
+            st.max_occupancy,
+            if self.prefer_vulkan {
+                "requested, not used (no compute shaders yet)"
+            } else {
+                "off"
+            },
+        )
+    }
 }
 
 // ============================================================================
@@ -3355,6 +3973,333 @@ pub mod jni {
             }
             Ok(values.len() as i64)
         }) as i32
+    }
+
+    // ---- VC-Core motor arayüzü (planın sözleşmesi) ------------------------------------------
+
+    const ENGINE_MAGIC: u64 = 0x5643_454E_4731_3030; // "VCENG100"
+    const JNI_NEW_STRING_UTF: usize = 167;
+
+    struct EngineHandle {
+        magic: u64,
+        engine: Mutex<Engine>,
+    }
+
+    fn engine_call<F>(ctx: i64, f: F) -> i64
+    where
+        F: FnOnce(&mut Engine) -> Result<i64, CoreError>,
+    {
+        let ptr = ctx as usize as *const EngineHandle;
+        if ptr.is_null() || !ptr.is_aligned() {
+            return CoreError::InvalidHandle.code() as i64;
+        }
+        // SAFETY: ctx vcInitEngine tarafından Box::into_raw ile üretilir, vcDestroy'a kadar geçerlidir.
+        let handle = unsafe { &*ptr };
+        if handle.magic != ENGINE_MAGIC {
+            return CoreError::InvalidHandle.code() as i64;
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            f(&mut lock(&handle.engine))
+        }));
+        match result {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => e.code() as i64,
+            Err(_) => CoreError::Internal.code() as i64,
+        }
+    }
+
+    /// `external fun vcInitEngine(mode: Int, preferVulkan: Boolean): Long` — 0 otomatik (B, zor karede A),
+    /// 1 yalnız B, 2 yalnız A. Android'de halka belleği AHardwareBuffer'dır (ayrılamazsa yığın).
+    #[unsafe(no_mangle)]
+    pub extern "system" fn Java_com_video_cleaner_Core_vcInitEngine(
+        _env: *mut JniEnv,
+        _class: JObject,
+        mode: i32,
+        prefer_vulkan: u8,
+    ) -> i64 {
+        let Some(mode) = EngineMode::from_i32(mode) else {
+            return CoreError::BadArgument.code() as i64;
+        };
+        let storage = if cfg!(target_os = "android") {
+            StorageKind::HardwareBuffer
+        } else {
+            StorageKind::Heap
+        };
+        let handle = Box::new(EngineHandle {
+            magic: ENGINE_MAGIC,
+            engine: Mutex::new(Engine::new(mode, prefer_vulkan != 0, storage)),
+        });
+        Box::into_raw(handle) as usize as i64
+    }
+
+    /// `external fun vcDestroy(ctx: Long)`
+    ///
+    /// # Safety
+    /// `ctx`, vcInitEngine'den dönen ve daha önce yok edilmemiş bir değer olmalıdır.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "system" fn Java_com_video_cleaner_Core_vcDestroy(
+        _env: *mut JniEnv,
+        _class: JObject,
+        ctx: i64,
+    ) {
+        let ptr = ctx as usize as *mut EngineHandle;
+        if ptr.is_null() || !ptr.is_aligned() {
+            return;
+        }
+        // SAFETY: çağıranın sözleşmesi; sihirli sayı çift serbest bırakmayı yakalar.
+        unsafe {
+            if (*ptr).magic != ENGINE_MAGIC {
+                return;
+            }
+            (*ptr).magic = 0;
+            drop(Box::from_raw(ptr));
+        }
+    }
+
+    /// `external fun vcPushHardwareFrame(ctx: Long, buffer: HardwareBuffer, ptsUs: Long, flags: Int): Int`
+    /// — YUV 4:2:0 donanım tamponunu (ör. ImageReader `Image.hardwareBuffer`) Java yığınına kopyalamadan
+    /// halkaya alır. Karenin sıra numarası (≥ 0) veya negatif hata kodu.
+    ///
+    /// # Safety
+    /// `env` geçerli olmalı; `buffer` bir `android.hardware.HardwareBuffer` olmalıdır.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "system" fn Java_com_video_cleaner_Core_vcPushHardwareFrame(
+        env: *mut JniEnv,
+        _class: JObject,
+        ctx: i64,
+        buffer: JObject,
+        pts_us: i64,
+        flags: i32,
+    ) -> i32 {
+        #[cfg(target_os = "android")]
+        {
+            engine_call(ctx, |e| {
+                use crate::hwbuf::*;
+                if buffer.is_null() {
+                    return Err(CoreError::BadArgument);
+                }
+                // SAFETY: env ve buffer JVM'den gelir; AHardwareBuffer çağrı boyunca HardwareBuffer nesnesiyle yaşar.
+                unsafe {
+                    let ahb = AHardwareBuffer_fromHardwareBuffer(env as *mut c_void, buffer);
+                    if ahb.is_null() {
+                        return Err(CoreError::BadArgument);
+                    }
+                    let mut desc = Desc::default();
+                    AHardwareBuffer_describe(ahb, &mut desc);
+                    let mut planes = Planes {
+                        plane_count: 0,
+                        planes: [Plane {
+                            data: std::ptr::null_mut(),
+                            pixel_stride: 0,
+                            row_stride: 0,
+                        }; 4],
+                    };
+                    if AHardwareBuffer_lockPlanes(
+                        ahb,
+                        USAGE_CPU_READ_OFTEN,
+                        -1,
+                        std::ptr::null(),
+                        &mut planes,
+                    ) != 0
+                        || planes.plane_count < 3
+                    {
+                        return Err(CoreError::BadArgument);
+                    }
+                    let (w, h) = (desc.width as usize, desc.height as usize);
+                    let mk = |p: Plane, rows: usize| RawPlane {
+                        ptr: p.data as *mut u8,
+                        len: p.row_stride as usize * rows,
+                        row_stride: p.row_stride as usize,
+                        pixel_stride: p.pixel_stride.max(1) as usize,
+                    };
+                    let result = e.push_planes(
+                        w,
+                        h,
+                        mk(planes.planes[0], h),
+                        mk(planes.planes[1], h / 2),
+                        mk(planes.planes[2], h / 2),
+                        pts_us,
+                        flags as u32,
+                        true,
+                    );
+                    AHardwareBuffer_unlock(ahb, std::ptr::null_mut());
+                    result.map(|seq| seq as i64)
+                }
+            }) as i32
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            let _ = (env, buffer, pts_us, flags);
+            engine_call(ctx, |_| Err(CoreError::BadState)) as i32
+        }
+    }
+
+    /// `external fun vcPushNv12(ctx: Long, width: Int, height: Int, frame: ByteBuffer, ptsUs: Long, flags: Int): Int`
+    /// — CPU yolu (donanım tamponu olmayan kaynaklar ve testler için).
+    ///
+    /// # Safety
+    /// `env` geçerli olmalı; `frame` doğrudan ByteBuffer olmalıdır.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "system" fn Java_com_video_cleaner_Core_vcPushNv12(
+        env: *mut JniEnv,
+        _class: JObject,
+        ctx: i64,
+        width: i32,
+        height: i32,
+        frame: JObject,
+        pts_us: i64,
+        flags: i32,
+    ) -> i32 {
+        // SAFETY: çağıranın sözleşmesi.
+        let data = match unsafe { buffer_mut(env, frame, 1) } {
+            Ok(b) => b,
+            Err(e) => return e.code(),
+        };
+        if width <= 0 || height <= 0 {
+            return CoreError::InvalidGeometry.code();
+        }
+        engine_call(ctx, |e| {
+            e.push_nv12(width as usize, height as usize, data, pts_us, flags as u32)
+                .map(|s| s as i64)
+        }) as i32
+    }
+
+    /// `external fun vcPoll(ctx: Long, info: ByteBuffer): Int` — `nativePoll` ile aynı adım kodları ve düzen.
+    ///
+    /// # Safety
+    /// `env` geçerli olmalı; `info` doğrudan ByteBuffer olmalıdır.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "system" fn Java_com_video_cleaner_Core_vcPoll(
+        env: *mut JniEnv,
+        _class: JObject,
+        ctx: i64,
+        info: JObject,
+    ) -> i32 {
+        // SAFETY: çağıranın sözleşmesi.
+        let info = match unsafe { buffer_mut(env, info, POLL_INFO_BYTES) } {
+            Ok(b) => b,
+            Err(e) => return e.code(),
+        };
+        engine_call(ctx, |e| {
+            info[..POLL_INFO_BYTES].fill(0);
+            let code = match e.poll() {
+                Step::NeedFrames(n) => {
+                    put_i32(info, 4, n as i32);
+                    STEP_NEED_FRAMES
+                }
+                Step::Output(n) => {
+                    put_i32(info, 4, n as i32);
+                    STEP_OUTPUT
+                }
+                Step::Finished => STEP_FINISHED,
+                Step::Window(plan) => {
+                    put_i64(info, 8, plan.id as i64);
+                    put_i32(info, 16, if plan.mode == Mode::A { 0 } else { 1 });
+                    put_i32(info, 20, plan.slide as i32);
+                    put_i64(info, 48, plan.base_seq);
+                    put_i32(info, 56, plan.valid as i32);
+                    STEP_WINDOW
+                }
+            };
+            put_i32(info, 0, code);
+            Ok(code as i64)
+        }) as i32
+    }
+
+    /// `external fun vcProcessWindow(ctx: Long, forceModeA: Boolean): Int` — hazır pencereyi işler.
+    /// 0: pencere yok, 1: Mod B, 2: Mod A, negatif: hata. Model ağırlıkları yüklenmediğinde onarıcı
+    /// kimliktir (hiçbir piksel değişmez, çıkış girişle bit-bit aynı).
+    #[unsafe(no_mangle)]
+    pub extern "system" fn Java_com_video_cleaner_Core_vcProcessWindow(
+        _env: *mut JniEnv,
+        _class: JObject,
+        ctx: i64,
+        force_mode_a: u8,
+    ) -> i32 {
+        engine_call(ctx, |e| {
+            e.process_window(force_mode_a != 0, &mut IdentityRestorer)
+                .map(|v| v as i64)
+        }) as i32
+    }
+
+    /// `external fun vcPopOutputNv12(ctx: Long, dst: ByteBuffer, meta: ByteBuffer): Int` — 1 kare, 0 yok.
+    ///
+    /// # Safety
+    /// `env` geçerli olmalı; tamponlar doğrudan ByteBuffer olmalıdır.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "system" fn Java_com_video_cleaner_Core_vcPopOutputNv12(
+        env: *mut JniEnv,
+        _class: JObject,
+        ctx: i64,
+        dst: JObject,
+        meta: JObject,
+    ) -> i32 {
+        // SAFETY: çağıranın sözleşmesi.
+        let prepared = unsafe {
+            (|| {
+                Ok::<_, CoreError>((
+                    buffer_mut(env, dst, 1)?,
+                    buffer_mut(env, meta, OUTPUT_META_BYTES)?,
+                ))
+            })()
+        };
+        let (dst, meta_out) = match prepared {
+            Ok(p) => p,
+            Err(e) => return e.code(),
+        };
+        engine_call(ctx, |e| match e.pop_output(dst)? {
+            Some(m) => {
+                write_output_meta(meta_out, &m);
+                Ok(1)
+            }
+            None => Ok(0),
+        }) as i32
+    }
+
+    /// `external fun vcFinish(ctx: Long): Int`
+    #[unsafe(no_mangle)]
+    pub extern "system" fn Java_com_video_cleaner_Core_vcFinish(
+        _env: *mut JniEnv,
+        _class: JObject,
+        ctx: i64,
+    ) -> i32 {
+        engine_call(ctx, |e| {
+            e.finish();
+            Ok(0)
+        }) as i32
+    }
+
+    /// `external fun vcRunTesterAudit(ctx: Long): String` — VC-Tester çalışma zamanı raporu (JSON).
+    ///
+    /// # Safety
+    /// `env` geçerli bir `JNIEnv*` olmalıdır.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "system" fn Java_com_video_cleaner_Core_vcRunTesterAudit(
+        env: *mut JniEnv,
+        _class: JObject,
+        ctx: i64,
+    ) -> JObject {
+        let mut json = String::new();
+        let code = engine_call(ctx, |e| {
+            json = e.tester_audit_json();
+            Ok(0)
+        });
+        if code != 0 {
+            json = format!("{{\"error\":{code}}}");
+        }
+        let mut bytes = json.into_bytes();
+        bytes.retain(|b| *b != 0 && b.is_ascii());
+        bytes.push(0);
+        type NewStringUtf =
+            unsafe extern "system" fn(*mut JniEnv, *const std::ffi::c_char) -> JObject;
+        // SAFETY: JNI belirtimi: işlev tablosunun 167. girişi NewStringUTF'tir; dize NUL ile biter ve ASCII'dir.
+        unsafe {
+            if env.is_null() || (*env).is_null() {
+                return std::ptr::null_mut();
+            }
+            let f: NewStringUtf = std::mem::transmute(*(*env).add(JNI_NEW_STRING_UTF));
+            f(env, bytes.as_ptr() as *const std::ffi::c_char)
+        }
     }
 }
 
@@ -4744,6 +5689,21 @@ mod tests {
         unsafe { (*(buf as *const FakeBuffer)).cap }
     }
 
+    thread_local! {
+        static LAST_STRING: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+    }
+
+    unsafe extern "system" fn fake_new_string_utf(
+        _env: *mut JniEnv,
+        s: *const std::ffi::c_char,
+    ) -> JObject {
+        let text = unsafe { std::ffi::CStr::from_ptr(s) }
+            .to_string_lossy()
+            .into_owned();
+        LAST_STRING.with(|cell| *cell.borrow_mut() = text);
+        1usize as JObject
+    }
+
     struct FakeEnv {
         _table: Box<[*const c_void; 232]>,
         env: Box<JniEnv>,
@@ -4754,6 +5714,7 @@ mod tests {
             let mut table = Box::new([std::ptr::null::<c_void>(); 232]);
             table[230] = fake_address as *const c_void;
             table[231] = fake_capacity as *const c_void;
+            table[167] = fake_new_string_utf as *const c_void;
             let env = Box::new(table.as_ptr() as JniEnv);
             Self { _table: table, env }
         }
@@ -4802,8 +5763,7 @@ mod tests {
             Java_com_video_cleaner_Core_nativeCreate(env, null, 63, 48),
             CoreError::InvalidGeometry.code() as i64
         );
-        let handle =
-            Java_com_video_cleaner_Core_nativeCreate(env, null, w as i32, h as i32);
+        let handle = Java_com_video_cleaner_Core_nativeCreate(env, null, w as i32, h as i32);
         assert!(handle > 0);
         assert_eq!(
             Java_com_video_cleaner_Core_nativeSetOption(env, null, handle, 1, 0),
@@ -4835,8 +5795,7 @@ mod tests {
         };
         assert_eq!(code, CoreError::BufferTooSmall.code());
         // Null tampon (Kotlin tarafında yanlış tür / null aktarımı) çökme yerine hata kodu döndürür.
-        let code =
-            unsafe { Java_com_video_cleaner_Core_nativePoll(env, null, handle, null) };
+        let code = unsafe { Java_com_video_cleaner_Core_nativePoll(env, null, handle, null) };
         assert_eq!(code, CoreError::BadArgument.code());
         let mut scratch = vec![0u8; geo.frame_bytes()];
         let code = unsafe {
@@ -4926,12 +5885,7 @@ mod tests {
         let mut windows = 0;
         loop {
             let step = unsafe {
-                Java_com_video_cleaner_Core_nativePoll(
-                    env,
-                    null,
-                    handle,
-                    obj(&mut fake(&mut info)),
-                )
+                Java_com_video_cleaner_Core_nativePoll(env, null, handle, obj(&mut fake(&mut info)))
             };
             assert_eq!(step, read_i32(&info, 0));
             match step {
@@ -4939,9 +5893,7 @@ mod tests {
                     for _ in 0..read_i32(&info, 4) {
                         if pushed == total {
                             assert_eq!(
-                                Java_com_video_cleaner_Core_nativeFinish(
-                                    env, null, handle
-                                ),
+                                Java_com_video_cleaner_Core_nativeFinish(env, null, handle),
                                 0
                             );
                             break;
@@ -5043,9 +5995,7 @@ mod tests {
                     };
                     assert_eq!(bad, CoreError::BadArgument.code());
                     assert_eq!(
-                        Java_com_video_cleaner_Core_nativeCompleteWindow(
-                            env, null, handle
-                        ),
+                        Java_com_video_cleaner_Core_nativeCompleteWindow(env, null, handle),
                         0
                     );
                 }
@@ -5108,12 +6058,7 @@ mod tests {
 
         let mut stats = vec![0u8; STATS_BYTES];
         let n = unsafe {
-            Java_com_video_cleaner_Core_nativeStats(
-                env,
-                null,
-                handle,
-                obj(&mut fake(&mut stats)),
-            )
+            Java_com_video_cleaner_Core_nativeStats(env, null, handle, obj(&mut fake(&mut stats)))
         };
         assert_eq!(n, 14);
         assert_eq!(read_i64(&stats, 0), total as i64); // giren
@@ -5198,5 +6143,227 @@ mod tests {
             stats.sched.windows_b,
             pipe.ring().pool_bytes() as f64 / (1024.0 * 1024.0)
         );
+    }
+
+    // ---- VC-Core motoru (vc* arayüzü) ------------------------------------------------
+
+    /// Motoru sonuna kadar sürer: her adımda poll → pencere/çıktı; kimlik onarıcıyla.
+    fn drive_engine(
+        engine: &mut Engine,
+        frames: &[(Vec<u8>, i64)],
+        geo: FrameGeometry,
+    ) -> Vec<Vec<u8>> {
+        let mut next = 0usize;
+        let mut finished = false;
+        let mut out = Vec::new();
+        let mut dst = vec![0u8; geo.frame_bytes()];
+        loop {
+            match engine.poll() {
+                Step::NeedFrames(n) => {
+                    if next == frames.len() {
+                        assert!(!finished, "bitişten sonra kare istendi");
+                        engine.finish();
+                        finished = true;
+                        continue;
+                    }
+                    for _ in 0..n.min(frames.len() - next) {
+                        let (f, pts) = &frames[next];
+                        engine
+                            .push_nv12(geo.width(), geo.height(), f, *pts, 0)
+                            .unwrap();
+                        next += 1;
+                    }
+                }
+                Step::Window(_) => {
+                    assert!(engine.process_window(false, &mut IdentityRestorer).unwrap() > 0);
+                }
+                Step::Output(_) => {
+                    while engine.pop_output(&mut dst).unwrap().is_some() {
+                        out.push(dst.clone());
+                    }
+                }
+                Step::Finished => break,
+            }
+        }
+        out
+    }
+
+    fn engine_frames(geo: FrameGeometry, count: usize, cut_at: usize) -> Vec<(Vec<u8>, i64)> {
+        (0..count)
+            .map(|i| {
+                let content = frame_content(
+                    geo,
+                    if i >= cut_at {
+                        1000 + i as u64
+                    } else {
+                        (i / 7) as u64
+                    },
+                );
+                (content, i as i64 * 33_333)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn engine_identity_is_bit_exact_and_complete() {
+        let geo = small();
+        let frames = engine_frames(geo, 71, 40);
+        let mut engine = Engine::new(EngineMode::Auto, false, StorageKind::Heap);
+        let out = drive_engine(&mut engine, &frames, geo);
+        assert_eq!(out.len(), frames.len());
+        for (o, (f, _)) in out.iter().zip(&frames) {
+            assert_eq!(
+                &o[..],
+                &f[..geo.frame_bytes()],
+                "kimlik onarıcıda çıkış girişle bit-bit aynı olmalı"
+            );
+        }
+        let audit = engine.audit();
+        assert_eq!(audit.input_digest, audit.output_digest);
+        assert_eq!(audit.frames_cpu, frames.len() as u64);
+        let json = engine.tester_audit_json();
+        assert!(json.contains("\"bit_exact\":true"), "{json}");
+        assert!(json.contains("\"frames_equal\":true"), "{json}");
+        assert!(json.contains("\"violations\":0"), "{json}");
+        assert!(json.is_ascii());
+        let st = engine.pipeline().unwrap().stats();
+        assert!(st.sched.windows_b > 0);
+        assert_eq!(st.sched.windows_a, 0);
+    }
+
+    #[test]
+    fn engine_mode_a_finalises_every_frame_alone() {
+        let geo = small();
+        let frames = engine_frames(geo, 33, usize::MAX);
+        let mut engine = Engine::new(EngineMode::A, false, StorageKind::Heap);
+        let out = drive_engine(&mut engine, &frames, geo);
+        assert_eq!(out.len(), frames.len());
+        let st = engine.pipeline().unwrap().stats();
+        assert_eq!(
+            st.sched.windows_a,
+            frames.len() as u64,
+            "Mod A'da her kare tek hedef pencereyle kesinleşir"
+        );
+        assert_eq!(st.sched.windows_b, 0);
+        assert!(engine.tester_audit_json().contains("\"mode\":\"A\""));
+    }
+
+    #[test]
+    fn engine_rejects_non_monotonic_pts_and_geometry_change() {
+        let geo = small();
+        let frame = frame_content(geo, 3);
+        let mut engine = Engine::new(EngineMode::Auto, true, StorageKind::Heap);
+        engine
+            .push_nv12(geo.width(), geo.height(), &frame, 1000, 0)
+            .unwrap();
+        assert_eq!(
+            engine.push_nv12(geo.width(), geo.height(), &frame, 1000, 0),
+            Err(CoreError::NonMonotonicPts)
+        );
+        assert_eq!(engine.audit().pts_rejected, 1);
+        assert_eq!(
+            engine.push_nv12(geo.width() + 2, geo.height(), &frame, 2000, 0),
+            Err(CoreError::InvalidGeometry)
+        );
+        let json = engine.tester_audit_json();
+        assert!(json.contains("\"pts_rejected\":1"), "{json}");
+        assert!(json.contains("requested, not used"), "{json}");
+    }
+
+    #[test]
+    fn elf_alignment_is_reported() {
+        // Test ikilisi için de PT_LOAD hizası okunabilmeli (Linux x86_64'te ≥ 4096).
+        #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+        assert!(elf_load_alignment() >= 4096, "{}", elf_load_alignment());
+    }
+
+    #[test]
+    fn jni_engine_surface_with_fake_env() {
+        let mut fake_env = FakeEnv::new();
+        let env = fake_env.ptr();
+        let null = std::ptr::null_mut();
+        let geo = small();
+        assert_eq!(
+            Java_com_video_cleaner_Core_vcInitEngine(env, null, 9, 0),
+            CoreError::BadArgument.code() as i64
+        );
+        let ctx = Java_com_video_cleaner_Core_vcInitEngine(env, null, 0, 1);
+        assert!(ctx > 0);
+        let mut info = vec![0u8; POLL_INFO_BYTES];
+        let mut info_buf = fake(&mut info);
+        let mut dst = vec![0u8; geo.frame_bytes()];
+        let mut meta = vec![0u8; OUTPUT_META_BYTES];
+        let frames = engine_frames(geo, 20, usize::MAX);
+        let mut pushed = 0;
+        let mut popped = 0;
+        let mut finished = false;
+        loop {
+            let step =
+                unsafe { Java_com_video_cleaner_Core_vcPoll(env, null, ctx, obj(&mut info_buf)) };
+            match step {
+                STEP_NEED_FRAMES if pushed < frames.len() => {
+                    let mut f = frames[pushed].0.clone();
+                    let mut fb = fake(&mut f);
+                    let seq = unsafe {
+                        Java_com_video_cleaner_Core_vcPushNv12(
+                            env,
+                            null,
+                            ctx,
+                            geo.width() as i32,
+                            geo.height() as i32,
+                            obj(&mut fb),
+                            frames[pushed].1,
+                            0,
+                        )
+                    };
+                    assert_eq!(seq, pushed as i32);
+                    pushed += 1;
+                }
+                STEP_NEED_FRAMES => {
+                    assert!(!finished);
+                    assert_eq!(Java_com_video_cleaner_Core_vcFinish(env, null, ctx), 0);
+                    finished = true;
+                }
+                STEP_WINDOW => {
+                    assert!(Java_com_video_cleaner_Core_vcProcessWindow(env, null, ctx, 0) > 0)
+                }
+                STEP_OUTPUT => {
+                    let (mut db, mut mb) = (fake(&mut dst), fake(&mut meta));
+                    while unsafe {
+                        Java_com_video_cleaner_Core_vcPopOutputNv12(
+                            env,
+                            null,
+                            ctx,
+                            obj(&mut db),
+                            obj(&mut mb),
+                        )
+                    } == 1
+                    {
+                        assert_eq!(&dst[..], &frames[popped].0[..geo.frame_bytes()]);
+                        assert_eq!(read_i64(&meta, 8), frames[popped].1);
+                        popped += 1;
+                        (db, mb) = (fake(&mut dst), fake(&mut meta));
+                    }
+                }
+                STEP_FINISHED => break,
+                other => panic!("beklenmeyen adım {other}"),
+            }
+        }
+        assert_eq!(popped, frames.len());
+        // Donanım tamponu masaüstünde yok: açık hata kodu döner.
+        assert_eq!(
+            unsafe { Java_com_video_cleaner_Core_vcPushHardwareFrame(env, null, ctx, null, 0, 0) },
+            CoreError::BadState.code()
+        );
+        let jstr = unsafe { Java_com_video_cleaner_Core_vcRunTesterAudit(env, null, ctx) };
+        assert!(!jstr.is_null());
+        let json = LAST_STRING.with(|c| c.borrow().clone());
+        assert!(
+            json.starts_with("{\"abi\":")
+                && json.contains("\"bit_exact\":true")
+                && json.contains("\"frames_out\":20"),
+            "{json}"
+        );
+        unsafe { Java_com_video_cleaner_Core_vcDestroy(env, null, ctx) };
     }
 }

@@ -23,6 +23,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.graphics.ImageFormat
+import android.hardware.HardwareBuffer
 import android.media.Image
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
@@ -130,6 +131,36 @@ object Core {
 
     @JvmStatic external fun nativePopOutputNv12(handle: Long, dst: ByteBuffer, meta: ByteBuffer): Int
     @JvmStatic external fun nativeStats(handle: Long, out: ByteBuffer): Int
+
+    // ---- VC-Core motor arayüzü (Java_com_video_cleaner_Core_vc*) -----------------------------
+    // Halka belleği Android'de AHardwareBuffer'dır (ayrılamazsa yığın). Geometri ilk karede belirlenir.
+
+    const val ENGINE_MODE_AUTO = 0
+    const val ENGINE_MODE_B = 1
+    const val ENGINE_MODE_A = 2
+
+    /** VC-Core'u başlatır; bağlam tutamağı (> 0) veya negatif hata kodu. */
+    @JvmStatic external fun vcInitEngine(mode: Int, preferVulkan: Boolean): Long
+
+    /** YUV 4:2:0 donanım tamponunu (ImageReader `Image.hardwareBuffer`) Java yığınına kopyalamadan iter. */
+    @JvmStatic external fun vcPushHardwareFrame(ctx: Long, buffer: HardwareBuffer, ptsUs: Long, flags: Int): Int
+
+    /** Sıkı NV12 kare (CPU yolu). */
+    @JvmStatic external fun vcPushNv12(ctx: Long, width: Int, height: Int, frame: ByteBuffer, ptsUs: Long, flags: Int): Int
+
+    /** Sıradaki adım (STEP_*); `info` düzeni `nativePoll` ile aynı. */
+    @JvmStatic external fun vcPoll(ctx: Long, info: ByteBuffer): Int
+
+    /** Hazır pencereyi işler: 0 pencere yok, 1 Mod B, 2 Mod A. */
+    @JvmStatic external fun vcProcessWindow(ctx: Long, forceModeA: Boolean): Int
+
+    @JvmStatic external fun vcPopOutputNv12(ctx: Long, dst: ByteBuffer, meta: ByteBuffer): Int
+    @JvmStatic external fun vcFinish(ctx: Long): Int
+
+    /** VC-Tester çalışma zamanı raporu (JSON): mediaSync, preservation, scheduler, platform, runtime. */
+    @JvmStatic external fun vcRunTesterAudit(ctx: Long): String
+
+    @JvmStatic external fun vcDestroy(ctx: Long)
 
     /** Etkin SIMD arka ucunun adı. */
     fun kernelBackendName(): String = when (nativeKernelBackend()) {
