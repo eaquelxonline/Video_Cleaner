@@ -90,16 +90,13 @@ class EncoderCalibrationTest {
     fun g_bitrateCalibration() {
         assumeTrue("yalnızca calibrate=true ile", InstrumentationRegistry.getArguments().getString("calibrate") == "true")
         val vbr = EncoderCapabilities.BITRATE_MODE_VBR
-        // 3. tur: üretim politikası (policy_*) eski kurala karşı; çapraz kodek kaynaklar (c12 HEVC, c13 HEVC,
-        // c14 VP9 → H.264) için kaynak katı taraması. 1-2. turlarda HEVC kodlayıcı emülatörde ≤512 px olduğundan,
-        // CQ AVC'de olmadığından ve QP sınırı ölçülebilir fark yaratmadığından bu adaylar çıkarıldı.
+        // Doğrulama turu: nihai üretim politikası (Standart ×2.0, Yüksek ×3.0, kaynak GOP, VBR) eski kurala karşı.
+        // Önceki turlar (kaynak katı 1.0–3.0, GOP, QP sınırı, CQ, HEVC) için commit geçmişine bakın.
         val candidates = listOf(
             Candidate("avc_legacy", false, null) { c -> maxOf(c.declaredBps * 5L / 4, c.bpppf(0.14)) },
             Candidate("policy_std", false, null, policyQuality = 1f) { 0 },
             Candidate("policy_high", false, null, policyQuality = 2f) { 0 },
-            Candidate("avc_s150_g", false, vbr, gopFromSource = true) { c -> c.videoBps * 3 / 2 },
-            Candidate("avc_s200_g", false, vbr, gopFromSource = true) { c -> c.videoBps * 2 },
-            Candidate("avc_s300_g", false, vbr, gopFromSource = true) { c -> c.videoBps * 3 },
+            Candidate("policy_std_hevc", true, null, policyQuality = 1f) { 0 },
         )
         val only = InstrumentationRegistry.getArguments().getString("calibrateClips")?.split(',')?.toSet()
         val names = testAssets.list("calib")!!.sorted().filter { only == null || it.substringBefore('.') in only }

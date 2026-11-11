@@ -87,7 +87,7 @@ def video_info(path):
 
 def psnr_ssim(ref, dist):
     proc = subprocess.run(
-        ["ffmpeg", "-hide_banner", "-nostats", "-i", dist, "-i", ref, "-lavfi", "[0:v]split[d1][d2];[1:v]split[r1][r2];[d1][r1]psnr;[d2][r2]ssim", "-f", "null", "-"],
+        ["ffmpeg", "-hide_banner", "-nostats", "-i", dist, "-i", ref, "-lavfi", "[0:v]setpts=PTS-STARTPTS,split[d1][d2];[1:v]setpts=PTS-STARTPTS,split[r1][r2];[d1][r1]psnr;[d2][r2]ssim", "-f", "null", "-"],
         capture_output=True, text=True,
     )
     psnr = re.search(r"PSNR y:([\d.]+|inf)", proc.stderr)

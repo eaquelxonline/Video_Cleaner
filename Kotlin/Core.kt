@@ -432,20 +432,23 @@ private fun MediaFormat.intOr(key: String, fallback: Int): Int = if (containsKey
 /**
  * Video bit hızı ve anahtar kare politikası (saf hesap; Android'e bağımlı değildir, birim testlenir).
  *
- * Sabitler emülatör kalibrasyonuyla seçildi (.github/workflows/bitrate-calibration.yml, 11 klip,
- * 360p–1080p, 24/30/60 FPS, VMAF/PSNR/SSIM kaynağa göre). Hedefe uyan kodlayıcıda (OMX.google.h264)
- * kaynağın anahtar kare aralığıyla:
- *   kaynak×1.0 → ort. VMAF 91,6 (en düşük 78,9) · ×1.5 → 94,1 (86,1), boyut ~1,45× · ×2.0 → 95,6 (91,6), ~1,9×
- *   eski kural (max(beyan×1.25, 0.14 bpppf)) → 96,9 (94,4) ama boyut ort. ~3,6×, en kötü 12,5×.
+ * Sabitler emülatör kalibrasyonuyla seçildi (.github/workflows/bitrate-calibration.yml; 14 klip: 360p–1080p ve
+ * dikey, 24/30/60 FPS, düşük/yüksek bit hızı, gerçek/gürültülü/animasyon/durağan, H.264/HEVC/VP9 kaynak).
+ * Hedefe uyan kodlayıcıda (OMX.google.h264), kaynağın anahtar kare aralığıyla, VMAF kaynağa göre:
+ *   kaynak×1.5 → ort. 93,8, en düşük 86,1 (2 klip < 90), medyan boyut 1,50×
+ *   kaynak×2.0 → ort. 95,8, en düşük 91,6 (0 klip < 90), medyan boyut 1,96×, en kötü 3,2×
+ *   kaynak×3.0 → ort. 97,4, en düşük 93,5
+ *   eski kural (max(beyan×1.25, 0.14 bpppf)) → ort. 96,6, en düşük 92,9; medyan 2,5×, ort. 5,8×, en kötü 33,7×
+ * Piksel başına bite göre uyarlanan kurallar zorluğu öngörmedi (düşük bit hızlı kolay klipler); sabit kat seçildi.
  * Kaynağın kendi anahtar kare aralığını korumak aynı boyutta VMAF'ı 7 puana kadar artırdı.
- * Donanım kodlayıcıları farklı davranır; bu yüzden hedef, kodlayıcının bit hızı aralığına kırpılır ve
- * kalite modu (CQ/QP sınırı) yalnızca destekleniyorsa ve ölçülmüşse kullanılır (şu an kullanılmıyor).
+ * Donanım kodlayıcıları farklı davranır; hedef kodlayıcının bit hızı aralığına kırpılır, kalite modu
+ * (CQ/QP sınırı) kullanılmaz: AVC'de CQ yok, QP sınırı ölçülebilir fark yaratmadı.
  */
 internal object BitratePolicy {
-    /** Standart: kaynağın gerçek video bit hızının katı. */
-    const val STANDARD_SOURCE_FACTOR = 1.5
-    /** Yüksek: kaynağın gerçek video bit hızının katı. */
-    const val HIGH_SOURCE_FACTOR = 2.0
+    /** Standart: kaynağın gerçek video bit hızının katı (hiçbir test klibinde VMAF < 90 değil). */
+    const val STANDARD_SOURCE_FACTOR = 2.0
+    /** Yüksek: kaynağın gerçek video bit hızının katı (ortalama VMAF eski kuralın üstünde). */
+    const val HIGH_SOURCE_FACTOR = 3.0
     /** Kaynak bit hızı ölçülemezse eski taban (piksel başına, kare başına bit) korunur: belirsizlikte kaliteyi düşürme. */
     const val UNKNOWN_SOURCE_BPPPF = 0.14
     /** Akıl dışı küçük hedeflere karşı alt sınır (bit/s). */
@@ -471,8 +474,10 @@ internal object BitratePolicy {
     data class Plan(val bitrateBps: Long, val iFrameIntervalSec: Float, val reason: String)
 
     /**
-     * Kaynak ile hedef kodek farklıysa (ör. HEVC → H.264) aynı kalite için gereken bit hızı oranı.
-     * Kalibrasyonla ölçülmeden sabitlenmez; ölçülmemiş geçişlerde 1.0 kullanılır.
+     * Kaynak ile hedef kodek farklıysa (ör. HEVC → H.264) aynı kalite için ek bit hızı oranı.
+     * Ölçüm (c12/c13 HEVC, c14 VP9 → H.264): aynı katsayı H.264 kaynaklarla benzer veya daha iyi VMAF verdi
+     * (×1.5: 93,5 / 93,3 / 95,5; ×2.0: 96,2 / 93,3 / 97,5); ek katsayı gerekmedi. HEVC hedef kodlayıcı
+     * emülatörde ≤512 px olduğundan H.264 → HEVC tasarrufu ölçülemedi; ölçülmeden tasarruf varsayılmaz.
      */
     fun codecFactor(sourceMime: String, targetMime: String): Double = 1.0
 
