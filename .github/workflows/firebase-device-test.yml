@@ -231,8 +231,13 @@ jobs:
               cat "device-$name.md" 2>/dev/null
               echo; echo "### Test sonuçları ve özet satırları ($name)"; echo '```'
               for x in "$dev"/test_result_*.xml; do
-                [ -f "$x" ] && grep -oE '<testsuite [^>]*' "$x" | head -1
-                [ -f "$x" ] && grep -oE '<testcase [^>]*name="[^"]*"[^>]*>(<failure|<error)?' "$x" | grep -E '<failure|<error' | sed -E 's/.*name="([^"]*)".*classname="([^"]*)".*/KALDI: \2.\1/'
+                [ -f "$x" ] && python3 -c "import sys,xml.etree.ElementTree as E
+r=E.parse(sys.argv[1]).getroot()
+for t in r.iter('testsuite'): print('testler:',t.get('tests'),'kalan:',t.get('failures'),'hata:',t.get('errors'),'atlanan:',t.get('skipped'))
+for c in r.iter('testcase'):
+  f=c.find('failure')
+  if f is None: f=c.find('error')
+  if f is not None: print('KALDI:',c.get('classname')+'.'+c.get('name'),'—',(f.text or '').strip().splitlines()[0][:300] if (f.text or '').strip() else '')" "$x"
               done
               grep -aE 'VCCAPS|VCDIAG|VCTEST.*(DEVICE|SUMMARY|VIDEO|BITRATE|SERVICE|PIXELS|VCCORE|VCAUDIT|REMUX|HBDECODE|CODECS|AV1ENCODE|RUNTIME|CHECKPOINT|AUDIOPROBE)' "device-$name.log" | sed -E 's/^.*(VCCAPS|VCDIAG|VCTEST) *: //'
               echo '```'
