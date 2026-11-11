@@ -172,6 +172,10 @@ class VideoPipelineTest {
         }
     }
 
+    private fun colorTag(format: MediaFormat): String =
+        listOf(MediaFormat.KEY_COLOR_STANDARD, MediaFormat.KEY_COLOR_RANGE, MediaFormat.KEY_COLOR_TRANSFER)
+            .joinToString("/") { if (format.containsKey(it)) format.getInteger(it).toString() else "-" }
+
     private fun averageFps(times: List<Long>): Double =
         if (times.size > 1 && times.last() > times.first()) (times.size - 1) * 1_000_000.0 / (times.last() - times.first()) else 0.0
 
@@ -275,7 +279,8 @@ class VideoPipelineTest {
                     log(
                         "BITRATE name=$name srcVideoBps=$srcVideoBps declared=${result.sourceDeclaredBitrate} requested=$requested mode=${result.encoderSettings.bitrateMode} " +
                             "gop=${result.encoderSettings.iFrameIntervalSec} outVideoBps=$outVideoBps ratio=${if (srcVideoBps > 0) "%.2f".format(outVideoBps.toDouble() / srcVideoBps) else "-"} " +
-                            "fps=${"%.3f".format(srcFps)}→${"%.3f".format(outFps)} reason=\"${result.encoderSettings.reason}\"",
+                            "fps=${"%.3f".format(srcFps)}→${"%.3f".format(outFps)} color=${colorTag(source.format)}→${colorTag(video.format)} " +
+                            "reason=\"${result.encoderSettings.reason}\"",
                     )
                     log(
                         "VIDEO name=$name status=${if (problems.isEmpty()) "PASS" else "FAIL"} source=${source.mime} " +

@@ -959,16 +959,22 @@ class VideoJob(
                     bitrateBps = bitrate, bitrateMode = modeLabel, cqQuality = cq, qpMax = qpMax, iFrameIntervalSec = gop, frameRate = rate,
                     reason = if (tuning?.bitrateBps != null) "elle (kalibrasyon)" else plan.reason,
                 )
-                if (color != null) {
-                    for (key in arrayOf(MediaFormat.KEY_COLOR_STANDARD, MediaFormat.KEY_COLOR_RANGE, MediaFormat.KEY_COLOR_TRANSFER)) {
-                        if (color.containsKey(key)) format.setInteger(key, color.getInteger(key))
-                    }
-                    // 8 bit çıktı HDR aktarım eğrisi taşıyamaz.
-                    val transfer = color.intOr(MediaFormat.KEY_COLOR_TRANSFER, 0)
-                    if (transfer == MediaFormat.COLOR_TRANSFER_ST2084 || transfer == MediaFormat.COLOR_TRANSFER_HLG) {
-                        format.setInteger(MediaFormat.KEY_COLOR_TRANSFER, MediaFormat.COLOR_TRANSFER_SDR_VIDEO)
-                    }
-                }
+                // Renk bilgisi kaynaktan korunur. Kaynak belirtmiyorsa (0/yok) oynatıcıların etiketsiz videoya
+                // uyguladığı varsayılan açıkça yazılır (mpv kuralı: genişlik ≥ 1280 veya yükseklik > 576 → BT.709,
+                // aksi BT.601); sınırlı aralık; SDR.
+                // Aksi halde bazı kodlayıcılar (OMX.google.h264, API 30) matris katsayısını 0 = RGB yazıyor ve
+                // etikete uyan oynatıcılarda renkler bozuluyordu (kalibrasyonda "gbr" etiketi).
+                val standard = color?.intOr(MediaFormat.KEY_COLOR_STANDARD, 0) ?: 0
+                val range = color?.intOr(MediaFormat.KEY_COLOR_RANGE, 0) ?: 0
+                var transfer = color?.intOr(MediaFormat.KEY_COLOR_TRANSFER, 0) ?: 0
+                // 8 bit çıktı HDR aktarım eğrisi taşıyamaz.
+                if (transfer == MediaFormat.COLOR_TRANSFER_ST2084 || transfer == MediaFormat.COLOR_TRANSFER_HLG) transfer = MediaFormat.COLOR_TRANSFER_SDR_VIDEO
+                format.setInteger(
+                    MediaFormat.KEY_COLOR_STANDARD,
+                    if (standard != 0) standard else if (width >= 1280 || height > 576) MediaFormat.COLOR_STANDARD_BT709 else MediaFormat.COLOR_STANDARD_BT601_NTSC,
+                )
+                format.setInteger(MediaFormat.KEY_COLOR_RANGE, if (range != 0) range else MediaFormat.COLOR_RANGE_LIMITED)
+                format.setInteger(MediaFormat.KEY_COLOR_TRANSFER, if (transfer != 0) transfer else MediaFormat.COLOR_TRANSFER_SDR_VIDEO)
                 try {
                     val codec = MediaCodec.createByCodecName(candidate.name)
                     try {
