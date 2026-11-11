@@ -94,7 +94,7 @@ jobs:
           script: |
             adb logcat -G 32M || true
             adb logcat -c
-            ./gradlew connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=com.videocleaner.engine.EncoderCalibrationTest -Pandroid.testInstrumentationRunnerArguments.calibrate=true --stacktrace || touch test-failed
+            ./gradlew connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=com.video.cleaner.EncoderCalibrationTest -Pandroid.testInstrumentationRunnerArguments.calibrate=true --stacktrace || touch test-failed
             adb logcat -d -s VCCAL:I VCCAPS:I VideoCleaner:I AndroidRuntime:E > calib-logcat.txt || true
             mkdir -p calib-out && adb pull /sdcard/Movies/VideoCleanerCalib calib-out || true
             test ! -f test-failed

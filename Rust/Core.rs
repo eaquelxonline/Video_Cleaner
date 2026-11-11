@@ -2681,7 +2681,7 @@ pub unsafe fn unpack_nv12(
 }
 
 // ============================================================================
-// 10. JNI köprüsü (Kotlin: com.videocleaner.engine.NativeCore)
+// 10. JNI köprüsü (Kotlin: com.video.cleaner.Core)
 // ============================================================================
 
 /// Kotlin köprüsü. Harici JNI crate'i kullanılmaz: JNIEnv işlev tablosundan
@@ -2834,7 +2834,7 @@ pub mod jni {
 
     /// `external fun nativeAbiVersion(): Int`
     #[unsafe(no_mangle)]
-    pub extern "system" fn Java_com_videocleaner_engine_NativeCore_nativeAbiVersion(
+    pub extern "system" fn Java_com_video_cleaner_Core_nativeAbiVersion(
         _env: *mut JniEnv,
         _class: JObject,
     ) -> i32 {
@@ -2843,7 +2843,7 @@ pub mod jni {
 
     /// `external fun nativeKernelBackend(): Int` — 0 taşınabilir, 1 AVX2, 2 NEON.
     #[unsafe(no_mangle)]
-    pub extern "system" fn Java_com_videocleaner_engine_NativeCore_nativeKernelBackend(
+    pub extern "system" fn Java_com_video_cleaner_Core_nativeKernelBackend(
         _env: *mut JniEnv,
         _class: JObject,
     ) -> i32 {
@@ -2852,7 +2852,7 @@ pub mod jni {
 
     /// `external fun nativePageSize(): Int` — çalışma anındaki sayfa boyutu.
     #[unsafe(no_mangle)]
-    pub extern "system" fn Java_com_videocleaner_engine_NativeCore_nativePageSize(
+    pub extern "system" fn Java_com_video_cleaner_Core_nativePageSize(
         _env: *mut JniEnv,
         _class: JObject,
     ) -> i32 {
@@ -2861,7 +2861,7 @@ pub mod jni {
 
     /// `external fun nativeCreate(width: Int, height: Int): Long` — tutamak veya negatif hata kodu.
     #[unsafe(no_mangle)]
-    pub extern "system" fn Java_com_videocleaner_engine_NativeCore_nativeCreate(
+    pub extern "system" fn Java_com_video_cleaner_Core_nativeCreate(
         _env: *mut JniEnv,
         _class: JObject,
         width: i32,
@@ -2894,7 +2894,7 @@ pub mod jni {
     /// # Safety
     /// `handle`, `nativeCreate`'ten dönen ve daha önce yok edilmemiş bir değer olmalıdır.
     #[unsafe(no_mangle)]
-    pub unsafe extern "system" fn Java_com_videocleaner_engine_NativeCore_nativeDestroy(
+    pub unsafe extern "system" fn Java_com_video_cleaner_Core_nativeDestroy(
         _env: *mut JniEnv,
         _class: JObject,
         handle: i64,
@@ -2916,7 +2916,7 @@ pub mod jni {
     /// `external fun nativeSetOption(handle: Long, key: Int, value: Int): Int`
     /// — 1: otomatik sahne geçişi, 2: bütünlük denetimi.
     #[unsafe(no_mangle)]
-    pub extern "system" fn Java_com_videocleaner_engine_NativeCore_nativeSetOption(
+    pub extern "system" fn Java_com_video_cleaner_Core_nativeSetOption(
         _env: *mut JniEnv,
         _class: JObject,
         handle: i64,
@@ -2942,7 +2942,7 @@ pub mod jni {
     /// # Safety
     /// `env` geçerli bir `JNIEnv*`, `info` doğrudan bir ByteBuffer olmalıdır.
     #[unsafe(no_mangle)]
-    pub unsafe extern "system" fn Java_com_videocleaner_engine_NativeCore_nativePoll(
+    pub unsafe extern "system" fn Java_com_video_cleaner_Core_nativePoll(
         env: *mut JniEnv,
         _class: JObject,
         handle: i64,
@@ -2993,7 +2993,7 @@ pub mod jni {
     /// # Safety
     /// `env` geçerli olmalı; üç tampon da doğrudan ByteBuffer olmalıdır.
     #[unsafe(no_mangle)]
-    pub unsafe extern "system" fn Java_com_videocleaner_engine_NativeCore_nativePushYuv420(
+    pub unsafe extern "system" fn Java_com_video_cleaner_Core_nativePushYuv420(
         env: *mut JniEnv,
         _class: JObject,
         handle: i64,
@@ -3040,7 +3040,7 @@ pub mod jni {
     /// # Safety
     /// `env` geçerli olmalı; `frame` doğrudan ByteBuffer olmalıdır.
     #[unsafe(no_mangle)]
-    pub unsafe extern "system" fn Java_com_videocleaner_engine_NativeCore_nativePushNv12(
+    pub unsafe extern "system" fn Java_com_video_cleaner_Core_nativePushNv12(
         env: *mut JniEnv,
         _class: JObject,
         handle: i64,
@@ -3062,7 +3062,7 @@ pub mod jni {
 
     /// `external fun nativeFinish(handle: Long): Int` — kaynak bitti.
     #[unsafe(no_mangle)]
-    pub extern "system" fn Java_com_videocleaner_engine_NativeCore_nativeFinish(
+    pub extern "system" fn Java_com_video_cleaner_Core_nativeFinish(
         _env: *mut JniEnv,
         _class: JObject,
         handle: i64,
@@ -3076,7 +3076,7 @@ pub mod jni {
     /// `external fun nativeSetHint(handle: Long, seq: Long, hint: Int): Int`
     /// — 0 olağan, 1 hassas (Mod A), 2 bypass.
     #[unsafe(no_mangle)]
-    pub extern "system" fn Java_com_videocleaner_engine_NativeCore_nativeSetHint(
+    pub extern "system" fn Java_com_video_cleaner_Core_nativeSetHint(
         _env: *mut JniEnv,
         _class: JObject,
         handle: i64,
@@ -3098,7 +3098,7 @@ pub mod jni {
     /// # Safety
     /// `env` geçerli olmalı; `dst` doğrudan ByteBuffer olmalıdır.
     #[unsafe(no_mangle)]
-    pub unsafe extern "system" fn Java_com_videocleaner_engine_NativeCore_nativeReadWindowFrame(
+    pub unsafe extern "system" fn Java_com_video_cleaner_Core_nativeReadWindowFrame(
         env: *mut JniEnv,
         _class: JObject,
         handle: i64,
@@ -3136,7 +3136,7 @@ pub mod jni {
     /// # Safety
     /// `env` geçerli olmalı; üç tampon da doğrudan ByteBuffer olmalıdır.
     #[unsafe(no_mangle)]
-    pub unsafe extern "system" fn Java_com_videocleaner_engine_NativeCore_nativeSubmitEstimate(
+    pub unsafe extern "system" fn Java_com_video_cleaner_Core_nativeSubmitEstimate(
         env: *mut JniEnv,
         _class: JObject,
         handle: i64,
@@ -3211,7 +3211,7 @@ pub mod jni {
     /// `external fun nativeCompleteWindow(handle: Long): Int`
     /// — tahmin verilmeyen konumlar orijinal hâliyle çıkar.
     #[unsafe(no_mangle)]
-    pub extern "system" fn Java_com_videocleaner_engine_NativeCore_nativeCompleteWindow(
+    pub extern "system" fn Java_com_video_cleaner_Core_nativeCompleteWindow(
         _env: *mut JniEnv,
         _class: JObject,
         handle: i64,
@@ -3234,7 +3234,7 @@ pub mod jni {
     /// # Safety
     /// `env` geçerli olmalı; tüm tamponlar doğrudan ByteBuffer olmalıdır.
     #[unsafe(no_mangle)]
-    pub unsafe extern "system" fn Java_com_videocleaner_engine_NativeCore_nativePopOutputYuv420(
+    pub unsafe extern "system" fn Java_com_video_cleaner_Core_nativePopOutputYuv420(
         env: *mut JniEnv,
         _class: JObject,
         handle: i64,
@@ -3284,7 +3284,7 @@ pub mod jni {
     /// # Safety
     /// `env` geçerli olmalı; tamponlar doğrudan ByteBuffer olmalıdır.
     #[unsafe(no_mangle)]
-    pub unsafe extern "system" fn Java_com_videocleaner_engine_NativeCore_nativePopOutputNv12(
+    pub unsafe extern "system" fn Java_com_video_cleaner_Core_nativePopOutputNv12(
         env: *mut JniEnv,
         _class: JObject,
         handle: i64,
@@ -3321,7 +3321,7 @@ pub mod jni {
     /// # Safety
     /// `env` geçerli olmalı; `out` doğrudan ByteBuffer olmalıdır.
     #[unsafe(no_mangle)]
-    pub unsafe extern "system" fn Java_com_videocleaner_engine_NativeCore_nativeStats(
+    pub unsafe extern "system" fn Java_com_video_cleaner_Core_nativeStats(
         env: *mut JniEnv,
         _class: JObject,
         handle: i64,
@@ -4791,34 +4791,34 @@ mod tests {
         let total = 47u64;
 
         assert_eq!(
-            Java_com_videocleaner_engine_NativeCore_nativeAbiVersion(env, null),
+            Java_com_video_cleaner_Core_nativeAbiVersion(env, null),
             ABI_VERSION
         );
         assert_eq!(
-            Java_com_videocleaner_engine_NativeCore_nativePageSize(env, null) as usize,
+            Java_com_video_cleaner_Core_nativePageSize(env, null) as usize,
             page_size()
         );
         assert_eq!(
-            Java_com_videocleaner_engine_NativeCore_nativeCreate(env, null, 63, 48),
+            Java_com_video_cleaner_Core_nativeCreate(env, null, 63, 48),
             CoreError::InvalidGeometry.code() as i64
         );
         let handle =
-            Java_com_videocleaner_engine_NativeCore_nativeCreate(env, null, w as i32, h as i32);
+            Java_com_video_cleaner_Core_nativeCreate(env, null, w as i32, h as i32);
         assert!(handle > 0);
         assert_eq!(
-            Java_com_videocleaner_engine_NativeCore_nativeSetOption(env, null, handle, 1, 0),
+            Java_com_video_cleaner_Core_nativeSetOption(env, null, handle, 1, 0),
             0
         );
         assert_eq!(
-            Java_com_videocleaner_engine_NativeCore_nativeSetOption(env, null, handle, 2, 1),
+            Java_com_video_cleaner_Core_nativeSetOption(env, null, handle, 2, 1),
             0
         );
         assert_eq!(
-            Java_com_videocleaner_engine_NativeCore_nativeSetOption(env, null, handle, 9, 1),
+            Java_com_video_cleaner_Core_nativeSetOption(env, null, handle, 9, 1),
             CoreError::BadArgument.code()
         );
         assert_eq!(
-            Java_com_videocleaner_engine_NativeCore_nativeFinish(env, null, 0),
+            Java_com_video_cleaner_Core_nativeFinish(env, null, 0),
             CoreError::InvalidHandle.code()
         );
 
@@ -4826,7 +4826,7 @@ mod tests {
         let mut meta = vec![0u8; OUTPUT_META_BYTES];
         let mut small_info = vec![0u8; 8];
         let code = unsafe {
-            Java_com_videocleaner_engine_NativeCore_nativePoll(
+            Java_com_video_cleaner_Core_nativePoll(
                 env,
                 null,
                 handle,
@@ -4836,11 +4836,11 @@ mod tests {
         assert_eq!(code, CoreError::BufferTooSmall.code());
         // Null tampon (Kotlin tarafında yanlış tür / null aktarımı) çökme yerine hata kodu döndürür.
         let code =
-            unsafe { Java_com_videocleaner_engine_NativeCore_nativePoll(env, null, handle, null) };
+            unsafe { Java_com_video_cleaner_Core_nativePoll(env, null, handle, null) };
         assert_eq!(code, CoreError::BadArgument.code());
         let mut scratch = vec![0u8; geo.frame_bytes()];
         let code = unsafe {
-            Java_com_videocleaner_engine_NativeCore_nativePushYuv420(
+            Java_com_video_cleaner_Core_nativePushYuv420(
                 env,
                 null,
                 handle,
@@ -4862,7 +4862,7 @@ mod tests {
         // Negatif ofset, sıfır adım ve tampondan büyük ofset de reddedilir.
         for (offset, stride) in [(-1, w as i32), (0, 0), (i32::MAX, w as i32)] {
             let code = unsafe {
-                Java_com_videocleaner_engine_NativeCore_nativePushYuv420(
+                Java_com_video_cleaner_Core_nativePushYuv420(
                     env,
                     null,
                     handle,
@@ -4889,7 +4889,7 @@ mod tests {
         // Çok küçük düzlem: kare eklenmez.
         let mut tiny = vec![0u8; 16];
         let code = unsafe {
-            Java_com_videocleaner_engine_NativeCore_nativePushYuv420(
+            Java_com_video_cleaner_Core_nativePushYuv420(
                 env,
                 null,
                 handle,
@@ -4926,7 +4926,7 @@ mod tests {
         let mut windows = 0;
         loop {
             let step = unsafe {
-                Java_com_videocleaner_engine_NativeCore_nativePoll(
+                Java_com_video_cleaner_Core_nativePoll(
                     env,
                     null,
                     handle,
@@ -4939,7 +4939,7 @@ mod tests {
                     for _ in 0..read_i32(&info, 4) {
                         if pushed == total {
                             assert_eq!(
-                                Java_com_videocleaner_engine_NativeCore_nativeFinish(
+                                Java_com_video_cleaner_Core_nativeFinish(
                                     env, null, handle
                                 ),
                                 0
@@ -4958,7 +4958,7 @@ mod tests {
                             }
                         }
                         let seq = unsafe {
-                            Java_com_videocleaner_engine_NativeCore_nativePushYuv420(
+                            Java_com_video_cleaner_Core_nativePushYuv420(
                                 env,
                                 null,
                                 handle,
@@ -4988,7 +4988,7 @@ mod tests {
                     // Pencere karesi okunabilir ve doğru kareyi verir; dolgu konumu 0 döner.
                     for pos in [0, 14, 29] {
                         let got = unsafe {
-                            Java_com_videocleaner_engine_NativeCore_nativeReadWindowFrame(
+                            Java_com_video_cleaner_Core_nativeReadWindowFrame(
                                 env,
                                 null,
                                 handle,
@@ -5009,7 +5009,7 @@ mod tests {
                     // Kesinleşen her konuma (4,2)-(12,6) bölgesi için tahmin ver.
                     for pos in emit0..emit1 {
                         let rc = unsafe {
-                            Java_com_videocleaner_engine_NativeCore_nativeSubmitEstimate(
+                            Java_com_video_cleaner_Core_nativeSubmitEstimate(
                                 env,
                                 null,
                                 handle,
@@ -5027,7 +5027,7 @@ mod tests {
                     }
                     // Hizasız ROI ve çıktı istenmeyen konum reddedilir.
                     let bad = unsafe {
-                        Java_com_videocleaner_engine_NativeCore_nativeSubmitEstimate(
+                        Java_com_video_cleaner_Core_nativeSubmitEstimate(
                             env,
                             null,
                             handle,
@@ -5043,7 +5043,7 @@ mod tests {
                     };
                     assert_eq!(bad, CoreError::BadArgument.code());
                     assert_eq!(
-                        Java_com_videocleaner_engine_NativeCore_nativeCompleteWindow(
+                        Java_com_video_cleaner_Core_nativeCompleteWindow(
                             env, null, handle
                         ),
                         0
@@ -5051,7 +5051,7 @@ mod tests {
                 }
                 STEP_OUTPUT => loop {
                     let got = unsafe {
-                        Java_com_videocleaner_engine_NativeCore_nativePopOutputYuv420(
+                        Java_com_video_cleaner_Core_nativePopOutputYuv420(
                             env,
                             null,
                             handle,
@@ -5108,7 +5108,7 @@ mod tests {
 
         let mut stats = vec![0u8; STATS_BYTES];
         let n = unsafe {
-            Java_com_videocleaner_engine_NativeCore_nativeStats(
+            Java_com_video_cleaner_Core_nativeStats(
                 env,
                 null,
                 handle,
@@ -5121,7 +5121,7 @@ mod tests {
         assert_eq!(read_i64(&stats, 32), 0); // koruma ihlali
         assert_eq!(read_i64(&stats, 40), 0); // sıra ihlali
 
-        unsafe { Java_com_videocleaner_engine_NativeCore_nativeDestroy(env, null, handle) };
+        unsafe { Java_com_video_cleaner_Core_nativeDestroy(env, null, handle) };
     }
 
     // ---- hız ölçümü (cargo test --release -- --ignored --nocapture bench) -----

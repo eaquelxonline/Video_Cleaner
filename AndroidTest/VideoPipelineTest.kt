@@ -5,7 +5,7 @@
 // GitHub Actions'ta KVM'li emülatörde koşar (.github/workflows/android-test.yml).
 // Her sonuç logcat'e "VCTEST" etiketiyle tek satır olarak yazılır.
 
-package com.videocleaner.engine
+package com.video.cleaner
 
 import android.content.ContentValues
 import android.content.Context
@@ -63,12 +63,12 @@ class VideoPipelineTest {
 
     @Test
     fun a_nativeCoreLoadsOnArt() {
-        assertEquals(NativeCore.ABI_VERSION, NativeCore.nativeAbiVersion())
-        val page = NativeCore.nativePageSize()
+        assertEquals(Core.ABI_VERSION, Core.nativeAbiVersion())
+        val page = Core.nativePageSize()
         assertEquals("çekirdeğin gördüğü sayfa boyutu işletim sistemininkiyle aynı olmalı", Os.sysconf(OsConstants._SC_PAGESIZE).toInt(), page)
         log(
             "DEVICE api=${Build.VERSION.SDK_INT} release=${Build.VERSION.RELEASE} abi=${Build.SUPPORTED_ABIS.joinToString("/")} " +
-                "page=$page backend=\"${NativeCore.kernelBackendName()}\" model=\"${Build.MODEL}\"",
+                "page=$page backend=\"${Core.kernelBackendName()}\" model=\"${Build.MODEL}\"",
         )
         InstrumentationRegistry.getArguments().getString("expectPageSize")?.let { expected ->
             assertEquals("beklenen sayfa boyutu", expected.toInt(), page)
@@ -96,13 +96,13 @@ class VideoPipelineTest {
     fun b_coreIsBitExactOnArt() {
         val (w, h, total) = Triple(360, 270, 97)
         val bytes = w * h * 3 / 2
-        val handle = NativeCore.nativeCreate(w, h)
+        val handle = Core.nativeCreate(w, h)
         assertFalse("nativeCreate hata döndürdü: $handle", handle in -4096L..0L)
         try {
-            assertEquals(0, NativeCore.nativeSetOption(handle, NativeCore.OPTION_AUTO_SCENE_CUT, 0))
-            assertEquals(0, NativeCore.nativeSetOption(handle, NativeCore.OPTION_INTEGRITY_CHECK, 1))
-            val info = direct(NativeCore.POLL_INFO_BYTES)
-            val meta = direct(NativeCore.OUTPUT_META_BYTES)
+            assertEquals(0, Core.nativeSetOption(handle, Core.OPTION_AUTO_SCENE_CUT, 0))
+            assertEquals(0, Core.nativeSetOption(handle, Core.OPTION_INTEGRITY_CHECK, 1))
+            val info = direct(Core.POLL_INFO_BYTES)
+            val meta = direct(Core.OUTPUT_META_BYTES)
             val frame = direct(bytes)
             val out = direct(bytes)
             fun pattern(seq: Int, i: Int): Byte = (seq * 31 + i * 7 + (i shr 8)).toByte()
@@ -110,24 +110,24 @@ class VideoPipelineTest {
             var popped = 0
             var windows = 0
             loop@ while (true) {
-                when (val step = NativeCore.nativePoll(handle, info)) {
-                    NativeCore.STEP_NEED_FRAMES -> {
+                when (val step = Core.nativePoll(handle, info)) {
+                    Core.STEP_NEED_FRAMES -> {
                         for (k in 0 until info.getInt(4)) {
                             if (pushed == total) {
-                                assertEquals(0, NativeCore.nativeFinish(handle))
+                                assertEquals(0, Core.nativeFinish(handle))
                                 break
                             }
                             for (i in 0 until bytes) frame.put(i, pattern(pushed, i))
                             // Düzensiz ama artan zaman damgaları (değişken kare hızı).
-                            assertEquals(pushed.toLong(), NativeCore.nativePushNv12(handle, frame, pushed * 16_667L + pushed % 7, 0))
+                            assertEquals(pushed.toLong(), Core.nativePushNv12(handle, frame, pushed * 16_667L + pushed % 7, 0))
                             pushed++
                         }
                     }
-                    NativeCore.STEP_WINDOW -> {
+                    Core.STEP_WINDOW -> {
                         windows++
-                        assertEquals(0, NativeCore.nativeCompleteWindow(handle))
+                        assertEquals(0, Core.nativeCompleteWindow(handle))
                     }
-                    NativeCore.STEP_OUTPUT -> while (NativeCore.nativePopOutputNv12(handle, out, meta) == 1) {
+                    Core.STEP_OUTPUT -> while (Core.nativePopOutputNv12(handle, out, meta) == 1) {
                         assertEquals(popped.toLong(), meta.getLong(0))
                         assertEquals(popped * 16_667L + popped % 7, meta.getLong(8))
                         for (i in 0 until bytes) {
@@ -135,7 +135,7 @@ class VideoPipelineTest {
                         }
                         popped++
                     }
-                    NativeCore.STEP_FINISHED -> break@loop
+                    Core.STEP_FINISHED -> break@loop
                     else -> throw AssertionError("beklenmeyen adım $step")
                 }
             }
@@ -143,9 +143,9 @@ class VideoPipelineTest {
             assertEquals(total, popped)
             log("CORE frames=$total windows=$windows bitExact=true size=${w}x$h")
         } finally {
-            NativeCore.nativeDestroy(handle)
+            Core.nativeDestroy(handle)
         }
-        assertEquals("yok edilmiş tutamak reddedilmeli", -12, NativeCore.nativeFinish(0))
+        assertEquals("yok edilmiş tutamak reddedilmeli", -12, Core.nativeFinish(0))
     }
 
     // ---- 3. Gerçek videolar: çöz → çekirdek → kodla → MP4 ---------------------------

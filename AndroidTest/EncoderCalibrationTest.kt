@@ -6,7 +6,7 @@
 //   Movies/VideoCleanerCalib altına koyar ve her kodlamayı "VCCAL" satırı olarak yazar. Kalite ölçümü
 //   (PSNR/SSIM/VMAF) bilgisayarda yapılır: .github/scripts/calibration_metrics.py
 
-package com.videocleaner.engine
+package com.video.cleaner
 
 import android.content.ContentValues
 import android.content.Context

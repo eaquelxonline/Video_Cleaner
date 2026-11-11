@@ -25,15 +25,15 @@ plugins {
 val minAndroidApi = 30          // Android 11
 
 android {
-    namespace = "com.videocleaner.engine"
+    namespace = "com.video.cleaner"
     compileSdk = 37              // Android 17
     ndkVersion = "30.0.16248370"
 
     defaultConfig {
-        applicationId = "com.videocleaner.engine"
+        applicationId = "com.video.cleaner"
         minSdk = minAndroidApi
         targetSdk = 37
-        versionCode = 1
+        versionCode = 2
         versionName = "2.0.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         ndk {

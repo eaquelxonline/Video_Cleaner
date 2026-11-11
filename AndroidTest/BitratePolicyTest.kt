@@ -1,6 +1,6 @@
 // Video_Cleaner — bit hızı politikası birim testleri (saf hesap; cihazda koşar ama MediaCodec kullanmaz).
 
-package com.videocleaner.engine
+package com.video.cleaner
 
 import android.media.MediaFormat
 import androidx.test.ext.junit.runners.AndroidJUnit4

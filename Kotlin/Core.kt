@@ -1,6 +1,6 @@
 // Video_Cleaner v2.0 — Android çekirdek katmanı
 //
-//   NativeCore      Rust çekirdeğinin (libvideo_cleaner.so) JNI yüzeyi
+//   Core      Rust çekirdeğinin (libvideo_cleaner.so) JNI yüzeyi
 //   CleanerSession  Tutamağı ve tamponları saran güvenli Kotlin arayüzü
 //   VideoJob        MediaCodec ile çöz → Rust halkası/zamanlayıcı → MediaCodec ile kodla → MP4
 //   CleanerService  Uzun işi taşıyan ön plan hizmeti
@@ -12,7 +12,7 @@
 // Kopya sayısı: çözücü görüntüsü → halka (1 kopya), halka → kodlayıcı görüntüsü
 // (1 kopya). Sıfır kopya hattı (AHardwareBuffer/Vulkan) GPU aşamasının işidir.
 
-package com.videocleaner.engine
+package com.video.cleaner
 
 import android.app.Notification
 import android.app.NotificationChannel
@@ -56,7 +56,7 @@ import kotlin.math.max
  * birebir eşleşmelidir. Tüm tamponlar DOĞRUDAN (direct) `ByteBuffer` olmalıdır;
  * hatalar istisna yerine negatif kod olarak döner.
  */
-object NativeCore {
+object Core {
     const val ABI_VERSION = 2
 
     const val STEP_NEED_FRAMES = 0
@@ -228,17 +228,17 @@ data class CoreStats(
  */
 class CleanerSession(val width: Int, val height: Int) : AutoCloseable {
     private var handle: Long
-    private val info = direct(NativeCore.POLL_INFO_BYTES)
-    private val meta = direct(NativeCore.OUTPUT_META_BYTES)
-    private val statsBuffer = direct(NativeCore.STATS_BYTES)
+    private val info = direct(Core.POLL_INFO_BYTES)
+    private val meta = direct(Core.OUTPUT_META_BYTES)
+    private val statsBuffer = direct(Core.STATS_BYTES)
 
     val frameBytes: Int get() = width * height * 3 / 2
 
     init {
-        check(NativeCore.nativeAbiVersion() == NativeCore.ABI_VERSION) {
-            "libvideo_cleaner.so sürümü uyumsuz (beklenen ABI ${NativeCore.ABI_VERSION})"
+        check(Core.nativeAbiVersion() == Core.ABI_VERSION) {
+            "libvideo_cleaner.so sürümü uyumsuz (beklenen ABI ${Core.ABI_VERSION})"
         }
-        val created = NativeCore.nativeCreate(width, height)
+        val created = Core.nativeCreate(width, height)
         // Tutamak bir bellek adresidir. Android 11+ ARM64'te adreslerin üst baytı etiketlidir
         // (ör. 0xB4…), dolayısıyla Long olarak NEGATİF görünebilir: "<= 0" denetimi geçerli
         // tutamağı hata sanar. Hata kodları yalnızca küçük negatif sayılardır.
@@ -252,18 +252,18 @@ class CleanerSession(val width: Int, val height: Int) : AutoCloseable {
     }
 
     fun setAutoSceneCut(enabled: Boolean) {
-        check(NativeCore.nativeSetOption(handle, NativeCore.OPTION_AUTO_SCENE_CUT, if (enabled) 1 else 0), "setOption")
+        check(Core.nativeSetOption(handle, Core.OPTION_AUTO_SCENE_CUT, if (enabled) 1 else 0), "setOption")
     }
 
     /** Her çıkan karede koruma kapısını yeniden denetler (yavaş; tanılama için). */
     fun setIntegrityCheck(enabled: Boolean) {
-        check(NativeCore.nativeSetOption(handle, NativeCore.OPTION_INTEGRITY_CHECK, if (enabled) 1 else 0), "setOption")
+        check(Core.nativeSetOption(handle, Core.OPTION_INTEGRITY_CHECK, if (enabled) 1 else 0), "setOption")
     }
 
-    fun poll(): Step = when (check(NativeCore.nativePoll(handle, info), "poll")) {
-        NativeCore.STEP_NEED_FRAMES -> Step.NeedFrames(info.getInt(4))
-        NativeCore.STEP_OUTPUT -> Step.Output(info.getInt(4))
-        NativeCore.STEP_FINISHED -> Step.Finished
+    fun poll(): Step = when (check(Core.nativePoll(handle, info), "poll")) {
+        Core.STEP_NEED_FRAMES -> Step.NeedFrames(info.getInt(4))
+        Core.STEP_OUTPUT -> Step.Output(info.getInt(4))
+        Core.STEP_FINISHED -> Step.Finished
         else -> Step.Window(
             WindowPlan(
                 id = info.getLong(8),
@@ -289,7 +289,7 @@ class CleanerSession(val width: Int, val height: Int) : AutoCloseable {
         val high = if (image.format == ImageFormat.YCBCR_P010) 1 else 0
         val yOffset = crop.top * y.rowStride + crop.left * y.pixelStride + high
         val uvOffset = (crop.top / 2) * u.rowStride + (crop.left / 2) * u.pixelStride + high
-        val seq = NativeCore.nativePushYuv420(
+        val seq = Core.nativePushYuv420(
             handle,
             y.buffer, yOffset, y.rowStride, y.pixelStride,
             u.buffer, uvOffset,
@@ -302,35 +302,35 @@ class CleanerSession(val width: Int, val height: Int) : AutoCloseable {
     }
 
     fun finish() {
-        check(NativeCore.nativeFinish(handle), "finish")
+        check(Core.nativeFinish(handle), "finish")
     }
 
     fun setHint(seq: Long, hint: Int) {
-        check(NativeCore.nativeSetHint(handle, seq, hint), "setHint")
+        check(Core.nativeSetHint(handle, seq, hint), "setHint")
     }
 
     /** Pencere konumundaki kareyi NV12 olarak `dst` içine kopyalar; dolgu konumunda false döner. */
     fun readWindowFrame(position: Int, dst: ByteBuffer): Boolean =
-        check(NativeCore.nativeReadWindowFrame(handle, position, dst), "readWindowFrame") == 1
+        check(Core.nativeReadWindowFrame(handle, position, dst), "readWindowFrame") == 1
 
     /**
      * Bir pencere konumunun model çıktısını verir. ROI çift sınırlı olmalıdır.
      * `y`/`weight`: w×h bayt, `uv`: w×h/2 bayt (U0 V0 U1 V1 …). `weight` 0 = pikseli koru.
      */
     fun submitEstimate(position: Int, x: Int, y0: Int, w: Int, h: Int, y: ByteBuffer, uv: ByteBuffer, weight: ByteBuffer) {
-        check(NativeCore.nativeSubmitEstimate(handle, position, x, y0, w, h, y, uv, weight), "submitEstimate")
+        check(Core.nativeSubmitEstimate(handle, position, x, y0, w, h, y, uv, weight), "submitEstimate")
     }
 
     /** Pencereyi tamamlar. Tahmin verilmeyen konumlar orijinal hâliyle çıkar. */
     fun completeWindow() {
-        check(NativeCore.nativeCompleteWindow(handle), "completeWindow")
+        check(Core.nativeCompleteWindow(handle), "completeWindow")
     }
 
     /** Sıradaki kesinleşmiş kareyi kodlayıcının giriş görüntüsüne yazar; hazır kare yoksa null. */
     fun popInto(image: Image): OutputFrame? {
         val (y, u, v) = image.planes
         val got = check(
-            NativeCore.nativePopOutputYuv420(
+            Core.nativePopOutputYuv420(
                 handle,
                 y.buffer, 0, y.rowStride,
                 u.buffer, 0,
@@ -345,14 +345,14 @@ class CleanerSession(val width: Int, val height: Int) : AutoCloseable {
     }
 
     fun stats(): CoreStats {
-        check(NativeCore.nativeStats(handle, statsBuffer), "stats")
+        check(Core.nativeStats(handle, statsBuffer), "stats")
         val v = LongArray(14) { statsBuffer.getLong(it * 8) }
         return CoreStats(v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9], v[10], v[11], v[12], v[13])
     }
 
     override fun close() {
         if (handle != 0L) {
-            NativeCore.nativeDestroy(handle)
+            Core.nativeDestroy(handle)
             handle = 0L
         }
     }
@@ -1522,8 +1522,8 @@ class CleanerService : Service() {
     }
 
     companion object {
-        private const val ACTION_START = "com.videocleaner.engine.START"
-        private const val ACTION_CANCEL = "com.videocleaner.engine.CANCEL"
+        private const val ACTION_START = "com.video.cleaner.START"
+        private const val ACTION_CANCEL = "com.video.cleaner.CANCEL"
         private const val EXTRA_INPUT = "input"
         private const val EXTRA_OUTPUT = "output"
         private const val EXTRA_HEVC = "hevc"

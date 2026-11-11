@@ -4,7 +4,7 @@
 // seçimi ve çıktı konumu Depolama Erişim Çerçevesi (SAF) ile yapılır; depolama izni
 // istenmez. Uygulama başka uygulamalardan "Birlikte aç" / "Paylaş" ile de video alır.
 
-package com.videocleaner.engine
+package com.video.cleaner
 
 import android.Manifest
 import android.content.Context
@@ -97,7 +97,7 @@ class App : ComponentActivity() {
     private fun handleIntent(intent: Intent?) {
         intent ?: return
         // Yalnızca hata ayıklama derlemesinde: adb ile arayüzsüz otomatik test.
-        //   adb shell am start -n com.videocleaner.engine/.App --es vc_input <dosya> --es vc_output <dosya>
+        //   adb shell am start -n com.video.cleaner/.App --es vc_input <dosya> --es vc_output <dosya>
         val debuggable = applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0
         val autoInput = intent.getStringExtra("vc_input")
         val autoOutput = intent.getStringExtra("vc_output")
@@ -137,8 +137,8 @@ fun VideoCleanerTheme(content: @Composable () -> Unit) {
 
 /** Yerel çekirdeğin durumu; kitaplık yüklenemezse hata metni. */
 private fun describeCore(): String = try {
-    val page = NativeCore.nativePageSize() / 1024
-    "Çekirdek v${NativeCore.nativeAbiVersion()} · ${NativeCore.kernelBackendName()} · $page KB sayfa"
+    val page = Core.nativePageSize() / 1024
+    "Çekirdek v${Core.nativeAbiVersion()} · ${Core.kernelBackendName()} · $page KB sayfa"
 } catch (e: Throwable) {
     "Yerel çekirdek yüklenemedi: ${e.message ?: e.javaClass.simpleName}"
 }
