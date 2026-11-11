@@ -1,7 +1,7 @@
 # Video_Cleaner — çalışma kuralları (Claude oturumları için)
 
 - Tek geliştirme dalı: `Video_Cleaner_Beta`. Bütün commit'ler bu dala push edilir.
-- Kullanıcıyla Türkçe konuşulur. Ölçülmeyen şey "geçti" yazılmaz; sonuçlar gerçek verilerle GEÇTİ/KALDI olarak raporlanır.
+- Kullanıcıyla HER ZAMAN, HER KOŞULDA yalnızca Türkçe konuşulur (otomatik bildirimlere, CI ve zamanlanmış kontrollere verilen yanıtlar dahil). Ölçülmeyen şey "geçti" yazılmaz; sonuçlar gerçek verilerle GEÇTİ/KALDI olarak raporlanır.
 - Kişisel (ör. WhatsApp) videolar depoya veya CI test dosyalarına eklenmez.
 
 ## Her push'tan sonra Google Drive yedeği (kullanıcının isteği)
