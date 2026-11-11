@@ -10,7 +10,7 @@ name: Video Cleaner Android Test
 on:
   workflow_dispatch:
   push:
-    branches: [ main ]
+    branches: [ Video_Cleaner_Beta ]
   pull_request:
 
 concurrency:

@@ -9,6 +9,8 @@ name: Video Cleaner Models
 
 on:
   workflow_dispatch:
+  push:
+    branches: [ Video_Cleaner_Beta ]
   pull_request:
 
 concurrency:

@@ -8,6 +8,8 @@ name: Video Cleaner Rust Core
 
 on:
   workflow_dispatch:
+  push:
+    branches: [ Video_Cleaner_Beta ]
   pull_request:
 
 concurrency:
