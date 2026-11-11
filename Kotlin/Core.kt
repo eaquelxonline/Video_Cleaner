@@ -440,6 +440,9 @@ private fun MediaFormat.intOr(key: String, fallback: Int): Int = if (containsKey
  *   kaynak×3.0 → ort. 97,4, en düşük 93,5
  *   eski kural (max(beyan×1.25, 0.14 bpppf)) → ort. 96,6, en düşük 92,9; medyan 2,5×, ort. 5,8×, en kötü 33,7×
  * Piksel başına bite göre uyarlanan kurallar zorluğu öngörmedi (düşük bit hızlı kolay klipler); sabit kat seçildi.
+ * Üst sınır: ölçülen 11 noktada çıktı ≥ 0,20 bpppf iken VMAF ≥ 96,5; bu yüzden hedef, kaynağın katı bu eşiği
+ * aşıyorsa eşiğe (ama asla kaynağın kendi bit hızının altına değil) indirilir. Böylece 16 Mb/s'lik bir 1080p
+ * kaynak 32 Mb/s'ye şişmez; kalibrasyon setinde ort. VMAF 95,8 → 95,4, en düşük 91,6 aynı, ort. boyut 2,11× → 1,95×.
  * Kaynağın kendi anahtar kare aralığını korumak aynı boyutta VMAF'ı 7 puana kadar artırdı.
  * Donanım kodlayıcıları farklı davranır; hedef kodlayıcının bit hızı aralığına kırpılır, kalite modu
  * (CQ/QP sınırı) kullanılmaz: AVC'de CQ yok, QP sınırı ölçülebilir fark yaratmadı.
@@ -449,6 +452,9 @@ internal object BitratePolicy {
     const val STANDARD_SOURCE_FACTOR = 2.0
     /** Yüksek: kaynağın gerçek video bit hızının katı (ortalama VMAF eski kuralın üstünde). */
     const val HIGH_SOURCE_FACTOR = 3.0
+    /** Kaynak katının yetiştiği "yeterli" çıktı yoğunluğu (piksel başına, kare başına bit); üstüne çıkılmaz. */
+    const val STANDARD_CAP_BPPPF = 0.20
+    const val HIGH_CAP_BPPPF = 0.30
     /** Kaynak bit hızı ölçülemezse eski taban (piksel başına, kare başına bit) korunur: belirsizlikte kaliteyi düşürme. */
     const val UNKNOWN_SOURCE_BPPPF = 0.14
     /** Akıl dışı küçük hedeflere karşı alt sınır (bit/s). */
@@ -489,9 +495,16 @@ internal object BitratePolicy {
             return Plan(max(fallback, MIN_BITRATE), gop, "kaynak bit hızı ölçülemedi: ${UNKNOWN_SOURCE_BPPPF} bpppf×${input.quality}")
         }
         val factor = if (high) HIGH_SOURCE_FACTOR else STANDARD_SOURCE_FACTOR
+        val capBpppf = if (high) HIGH_CAP_BPPPF else STANDARD_CAP_BPPPF
         val codec = codecFactor(input.sourceMime, input.targetMime)
-        val target = (input.sourceVideoBps * factor * codec).toLong()
-        return Plan(max(target, MIN_BITRATE), gop, "kaynak ${input.sourceVideoBps / 1000} kb/s × $factor × kodek $codec")
+        val source = input.sourceVideoBps * codec
+        val cap = input.width.toDouble() * input.height * input.frameRate * capBpppf
+        // min(kaynak×kat, max(kaynak×1, eşik)): düşük bit hızlı kaynakta kat uygulanır, yüksek bit hızlıda eşikte
+        // durulur; kaynağın kendi bit hızının altına hiçbir zaman inilmez.
+        val target = minOf(source * factor, maxOf(source, cap)).toLong()
+        val limited = source * factor > maxOf(source, cap)
+        val reason = "kaynak ${input.sourceVideoBps / 1000} kb/s × ${if (limited) "%.2f".format(target / input.sourceVideoBps.toDouble()) + " (eşik $capBpppf bpppf)" else "$factor"} × kodek $codec"
+        return Plan(max(target, MIN_BITRATE), gop, reason)
     }
 }
 

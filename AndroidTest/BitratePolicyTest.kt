@@ -39,20 +39,38 @@ class BitratePolicyTest {
                 for (src in listOf(100_000L, 400_000L, 1_500_000L, 8_000_000L, 40_000_000L)) {
                     val plan = BitratePolicy.plan(input(w, h, fps, src))
                     assertTrue("${w}x$h@$fps src=$src → ${plan.bitrateBps}", plan.bitrateBps <= maxOf((src * BitratePolicy.STANDARD_SOURCE_FACTOR).toLong(), BitratePolicy.MIN_BITRATE))
-                    assertTrue(plan.bitrateBps >= BitratePolicy.MIN_BITRATE)
+                    assertTrue("kaynağın altına inilmez", plan.bitrateBps >= maxOf(src, BitratePolicy.MIN_BITRATE))
                 }
             }
         }
     }
 
     @Test
-    fun highTargetsMoreThanStandard() {
-        for (src in listOf(300_000L, 2_000_000L, 12_000_000L)) {
+    fun highTargetsAtLeastStandard() {
+        for (src in listOf(300_000L, 2_000_000L, 12_000_000L, 40_000_000L)) {
             val std = BitratePolicy.plan(input(src = src, quality = 1f)).bitrateBps
             val high = BitratePolicy.plan(input(src = src, quality = 2f)).bitrateBps
-            assertTrue("yüksek $high > standart $std", high > std)
-            assertEquals((src * BitratePolicy.HIGH_SOURCE_FACTOR).toLong(), high)
+            assertTrue("yüksek $high ≥ standart $std", high >= std)
         }
+        // Düşük bit hızlı kaynakta Yüksek gerçekten daha fazla bit ister.
+        assertEquals((300_000 * BitratePolicy.HIGH_SOURCE_FACTOR).toLong(), BitratePolicy.plan(input(src = 300_000, quality = 2f)).bitrateBps)
+    }
+
+    @Test
+    fun highBitrateSourceIsNotInflatedNorReduced() {
+        // Telefonda denenen 1080p örnek: 16 Mb/s. ×2 = 32 Mb/s israf olurdu; eşik (0,20 bpppf ≈ 12,4 Mb/s)
+        // kaynağın altında kaldığı için hedef kaynağın kendisidir — ne şişirilir ne kaynağın altına inilir.
+        val plan = BitratePolicy.plan(input(w = 1920, h = 1080, fps = 30.0, src = 16_000_000))
+        assertEquals(16_000_000L, plan.bitrateBps)
+    }
+
+    @Test
+    fun capAppliesBetweenSourceAndMultiple() {
+        // 360p30 846 kb/s (qable örneği): ×2 = 1,69 Mb/s; eşik 0,20 bpppf = 1,382 Mb/s → hedef eşik.
+        val plan = BitratePolicy.plan(input(w = 640, h = 360, fps = 30.0, src = 846_000))
+        assertEquals((640.0 * 360 * 30 * BitratePolicy.STANDARD_CAP_BPPPF).toLong(), plan.bitrateBps)
+        // 720p30 1,43 Mb/s: ×2 = 2,86 Mb/s eşiğin (5,53 Mb/s) altında → tam kat.
+        assertEquals((1_432_000 * BitratePolicy.STANDARD_SOURCE_FACTOR).toLong(), BitratePolicy.plan(input(src = 1_432_000)).bitrateBps)
     }
 
     @Test
