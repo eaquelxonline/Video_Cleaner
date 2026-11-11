@@ -1,0 +1,15 @@
+# Derleme çıktıları
+/build/
+/.gradle/
+/.kotlin/
+/target/
+/local.properties
+# Eğitim çıktıları
+/runs/
+__pycache__/
+*.pt
+*.safetensors
+# İş akışı artıkları
+/vc-logcat.txt
+/vc-output/
+/test-failed

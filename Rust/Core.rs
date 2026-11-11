@@ -1,0 +1,5202 @@
+//! # Video_Cleaner v2.0 — Rust çekirdeği
+//!
+//! Bu dosya çalışma zamanı motorunun model-dışı kısmının tamamıdır:
+//!
+//! | Bölüm            | Sorumluluk                                                        |
+//! |------------------|-------------------------------------------------------------------|
+//! | [`FrameRing`]    | 30 karelik NV12 belleği + kare sahipliği (yazma/okuma kiraları)   |
+//! | [`Scheduler`]    | Hangi kare hangi pencerede girdi/çıktı olur (saf mantık, piksel yok) |
+//! | [`Estimate`]     | Modelin ürettiği onarım tahmini (yalnızca ROI içinde geçerli)     |
+//! | [`Pipeline`]     | Yukarıdakileri birleştiren kare giriş/çıkış hattı                 |
+//! | [`kernels`]      | Assembly SIMD çekirdekleri + taşınabilir başvuru gerçeklemesi     |
+//! | `jni`            | Kotlin köprüsü (harici crate yok, yalnızca doğrudan ByteBuffer)   |
+//!
+//! ## Pencere matematiği (kesin tanım)
+//!
+//! Model **her zaman** ardışık 30 kareyi görür. İki mod yalnızca *hangi çıktının
+//! kullanıldığını* ve *pencerenin ne kadar kaydığını* değiştirir. `e` = sıradaki
+//! kesinleşecek karenin sıra numarası olsun:
+//!
+//! * **Mod B (15+15 blok)** — `B(j)`, `0 ≤ j ≤ 15`: pencere `[e+j-15, e+j+15)`.
+//!   Konum `[15-j, 15)` kareleri kesinleşir, konum `[15, 30)` tahminleri bir sonraki
+//!   pencereyle harmanlanmak üzere önbelleğe alınır. Olağan akışta `j = 15`:
+//!   pencereler `[0,30) → [15,45) → [30,60)…` şeklinde 15 kare kayar.
+//!   `j = 0` hiçbir kareyi kesinleştirmeyen "köprü" geçişidir (yalnızca önbellek üretir).
+//! * **Mod A (14+1+15 hassas)**: pencere `[e-14, e+16)`, yalnızca konum 14 (= `e`)
+//!   kesinleşir, pencere 1 kare kayar.
+//!
+//! "15 geçmiş + 15 gelecek" tek bir geçişte hiçbir kareye verilemez (bunun için 31
+//! kare gerekir). Bunun yerine şu **kanıtlanabilir** güvence sağlanır ve
+//! `scheduler_random_streams_keep_invariants` testiyle denetlenir: Mod B'de
+//! kesinleşen her kare, harmanlanan iki tahmini üzerinden en az
+//! `min(15, sahne başına uzaklık)` geçmiş ve `min(15, sahne sonuna uzaklık)` gelecek
+//! kareye erişmiştir. Pencereler sahne geçişini asla aşmaz; eksik konumlar
+//! "geçersiz" (dolgu) olarak işaretlenir ve modele geçerlilik maskesiyle bildirilir.
+//!
+//! ## Dürüst sınırlar
+//!
+//! * Halka belleği sayfa hizalıdır; bu onu "pinned" veya GPU'ya doğrudan görünür
+//!   **yapmaz**. Sıfır kopya hattı AHardwareBuffer/Vulkan aşamasının işidir.
+//! * Maskesiz piksellerin bit düzeyinde korunması **kodlayıcıdan önce** garanti
+//!   edilir. Kayıplı (H.264/HEVC) yeniden kodlama bu garantiyi doğası gereği bozar.
+//! * NV12'de renk 2×2 blok başına tek örnektir: Y pikseli tek tek, UV ise içinde
+//!   hiç maskeli piksel bulunmayan bloklar için bit düzeyinde korunur.
+
+#![deny(unsafe_op_in_unsafe_fn)]
+#![allow(clippy::too_many_arguments)]
+
+use std::alloc::{self, Layout};
+use std::collections::VecDeque;
+use std::ffi::c_void;
+use std::fmt;
+use std::ops::Range;
+use std::ptr::NonNull;
+use std::sync::{Mutex, MutexGuard};
+
+// ============================================================================
+// 1. Sabitler ve hata türü
+// ============================================================================
+
+/// Modelin tek geçişte gördüğü kare sayısı ve halka kapasitesi.
+pub const WINDOW_FRAMES: usize = 30;
+/// 15+15 bloğunun yarısı; Mod B'nin olağan kayma miktarı.
+pub const HALF_WINDOW: usize = 15;
+/// Mod A'da hedef karenin pencere içindeki konumu (14 geçmiş + hedef + 15 gelecek).
+pub const MODE_A_TARGET: usize = 14;
+/// Bu sayıdan az geçerli kare içeren pencereler "düşük bağlam" olarak işaretlenir.
+pub const LOW_CONTEXT_FRAMES: u32 = 10;
+/// Kotlin köprüsüyle uyum denetimi için sürüm numarası.
+pub const ABI_VERSION: i32 = 2;
+
+/// Kare bayrağı: bu kare yeni bir sahnenin ilk karesidir.
+pub const FRAME_FLAG_SCENE_CUT: u32 = 1 << 0;
+/// Kare bayrağı: kaynakta anahtar kare (yalnızca bilgi amaçlı).
+pub const FRAME_FLAG_KEYFRAME: u32 = 1 << 1;
+
+/// Plan bayrağı: pencere sahnenin ilk karesini içeriyor (geçmiş tarafı dolgu olabilir).
+pub const PLAN_FLAG_SEGMENT_START: u32 = 1 << 0;
+/// Plan bayrağı: pencere sahnenin son karesine dayanıyor (gelecek tarafı dolgu olabilir).
+pub const PLAN_FLAG_SEGMENT_END: u32 = 1 << 1;
+/// Plan bayrağı: geçerli kare sayısı [`LOW_CONTEXT_FRAMES`] altında.
+pub const PLAN_FLAG_LOW_CONTEXT: u32 = 1 << 2;
+/// Plan bayrağı: hiçbir kareyi kesinleştirmeyen köprü geçişi (`B(0)`).
+pub const PLAN_FLAG_BRIDGE: u32 = 1 << 3;
+
+/// Çıktı bayrağı: kare bir model tahminiyle üretildi (maske boşsa piksel değişmemiş olabilir).
+pub const OUT_FLAG_RESTORED: u32 = 1 << 0;
+/// Çıktı bayrağı: Mod A (14+1+15) ile üretildi.
+pub const OUT_FLAG_MODE_A: u32 = 1 << 1;
+/// Çıktı bayrağı: iki örtüşen pencerenin tahmini harmanlandı.
+pub const OUT_FLAG_FUSED: u32 = 1 << 2;
+/// Çıktı bayrağı: kare modele sokulmadan aynen geçirildi.
+pub const OUT_FLAG_BYPASS: u32 = 1 << 3;
+/// Çıktı bayrağı: düşük bağlamlı pencereden üretildi (kısa sahne).
+pub const OUT_FLAG_LOW_CONTEXT: u32 = 1 << 4;
+/// Çıktı bayrağı: sahnenin ilk karesi.
+pub const OUT_FLAG_SCENE_START: u32 = 1 << 5;
+
+/// Çekirdeğin tüm hata durumları. Sayısal değerler JNI üzerinden aynen döner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+pub enum CoreError {
+    /// Genişlik/yükseklik çift değil veya desteklenen aralığın dışında.
+    InvalidGeometry = -1,
+    /// Bellek ayrılamadı.
+    OutOfMemory = -2,
+    /// Halkada boş yer yok (30 kare dolu).
+    RingFull = -3,
+    /// Yazılacak yuva hâlâ bir okuyucu tarafından tutuluyor.
+    SlotBusy = -4,
+    /// Aynı anda ikinci bir yazma kirası istendi.
+    WriteInProgress = -5,
+    /// Zaman damgası bir önceki kareden büyük değil.
+    NonMonotonicPts = -6,
+    /// İstenen kare halkada yok (hiç gelmedi veya bırakıldı).
+    UnknownFrame = -7,
+    /// Çağrı o anki durumda geçerli değil.
+    BadState = -8,
+    /// Geçersiz argüman.
+    BadArgument = -9,
+    /// Verilen tampon çok küçük.
+    BufferTooSmall = -10,
+    /// Akış bitti; yeni kare kabul edilmiyor.
+    StreamFinished = -11,
+    /// Geçersiz veya serbest bırakılmış tutamak.
+    InvalidHandle = -12,
+    /// Beklenmeyen iç hata (yakalanan panik).
+    Internal = -13,
+}
+
+impl CoreError {
+    /// JNI sınırında kullanılan negatif hata kodu.
+    pub const fn code(self) -> i32 {
+        self as i32
+    }
+}
+
+impl fmt::Display for CoreError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let text = match self {
+            CoreError::InvalidGeometry => "geçersiz kare boyutu",
+            CoreError::OutOfMemory => "bellek ayrılamadı",
+            CoreError::RingFull => "halka dolu",
+            CoreError::SlotBusy => "yuva bir okuyucu tarafından tutuluyor",
+            CoreError::WriteInProgress => "süren bir yazma kirası var",
+            CoreError::NonMonotonicPts => "zaman damgası artan sırada değil",
+            CoreError::UnknownFrame => "kare halkada bulunamadı",
+            CoreError::BadState => "çağrı bu durumda geçerli değil",
+            CoreError::BadArgument => "geçersiz argüman",
+            CoreError::BufferTooSmall => "tampon çok küçük",
+            CoreError::StreamFinished => "akış sonlandı",
+            CoreError::InvalidHandle => "geçersiz tutamak",
+            CoreError::Internal => "iç hata",
+        };
+        write!(f, "{text} ({})", self.code())
+    }
+}
+
+impl std::error::Error for CoreError {}
+
+/// Zehirlenmiş kilidi de kabul eden kilitleme (durum tabloları her adımda tutarlıdır).
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Sürüm metni.
+pub fn version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
+// ============================================================================
+// 2. Kare geometrisi ve hizalı bellek
+// ============================================================================
+
+/// NV12 (4:2:0, Y düzlemi + iç içe UV düzlemi) kare boyutu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameGeometry {
+    width: u32,
+    height: u32,
+}
+
+impl FrameGeometry {
+    /// Projenin hedef çözünürlüğü: 1280×720.
+    pub const HD720: FrameGeometry = FrameGeometry {
+        width: 1280,
+        height: 720,
+    };
+    /// Desteklenen en büyük kenar uzunluğu.
+    pub const MAX_DIM: usize = 8192;
+
+    /// Genişlik ve yükseklik çift olmalıdır (4:2:0 örnekleme).
+    pub fn new(width: usize, height: usize) -> Result<Self, CoreError> {
+        let ok = |v: usize| (2..=Self::MAX_DIM).contains(&v) && v.is_multiple_of(2);
+        if ok(width) && ok(height) {
+            Ok(Self {
+                width: width as u32,
+                height: height as u32,
+            })
+        } else {
+            Err(CoreError::InvalidGeometry)
+        }
+    }
+
+    /// Piksel cinsinden genişlik.
+    pub const fn width(self) -> usize {
+        self.width as usize
+    }
+
+    /// Piksel cinsinden yükseklik.
+    pub const fn height(self) -> usize {
+        self.height as usize
+    }
+
+    /// Y düzleminin bayt sayısı (aynı zamanda UV düzleminin başlangıç ofseti).
+    pub const fn luma_bytes(self) -> usize {
+        self.width() * self.height()
+    }
+
+    /// İç içe UV düzleminin bayt sayısı.
+    pub const fn chroma_bytes(self) -> usize {
+        self.luma_bytes() / 2
+    }
+
+    /// Bir NV12 karesinin toplam bayt sayısı (genişlik × yükseklik × 1,5).
+    pub const fn frame_bytes(self) -> usize {
+        self.luma_bytes() + self.chroma_bytes()
+    }
+}
+
+/// İşletim sisteminin bellek sayfası boyutu (4 KB veya 16 KB). Derleme zamanında
+/// sabitlenmez: aynı ikili dosya her iki sayfa boyutunda da çalışır.
+pub fn page_size() -> usize {
+    #[cfg(unix)]
+    {
+        unsafe extern "C" {
+            fn getpagesize() -> std::ffi::c_int;
+        }
+        // SAFETY: getpagesize() ön koşulu olmayan, yan etkisiz bir libc çağrısıdır.
+        let size = unsafe { getpagesize() };
+        if size > 0 {
+            return size as usize;
+        }
+    }
+    4096
+}
+
+const fn round_up(value: usize, multiple: usize) -> usize {
+    value.div_ceil(multiple) * multiple
+}
+
+/// Sıfırlanmış, hizalı tek parça bellek.
+struct AlignedBlock {
+    ptr: NonNull<u8>,
+    layout: Layout,
+}
+
+impl AlignedBlock {
+    fn zeroed(size: usize, align: usize) -> Result<Self, CoreError> {
+        if size == 0 {
+            return Err(CoreError::OutOfMemory);
+        }
+        let layout = Layout::from_size_align(size, align).map_err(|_| CoreError::OutOfMemory)?;
+        // SAFETY: layout sıfırdan büyük boyutludur.
+        let raw = unsafe { alloc::alloc_zeroed(layout) };
+        NonNull::new(raw)
+            .map(|ptr| Self { ptr, layout })
+            .ok_or(CoreError::OutOfMemory)
+    }
+}
+
+impl Drop for AlignedBlock {
+    fn drop(&mut self) {
+        // SAFETY: ptr bu layout ile alloc_zeroed tarafından ayrıldı ve bir kez serbest bırakılıyor.
+        unsafe { alloc::dealloc(self.ptr.as_ptr(), self.layout) }
+    }
+}
+
+// SAFETY: AlignedBlock sahip olunan düz bellektir (Box<[u8]> gibi). İçeriğe erişim
+// FrameRing'in kira durum makinesi tarafından eşzamanlanır.
+unsafe impl Send for AlignedBlock {}
+unsafe impl Sync for AlignedBlock {}
+
+// ============================================================================
+// 3. FrameRing — 30 karelik bellek ve kare sahipliği
+// ============================================================================
+
+/// Halkadaki bir karenin kimliği ve zaman bilgisi.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameMeta {
+    /// Gösterim sırasındaki kesintisiz kare numarası (0'dan başlar).
+    pub seq: u64,
+    /// Kaynak dosyadaki sunum zaman damgası (mikrosaniye). Aynen korunur.
+    pub pts_us: i64,
+    /// `FRAME_FLAG_*` bitleri.
+    pub flags: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlotState {
+    /// Boş; yazılabilir.
+    Free,
+    /// Tek bir [`WriteLease`] tarafından dolduruluyor.
+    Writing,
+    /// Değişmez; okunabilir.
+    Ready,
+    /// Halkadan çıkarıldı ama okuyucusu var; son okuyucu bırakınca `Free` olur.
+    Retired,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SlotInfo {
+    state: SlotState,
+    readers: u32,
+    meta: FrameMeta,
+}
+
+struct RingTable {
+    slots: [SlotInfo; WINDOW_FRAMES],
+    /// Halkadaki en eski karenin sıra numarası.
+    head: u64,
+    /// Bir sonraki yazılacak karenin sıra numarası.
+    tail: u64,
+    last_pts: Option<i64>,
+    writing: bool,
+}
+
+/// 30 karelik NV12 halka belleği.
+///
+/// Tek bir sayfa hizalı blok ayrılır (720p için tam 41.472.000 bayt). Kare `seq`,
+/// `seq % 30` numaralı yuvada durur. Yuva belleğine yalnızca kiralar üzerinden
+/// erişilir:
+///
+/// * [`WriteLease`] — aynı anda en çok bir tane; yuvaya özel yazma erişimi.
+/// * [`ReadLease`] — sınırsız sayıda; paylaşımlı salt-okunur erişim.
+///
+/// Okuyucusu olan bir yuva halkadan çıkarılsa bile üzerine yazılamaz
+/// ([`CoreError::SlotBusy`]); bu yüzden yapı `Sync`'tir ve çözücü, çıkarım ve
+/// kodlayıcı iş parçacıkları arasında güvenle paylaşılabilir.
+pub struct FrameRing {
+    geo: FrameGeometry,
+    stride: usize,
+    block: AlignedBlock,
+    table: Mutex<RingTable>,
+}
+
+impl FrameRing {
+    /// Verilen geometri için 30 yuvalı halka ayırır.
+    pub fn new(geo: FrameGeometry) -> Result<Self, CoreError> {
+        let stride = round_up(geo.frame_bytes(), 64);
+        let total = stride
+            .checked_mul(WINDOW_FRAMES)
+            .ok_or(CoreError::OutOfMemory)?;
+        let block = AlignedBlock::zeroed(total, page_size().max(64))?;
+        let empty = SlotInfo {
+            state: SlotState::Free,
+            readers: 0,
+            meta: FrameMeta {
+                seq: 0,
+                pts_us: 0,
+                flags: 0,
+            },
+        };
+        Ok(Self {
+            geo,
+            stride,
+            block,
+            table: Mutex::new(RingTable {
+                slots: [empty; WINDOW_FRAMES],
+                head: 0,
+                tail: 0,
+                last_pts: None,
+                writing: false,
+            }),
+        })
+    }
+
+    /// Kare geometrisi.
+    pub fn geometry(&self) -> FrameGeometry {
+        self.geo
+    }
+
+    /// Ayrılan toplam bayt sayısı.
+    pub fn pool_bytes(&self) -> usize {
+        self.stride * WINDOW_FRAMES
+    }
+
+    /// Bloğun başlangıç adresi (hizalama testleri ve tanılama için).
+    pub fn base_addr(&self) -> usize {
+        self.block.ptr.as_ptr() as usize
+    }
+
+    /// `[en eski kare, bir sonraki kare)` sıra numarası aralığı.
+    pub fn bounds(&self) -> (u64, u64) {
+        let t = lock(&self.table);
+        (t.head, t.tail)
+    }
+
+    /// Halkadaki canlı kare sayısı.
+    pub fn len(&self) -> usize {
+        let (head, tail) = self.bounds();
+        (tail - head) as usize
+    }
+
+    /// Halka boş mu?
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn slot_ptr(&self, slot: usize) -> *mut u8 {
+        debug_assert!(slot < WINDOW_FRAMES);
+        // SAFETY: slot < 30 olduğundan ofset ayrılan bloğun içindedir.
+        unsafe { self.block.ptr.as_ptr().add(slot * self.stride) }
+    }
+
+    /// Bir sonraki kare için yazma kirası alır. Kira `commit` edilmeden düşerse
+    /// yuva boşa döner ve hiçbir kare eklenmez.
+    pub fn begin_write(&self) -> Result<WriteLease<'_>, CoreError> {
+        let mut t = lock(&self.table);
+        if t.writing {
+            return Err(CoreError::WriteInProgress);
+        }
+        if t.tail - t.head >= WINDOW_FRAMES as u64 {
+            return Err(CoreError::RingFull);
+        }
+        let slot = (t.tail % WINDOW_FRAMES as u64) as usize;
+        if t.slots[slot].state != SlotState::Free {
+            return Err(CoreError::SlotBusy);
+        }
+        t.slots[slot].state = SlotState::Writing;
+        t.writing = true;
+        Ok(WriteLease {
+            ring: self,
+            slot,
+            active: true,
+        })
+    }
+
+    fn commit(&self, slot: usize, pts_us: i64, flags: u32) -> Result<FrameMeta, CoreError> {
+        let mut t = lock(&self.table);
+        debug_assert_eq!(t.slots[slot].state, SlotState::Writing);
+        t.writing = false;
+        if t.last_pts.is_some_and(|last| pts_us <= last) {
+            t.slots[slot].state = SlotState::Free;
+            return Err(CoreError::NonMonotonicPts);
+        }
+        let meta = FrameMeta {
+            seq: t.tail,
+            pts_us,
+            flags,
+        };
+        t.slots[slot] = SlotInfo {
+            state: SlotState::Ready,
+            readers: 0,
+            meta,
+        };
+        t.tail += 1;
+        t.last_pts = Some(pts_us);
+        Ok(meta)
+    }
+
+    fn abort(&self, slot: usize) {
+        let mut t = lock(&self.table);
+        t.slots[slot].state = SlotState::Free;
+        t.writing = false;
+    }
+
+    /// Halkadaki bir kare için paylaşımlı okuma kirası alır.
+    pub fn read(&self, seq: u64) -> Result<ReadLease<'_>, CoreError> {
+        let mut t = lock(&self.table);
+        if seq < t.head || seq >= t.tail {
+            return Err(CoreError::UnknownFrame);
+        }
+        let slot = (seq % WINDOW_FRAMES as u64) as usize;
+        let info = &mut t.slots[slot];
+        debug_assert!(info.state == SlotState::Ready && info.meta.seq == seq);
+        info.readers += 1;
+        Ok(ReadLease {
+            ring: self,
+            slot,
+            meta: info.meta,
+        })
+    }
+
+    fn release_read(&self, slot: usize) {
+        let mut t = lock(&self.table);
+        let info = &mut t.slots[slot];
+        debug_assert!(info.readers > 0);
+        info.readers -= 1;
+        if info.readers == 0 && info.state == SlotState::Retired {
+            info.state = SlotState::Free;
+        }
+    }
+
+    /// Halkadaki bir karenin bilgisi (kira almadan).
+    pub fn meta(&self, seq: u64) -> Option<FrameMeta> {
+        let t = lock(&self.table);
+        (seq >= t.head && seq < t.tail).then(|| t.slots[(seq % WINDOW_FRAMES as u64) as usize].meta)
+    }
+
+    /// `seq`'ten küçük tüm kareleri halkadan çıkarır; çıkarılan kare sayısını döndürür.
+    pub fn retire_before(&self, seq: u64) -> usize {
+        let mut t = lock(&self.table);
+        let target = seq.min(t.tail);
+        let mut released = 0;
+        while t.head < target {
+            let slot = (t.head % WINDOW_FRAMES as u64) as usize;
+            let info = &mut t.slots[slot];
+            info.state = if info.readers == 0 {
+                SlotState::Free
+            } else {
+                SlotState::Retired
+            };
+            t.head += 1;
+            released += 1;
+        }
+        released
+    }
+}
+
+/// Bir yuvaya özel yazma erişimi. `commit` ile kare halkaya eklenir.
+pub struct WriteLease<'r> {
+    ring: &'r FrameRing,
+    slot: usize,
+    active: bool,
+}
+
+impl WriteLease<'_> {
+    /// Yuvanın NV12 belleği (`frame_bytes()` uzunluğunda).
+    pub fn data(&mut self) -> &mut [u8] {
+        // SAFETY: Yuva `Writing` durumundadır ve bu durum için tek bir WriteLease
+        // vardır (`writing` bayrağı). `read()` yalnızca [head, tail) aralığındaki
+        // `Ready` karelere kira verir; bu yuva tail konumunda olduğundan ve eski
+        // okuyucusu varken `begin_write` SlotBusy döndürdüğünden, başka hiçbir
+        // referans bu belleği göremez.
+        unsafe {
+            std::slice::from_raw_parts_mut(
+                self.ring.slot_ptr(self.slot),
+                self.ring.geo.frame_bytes(),
+            )
+        }
+    }
+
+    /// Kareyi zaman damgasıyla halkaya ekler. Damga artan sırada değilse kare reddedilir.
+    pub fn commit(mut self, pts_us: i64, flags: u32) -> Result<FrameMeta, CoreError> {
+        self.active = false;
+        self.ring.commit(self.slot, pts_us, flags)
+    }
+}
+
+impl Drop for WriteLease<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            self.ring.abort(self.slot);
+        }
+    }
+}
+
+/// Bir kareye paylaşımlı salt-okunur erişim. Düştüğünde yuva serbest kalır.
+pub struct ReadLease<'r> {
+    ring: &'r FrameRing,
+    slot: usize,
+    meta: FrameMeta,
+}
+
+impl ReadLease<'_> {
+    /// Karenin tamamı (NV12).
+    pub fn data(&self) -> &[u8] {
+        // SAFETY: Yuvanın okuyucu sayacı bu kira yaşadığı sürece > 0'dır; bu durumda
+        // yuva `Writing` durumuna geçemez, dolayısıyla bellek değişmezdir.
+        unsafe {
+            std::slice::from_raw_parts(self.ring.slot_ptr(self.slot), self.ring.geo.frame_bytes())
+        }
+    }
+
+    /// Y düzlemi.
+    pub fn luma(&self) -> &[u8] {
+        &self.data()[..self.ring.geo.luma_bytes()]
+    }
+
+    /// İç içe UV düzlemi.
+    pub fn chroma(&self) -> &[u8] {
+        &self.data()[self.ring.geo.luma_bytes()..]
+    }
+
+    /// Karenin kimliği ve zaman damgası.
+    pub fn meta(&self) -> FrameMeta {
+        self.meta
+    }
+}
+
+impl Drop for ReadLease<'_> {
+    fn drop(&mut self) {
+        self.ring.release_read(self.slot);
+    }
+}
+
+// ============================================================================
+// 4. SIMD çekirdekleri
+// ============================================================================
+
+/// Assembly çekirdekleri ve bunların taşınabilir başvuru gerçeklemesi.
+///
+/// Açık işlevler dilimler üzerinde çalışır: tam 32 baytlık bloklar (varsa)
+/// assembly çekirdeğine, kalan kuyruk [`portable`] yoluna gider. Her iki yol bit
+/// düzeyinde aynı sonucu üretir (`kernels_match_portable_reference` testi).
+pub mod kernels {
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "linux", target_os = "android")
+    ))]
+    mod native {
+        core::arch::global_asm!(include_str!("../Assembly/x86_64.asm"), options(raw));
+
+        pub const NAME: &str = "x86_64-avx2";
+        pub const ID: i32 = 1;
+
+        pub fn available() -> bool {
+            std::is_x86_feature_detected!("avx2")
+        }
+
+        unsafe extern "C" {
+            #[link_name = "vc_sad_u8_avx2"]
+            pub fn sad_u8(a: *const u8, b: *const u8, blocks: usize) -> u64;
+            #[link_name = "vc_select_u8_avx2"]
+            pub fn select_u8(
+                dst: *mut u8,
+                restored: *const u8,
+                original: *const u8,
+                mask: *const u8,
+                blocks: usize,
+            );
+            #[link_name = "vc_haar_fwd_u8_avx2"]
+            pub fn haar_fwd(
+                row0: *const u8,
+                row1: *const u8,
+                ll: *mut i16,
+                hl: *mut i16,
+                lh: *mut i16,
+                hh: *mut i16,
+                blocks: usize,
+            );
+            #[link_name = "vc_haar_inv_i16_avx2"]
+            pub fn haar_inv(
+                ll: *const i16,
+                hl: *const i16,
+                lh: *const i16,
+                hh: *const i16,
+                row0: *mut u8,
+                row1: *mut u8,
+                blocks: usize,
+            );
+        }
+    }
+
+    #[cfg(all(
+        target_arch = "aarch64",
+        any(target_os = "linux", target_os = "android")
+    ))]
+    mod native {
+        core::arch::global_asm!(include_str!("../Assembly/Arm64.S"), options(raw));
+
+        pub const NAME: &str = "arm64-neon";
+        pub const ID: i32 = 2;
+
+        /// NEON, AArch64'te zorunludur.
+        pub fn available() -> bool {
+            true
+        }
+
+        unsafe extern "C" {
+            #[link_name = "vc_sad_u8_neon"]
+            pub fn sad_u8(a: *const u8, b: *const u8, blocks: usize) -> u64;
+            #[link_name = "vc_select_u8_neon"]
+            pub fn select_u8(
+                dst: *mut u8,
+                restored: *const u8,
+                original: *const u8,
+                mask: *const u8,
+                blocks: usize,
+            );
+            #[link_name = "vc_haar_fwd_u8_neon"]
+            pub fn haar_fwd(
+                row0: *const u8,
+                row1: *const u8,
+                ll: *mut i16,
+                hl: *mut i16,
+                lh: *mut i16,
+                hh: *mut i16,
+                blocks: usize,
+            );
+            #[link_name = "vc_haar_inv_i16_neon"]
+            pub fn haar_inv(
+                ll: *const i16,
+                hl: *const i16,
+                lh: *const i16,
+                hh: *const i16,
+                row0: *mut u8,
+                row1: *mut u8,
+                blocks: usize,
+            );
+        }
+    }
+
+    #[cfg(not(any(
+        all(
+            target_arch = "x86_64",
+            any(target_os = "linux", target_os = "android")
+        ),
+        all(
+            target_arch = "aarch64",
+            any(target_os = "linux", target_os = "android")
+        )
+    )))]
+    mod native {
+        pub const NAME: &str = "portable";
+        pub const ID: i32 = 0;
+
+        pub fn available() -> bool {
+            false
+        }
+
+        pub unsafe fn sad_u8(_: *const u8, _: *const u8, _: usize) -> u64 {
+            unreachable!()
+        }
+        pub unsafe fn select_u8(_: *mut u8, _: *const u8, _: *const u8, _: *const u8, _: usize) {
+            unreachable!()
+        }
+        pub unsafe fn haar_fwd(
+            _: *const u8,
+            _: *const u8,
+            _: *mut i16,
+            _: *mut i16,
+            _: *mut i16,
+            _: *mut i16,
+            _: usize,
+        ) {
+            unreachable!()
+        }
+        pub unsafe fn haar_inv(
+            _: *const i16,
+            _: *const i16,
+            _: *const i16,
+            _: *const i16,
+            _: *mut u8,
+            _: *mut u8,
+            _: usize,
+        ) {
+            unreachable!()
+        }
+    }
+
+    /// 0: henüz belirlenmedi, 1: assembly, 2: taşınabilir.
+    static MODE: AtomicU8 = AtomicU8::new(0);
+
+    #[inline]
+    fn use_native() -> bool {
+        match MODE.load(Ordering::Relaxed) {
+            1 => true,
+            2 => false,
+            _ => {
+                let native = native::available();
+                MODE.store(if native { 1 } else { 2 }, Ordering::Relaxed);
+                native
+            }
+        }
+    }
+
+    /// `true` ise assembly devre dışı bırakılır (hata ayıklama ve karşılaştırma için).
+    pub fn force_portable(on: bool) {
+        MODE.store(if on { 2 } else { 0 }, Ordering::Relaxed);
+    }
+
+    /// Etkin arka ucun adı: `"x86_64-avx2"`, `"arm64-neon"` veya `"portable"`.
+    pub fn backend() -> &'static str {
+        if use_native() {
+            native::NAME
+        } else {
+            "portable"
+        }
+    }
+
+    /// Etkin arka ucun sayısal kimliği (0 taşınabilir, 1 AVX2, 2 NEON).
+    pub fn backend_id() -> i32 {
+        if use_native() { native::ID } else { 0 }
+    }
+
+    /// Mutlak farkların toplamı.
+    pub fn sad_u8(a: &[u8], b: &[u8]) -> u64 {
+        assert_eq!(a.len(), b.len());
+        let mut done = 0;
+        let mut total = 0;
+        if use_native() {
+            let blocks = a.len() / 32;
+            if blocks > 0 {
+                // SAFETY: her iki dilim de en az blocks*32 bayt uzunluğundadır.
+                total = unsafe { native::sad_u8(a.as_ptr(), b.as_ptr(), blocks) };
+                done = blocks * 32;
+            }
+        }
+        total + portable::sad_u8(&a[done..], &b[done..])
+    }
+
+    /// `dst[i] = mask[i] != 0 ? restored[i] : original[i]` (yalnızca bayt seçimi).
+    pub fn select_u8(dst: &mut [u8], restored: &[u8], original: &[u8], mask: &[u8]) {
+        let n = dst.len();
+        assert!(restored.len() == n && original.len() == n && mask.len() == n);
+        let mut done = 0;
+        if use_native() {
+            let blocks = n / 32;
+            if blocks > 0 {
+                // SAFETY: dört dilim de en az blocks*32 bayt uzunluğundadır; dst diğerleriyle çakışmaz.
+                unsafe {
+                    native::select_u8(
+                        dst.as_mut_ptr(),
+                        restored.as_ptr(),
+                        original.as_ptr(),
+                        mask.as_ptr(),
+                        blocks,
+                    )
+                };
+                done = blocks * 32;
+            }
+        }
+        portable::select_u8(
+            &mut dst[done..],
+            &restored[done..],
+            &original[done..],
+            &mask[done..],
+        );
+    }
+
+    /// Yerinde seçim: `mask[i] != 0` olan baytlar `restored`'dan alınır, diğerlerine dokunulmaz.
+    pub fn select_in_place(dst: &mut [u8], restored: &[u8], mask: &[u8]) {
+        let n = dst.len();
+        assert!(restored.len() == n && mask.len() == n);
+        let mut done = 0;
+        if use_native() {
+            let blocks = n / 32;
+            if blocks > 0 {
+                let p = dst.as_mut_ptr();
+                // SAFETY: dilimler en az blocks*32 bayttır. Çekirdek her bloğu yazmadan
+                // önce yüklediği için dst == original kullanımı tanımlıdır.
+                unsafe {
+                    native::select_u8(p, restored.as_ptr(), p as *const u8, mask.as_ptr(), blocks)
+                };
+                done = blocks * 32;
+            }
+        }
+        for i in done..n {
+            if mask[i] != 0 {
+                dst[i] = restored[i];
+            }
+        }
+    }
+
+    /// Bir satır çifti için kayıpsız tamsayı 2×2 Haar ileri dönüşümü.
+    /// `row0.len() == row1.len() == 2 * ll.len()`.
+    pub fn haar_fwd_rows(
+        row0: &[u8],
+        row1: &[u8],
+        ll: &mut [i16],
+        hl: &mut [i16],
+        lh: &mut [i16],
+        hh: &mut [i16],
+    ) {
+        let n = ll.len();
+        assert!(
+            row0.len() == 2 * n
+                && row1.len() == 2 * n
+                && hl.len() == n
+                && lh.len() == n
+                && hh.len() == n
+        );
+        let mut done = 0;
+        if use_native() {
+            let blocks = n / 16;
+            if blocks > 0 {
+                // SAFETY: girişler en az blocks*32 bayt, çıkışlar en az blocks*16 katsayıdır.
+                unsafe {
+                    native::haar_fwd(
+                        row0.as_ptr(),
+                        row1.as_ptr(),
+                        ll.as_mut_ptr(),
+                        hl.as_mut_ptr(),
+                        lh.as_mut_ptr(),
+                        hh.as_mut_ptr(),
+                        blocks,
+                    )
+                };
+                done = blocks * 16;
+            }
+        }
+        portable::haar_fwd_rows(
+            &row0[2 * done..],
+            &row1[2 * done..],
+            &mut ll[done..],
+            &mut hl[done..],
+            &mut lh[done..],
+            &mut hh[done..],
+        );
+    }
+
+    /// [`haar_fwd_rows`] dönüşümünün tersi (doygun aritmetik, 0..255 kırpma).
+    pub fn haar_inv_rows(
+        ll: &[i16],
+        hl: &[i16],
+        lh: &[i16],
+        hh: &[i16],
+        row0: &mut [u8],
+        row1: &mut [u8],
+    ) {
+        let n = ll.len();
+        assert!(
+            row0.len() == 2 * n
+                && row1.len() == 2 * n
+                && hl.len() == n
+                && lh.len() == n
+                && hh.len() == n
+        );
+        let mut done = 0;
+        if use_native() {
+            let blocks = n / 16;
+            if blocks > 0 {
+                // SAFETY: girişler en az blocks*16 katsayı, çıkışlar en az blocks*32 bayttır.
+                unsafe {
+                    native::haar_inv(
+                        ll.as_ptr(),
+                        hl.as_ptr(),
+                        lh.as_ptr(),
+                        hh.as_ptr(),
+                        row0.as_mut_ptr(),
+                        row1.as_mut_ptr(),
+                        blocks,
+                    )
+                };
+                done = blocks * 16;
+            }
+        }
+        portable::haar_inv_rows(
+            &ll[done..],
+            &hl[done..],
+            &lh[done..],
+            &hh[done..],
+            &mut row0[2 * done..],
+            &mut row1[2 * done..],
+        );
+    }
+
+    /// Düz Rust başvuru gerçeklemesi. Assembly çekirdeklerinin doğruluk ölçütü ve
+    /// assembly bulunmayan hedeflerdeki çalışma yoludur.
+    pub mod portable {
+        /// Mutlak farkların toplamı.
+        pub fn sad_u8(a: &[u8], b: &[u8]) -> u64 {
+            a.iter().zip(b).map(|(&x, &y)| x.abs_diff(y) as u64).sum()
+        }
+
+        /// Maskeye göre bayt seçimi.
+        pub fn select_u8(dst: &mut [u8], restored: &[u8], original: &[u8], mask: &[u8]) {
+            for i in 0..dst.len() {
+                dst[i] = if mask[i] != 0 {
+                    restored[i]
+                } else {
+                    original[i]
+                };
+            }
+        }
+
+        /// 2×2 Haar ileri dönüşümü.
+        pub fn haar_fwd_rows(
+            row0: &[u8],
+            row1: &[u8],
+            ll: &mut [i16],
+            hl: &mut [i16],
+            lh: &mut [i16],
+            hh: &mut [i16],
+        ) {
+            for i in 0..ll.len() {
+                let a = row0[2 * i] as i16;
+                let b = row0[2 * i + 1] as i16;
+                let c = row1[2 * i] as i16;
+                let d = row1[2 * i + 1] as i16;
+                ll[i] = a + b + c + d;
+                hl[i] = a - b + c - d;
+                lh[i] = a + b - c - d;
+                hh[i] = a - b - c + d;
+            }
+        }
+
+        /// `(x + 2) >> 2` — taşmasız.
+        #[inline]
+        fn rsh2(x: i16) -> i16 {
+            (x >> 2) + ((x >> 1) & 1)
+        }
+
+        /// 2×2 Haar ters dönüşümü.
+        pub fn haar_inv_rows(
+            ll: &[i16],
+            hl: &[i16],
+            lh: &[i16],
+            hh: &[i16],
+            row0: &mut [u8],
+            row1: &mut [u8],
+        ) {
+            for i in 0..ll.len() {
+                let t0 = ll[i].saturating_add(lh[i]);
+                let t1 = ll[i].saturating_sub(lh[i]);
+                let t2 = hl[i].saturating_add(hh[i]);
+                let t3 = hl[i].saturating_sub(hh[i]);
+                let px = |v: i16| rsh2(v).clamp(0, 255) as u8;
+                row0[2 * i] = px(t0.saturating_add(t2));
+                row0[2 * i + 1] = px(t0.saturating_sub(t2));
+                row1[2 * i] = px(t1.saturating_add(t3));
+                row1[2 * i + 1] = px(t1.saturating_sub(t3));
+            }
+        }
+    }
+}
+
+/// Bir düzlemin tek seviyeli 2×2 Haar alt bantları.
+///
+/// Dört bant toplamda girişle aynı sayıda katsayı tutar; dönüşüm belleği
+/// küçültmez. Kenar/detay enerjisi ölçümü ve frekans temelli denetim içindir.
+pub struct HaarBands {
+    /// Bant genişliği (giriş genişliğinin yarısı).
+    pub width: usize,
+    /// Bant yüksekliği (giriş yüksekliğinin yarısı).
+    pub height: usize,
+    /// Alçak-alçak bant: `a+b+c+d`.
+    pub ll: Vec<i16>,
+    /// Yatay detay: `a-b+c-d`.
+    pub hl: Vec<i16>,
+    /// Dikey detay: `a+b-c-d`.
+    pub lh: Vec<i16>,
+    /// Çapraz detay: `a-b-c+d`.
+    pub hh: Vec<i16>,
+}
+
+impl HaarBands {
+    /// `width × height` (ikisi de çift) boyutlu bir düzlem için bant belleği ayırır.
+    pub fn new(width: usize, height: usize) -> Result<Self, CoreError> {
+        if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
+            return Err(CoreError::InvalidGeometry);
+        }
+        let n = (width / 2) * (height / 2);
+        Ok(Self {
+            width: width / 2,
+            height: height / 2,
+            ll: vec![0; n],
+            hl: vec![0; n],
+            lh: vec![0; n],
+            hh: vec![0; n],
+        })
+    }
+
+    /// `plane` (satır aralığı `stride`) üzerinde ileri dönüşüm.
+    pub fn forward(&mut self, plane: &[u8], stride: usize) {
+        let (w2, w) = (self.width, self.width * 2);
+        for y in 0..self.height {
+            let row0 = &plane[2 * y * stride..][..w];
+            let row1 = &plane[(2 * y + 1) * stride..][..w];
+            let o = y * w2..(y + 1) * w2;
+            kernels::haar_fwd_rows(
+                row0,
+                row1,
+                &mut self.ll[o.clone()],
+                &mut self.hl[o.clone()],
+                &mut self.lh[o.clone()],
+                &mut self.hh[o],
+            );
+        }
+    }
+
+    /// Bantlardan düzlemi yeniden kurar. İleri dönüşümün çıktısı için kayıpsızdır.
+    pub fn inverse(&self, plane: &mut [u8], stride: usize) {
+        let (w2, w) = (self.width, self.width * 2);
+        for y in 0..self.height {
+            let (top, bottom) = plane[2 * y * stride..].split_at_mut(stride);
+            let o = y * w2..(y + 1) * w2;
+            kernels::haar_inv_rows(
+                &self.ll[o.clone()],
+                &self.hl[o.clone()],
+                &self.lh[o.clone()],
+                &self.hh[o],
+                &mut top[..w],
+                &mut bottom[..w],
+            );
+        }
+    }
+
+    /// Katsayı başına ortalama yüksek frekans enerjisi `(|HL| + |LH| + |HH|)`.
+    /// Onarılan bölgenin çevresine göre bulanık/aşırı keskin olup olmadığını
+    /// denetlemek için kullanılır.
+    pub fn detail_energy(&self) -> f64 {
+        let n = self.ll.len();
+        if n == 0 {
+            return 0.0;
+        }
+        let sum: u64 = (0..n)
+            .map(|i| {
+                self.hl[i].unsigned_abs() as u64
+                    + self.lh[i].unsigned_abs() as u64
+                    + self.hh[i].unsigned_abs() as u64
+            })
+            .sum();
+        sum as f64 / n as f64
+    }
+}
+
+// ============================================================================
+// 5. Sahne geçişi algılama
+// ============================================================================
+
+/// Sahne geçişi eşikleri. Varsayılanlar başlangıç değerleridir; gerçek video
+/// kümesi üzerinde ayarlanmalıdır.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SceneCutConfig {
+    /// Küçük resimlerin ortalama mutlak farkı (0..255) için alt eşik.
+    pub thumb_threshold: f32,
+    /// Parlaklık histogramı uzaklığı (0..1) için alt eşik.
+    pub hist_threshold: f32,
+    /// Fark, son karelerin hareket ortalamasının en az bu katı olmalıdır.
+    pub adaptive_ratio: f32,
+    /// İki geçiş arasındaki en az kare sayısı.
+    pub min_scene_len: u32,
+}
+
+impl Default for SceneCutConfig {
+    fn default() -> Self {
+        Self {
+            thumb_threshold: 20.0,
+            hist_threshold: 0.25,
+            adaptive_ratio: 4.0,
+            min_scene_len: 2,
+        }
+    }
+}
+
+/// [`SceneDetector::feed`] sonucu.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SceneVerdict {
+    /// Bu kare yeni bir sahnenin ilk karesi mi?
+    pub cut: bool,
+    /// Küçük resimlerin ortalama mutlak farkı (0..255).
+    pub thumb_diff: f32,
+    /// Histogram uzaklığı (0..1).
+    pub hist_diff: f32,
+}
+
+/// Y düzleminin küçük resmi (720p için 80×45) ve histogramı üzerinden sert
+/// sahne geçişlerini bulur. Küçük resim farkı SAD çekirdeğiyle hesaplanır.
+pub struct SceneDetector {
+    cfg: SceneCutConfig,
+    width: usize,
+    tw: usize,
+    th: usize,
+    bw: usize,
+    bh: usize,
+    prev: Vec<u8>,
+    cur: Vec<u8>,
+    acc: Vec<u32>,
+    prev_hist: [u32; 32],
+    primed: bool,
+    ema: f32,
+    since_cut: u32,
+}
+
+impl SceneDetector {
+    /// Verilen geometri için algılayıcı kurar.
+    pub fn new(geo: FrameGeometry, cfg: SceneCutConfig) -> Self {
+        let tw = (geo.width() / 16).clamp(1, 512);
+        let th = (geo.height() / 16).clamp(1, 512);
+        Self {
+            cfg,
+            width: geo.width(),
+            tw,
+            th,
+            bw: geo.width() / tw,
+            bh: geo.height() / th,
+            prev: vec![0; tw * th],
+            cur: vec![0; tw * th],
+            acc: vec![0; tw],
+            prev_hist: [0; 32],
+            primed: false,
+            ema: 0.0,
+            since_cut: 0,
+        }
+    }
+
+    /// Geçmişi unutur (akış yeniden başlatıldığında).
+    pub fn reset(&mut self) {
+        self.primed = false;
+        self.ema = 0.0;
+        self.since_cut = 0;
+    }
+
+    /// Sıradaki karenin Y düzlemini değerlendirir.
+    pub fn feed(&mut self, luma: &[u8]) -> SceneVerdict {
+        let (w, tw, th, bw, bh) = (self.width, self.tw, self.th, self.bw, self.bh);
+        let step = if bh >= 2 { 2 } else { 1 };
+        let div = (bw * bh.div_ceil(step)) as u32;
+        for ty in 0..th {
+            self.acc.fill(0);
+            let mut y = ty * bh;
+            while y < (ty + 1) * bh {
+                let row = &luma[y * w..y * w + tw * bw];
+                for (acc, cell) in self.acc.iter_mut().zip(row.chunks_exact(bw)) {
+                    *acc += cell.iter().map(|&v| v as u32).sum::<u32>();
+                }
+                y += step;
+            }
+            for tx in 0..tw {
+                self.cur[ty * tw + tx] = ((self.acc[tx] + div / 2) / div).min(255) as u8;
+            }
+        }
+        let mut hist = [0u32; 32];
+        for &v in &self.cur {
+            hist[(v >> 3) as usize] += 1;
+        }
+
+        let n = (tw * th) as f32;
+        let mut verdict = SceneVerdict {
+            cut: false,
+            thumb_diff: 0.0,
+            hist_diff: 0.0,
+        };
+        if self.primed {
+            verdict.thumb_diff = kernels::sad_u8(&self.cur, &self.prev) as f32 / n;
+            let l1: u32 = hist
+                .iter()
+                .zip(&self.prev_hist)
+                .map(|(&a, &b)| a.abs_diff(b))
+                .sum();
+            verdict.hist_diff = l1 as f32 / (2.0 * n);
+            let floor = self
+                .cfg
+                .thumb_threshold
+                .max(self.cfg.adaptive_ratio * self.ema);
+            verdict.cut = self.since_cut >= self.cfg.min_scene_len
+                && verdict.hist_diff >= self.cfg.hist_threshold
+                && verdict.thumb_diff >= floor;
+        }
+        if verdict.cut {
+            self.ema = 0.0;
+            self.since_cut = 0;
+        } else {
+            self.ema = if self.primed {
+                0.9 * self.ema + 0.1 * verdict.thumb_diff
+            } else {
+                0.0
+            };
+            self.since_cut = self.since_cut.saturating_add(1);
+        }
+        std::mem::swap(&mut self.prev, &mut self.cur);
+        self.prev_hist = hist;
+        self.primed = true;
+        verdict
+    }
+}
+
+// ============================================================================
+// 6. Tahminler, harmanlama ve koruma kapısı
+// ============================================================================
+
+/// Kare içi dikdörtgen bölge (piksel).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Rect {
+    /// Sol kenar.
+    pub x: usize,
+    /// Üst kenar.
+    pub y: usize,
+    /// Genişlik.
+    pub w: usize,
+    /// Yükseklik.
+    pub h: usize,
+}
+
+impl Rect {
+    /// Boş bölge.
+    pub const EMPTY: Rect = Rect {
+        x: 0,
+        y: 0,
+        w: 0,
+        h: 0,
+    };
+
+    /// Yeni dikdörtgen.
+    pub const fn new(x: usize, y: usize, w: usize, h: usize) -> Self {
+        Self { x, y, w, h }
+    }
+
+    /// Alanı sıfır mı?
+    pub const fn is_empty(self) -> bool {
+        self.w == 0 || self.h == 0
+    }
+
+    /// Kareye kırpılmış ve 2×2 renk bloklarına hizalanmış (çift sınırlı) dikdörtgen.
+    pub fn aligned(self, geo: FrameGeometry) -> Option<Rect> {
+        if self.is_empty() || self.x >= geo.width() || self.y >= geo.height() {
+            return None;
+        }
+        let x0 = self.x & !1;
+        let y0 = self.y & !1;
+        let x1 = (self.x.saturating_add(self.w).saturating_add(1) & !1).min(geo.width());
+        let y1 = (self.y.saturating_add(self.h).saturating_add(1) & !1).min(geo.height());
+        Some(Rect {
+            x: x0,
+            y: y0,
+            w: x1 - x0,
+            h: y1 - y0,
+        })
+    }
+
+    /// İki dikdörtgeni kapsayan en küçük dikdörtgen.
+    pub fn union(self, other: Rect) -> Rect {
+        if self.is_empty() {
+            return other;
+        }
+        if other.is_empty() {
+            return self;
+        }
+        let x0 = self.x.min(other.x);
+        let y0 = self.y.min(other.y);
+        let x1 = (self.x + self.w).max(other.x + other.w);
+        let y1 = (self.y + self.h).max(other.y + other.h);
+        Rect {
+            x: x0,
+            y: y0,
+            w: x1 - x0,
+            h: y1 - y0,
+        }
+    }
+}
+
+/// Bir kare için model tahmini: onarılmış pikseller + piksel başına ağırlık.
+///
+/// * `weight == 0`  → piksel **korunur** (orijinal bayt aynen çıkar).
+/// * `weight 1..=255` → piksel değiştirilir; değer aynı zamanda güven puanıdır ve
+///   örtüşen iki pencerenin tahminleri harmanlanırken kullanılır.
+///
+/// Tahmin yalnızca [`Estimate::begin`] ile bildirilen ROI içinde geçerlidir ve
+/// yalnızca o bölgeye yazılabilir. Tamponlar kare boyutunda ayrılır ama işletim
+/// sistemi yalnızca dokunulan sayfaları gerçekten ayırdığından fiziksel bellek
+/// kullanımı ROI alanıyla orantılıdır.
+pub struct Estimate {
+    geo: FrameGeometry,
+    nv12: Box<[u8]>,
+    weight: Box<[u8]>,
+    roi: Rect,
+    prior: u8,
+}
+
+impl Estimate {
+    /// Boş tahmin (hiçbir pikseli değiştirmez).
+    pub fn new(geo: FrameGeometry) -> Self {
+        Self {
+            geo,
+            nv12: vec![0u8; geo.frame_bytes()].into_boxed_slice(),
+            weight: vec![0u8; geo.luma_bytes()].into_boxed_slice(),
+            roi: Rect::EMPTY,
+            prior: 1,
+        }
+    }
+
+    /// Tahmini boşaltır (önceki ROI'deki ağırlıklar sıfırlanır).
+    pub fn clear(&mut self) {
+        let r = self.roi;
+        let w = self.geo.width();
+        for y in r.y..r.y + r.h {
+            self.weight[y * w + r.x..y * w + r.x + r.w].fill(0);
+        }
+        self.roi = Rect::EMPTY;
+    }
+
+    /// Yeni bir tahmine başlar ve yazılabilir bölgeyi belirler. Bölge kareye
+    /// kırpılır, çift sınırlara genişletilir ve bu hâliyle döndürülür.
+    pub fn begin(&mut self, roi: Rect) -> Result<Rect, CoreError> {
+        self.clear();
+        let aligned = roi.aligned(self.geo).ok_or(CoreError::BadArgument)?;
+        self.roi = aligned;
+        Ok(aligned)
+    }
+
+    /// Geçerli bölge (boşsa tahmin hiçbir pikseli değiştirmez).
+    pub fn roi(&self) -> Rect {
+        self.roi
+    }
+
+    /// Bu tahminin pencere içindeki konumundan gelen bağlam önceliği
+    /// (`1 + min(geçerli geçmiş, geçerli gelecek)`, 1..=15).
+    pub fn prior(&self) -> u8 {
+        self.prior
+    }
+
+    fn luma_range(&self, y: usize) -> Range<usize> {
+        let r = self.roi;
+        assert!(y >= r.y && y < r.y + r.h, "satır ROI dışında");
+        let start = y * self.geo.width() + r.x;
+        start..start + r.w
+    }
+
+    fn chroma_range(&self, cy: usize) -> Range<usize> {
+        let r = self.roi;
+        assert!(
+            cy >= r.y / 2 && cy < (r.y + r.h) / 2,
+            "renk satırı ROI dışında"
+        );
+        let start = self.geo.luma_bytes() + cy * self.geo.width() + r.x;
+        start..start + r.w
+    }
+
+    /// ROI içindeki `y` satırının Y değerleri.
+    pub fn y_row(&self, y: usize) -> &[u8] {
+        &self.nv12[self.luma_range(y)]
+    }
+
+    /// ROI içindeki `y` satırının ağırlıkları.
+    pub fn weight_row(&self, y: usize) -> &[u8] {
+        &self.weight[self.luma_range(y)]
+    }
+
+    /// ROI içindeki `cy` renk satırı (`U0 V0 U1 V1 …`, ROI genişliği kadar bayt).
+    pub fn uv_row(&self, cy: usize) -> &[u8] {
+        &self.nv12[self.chroma_range(cy)]
+    }
+
+    /// `y` satırının yazılabilir `(Y, ağırlık)` dilimleri.
+    pub fn luma_rows_mut(&mut self, y: usize) -> (&mut [u8], &mut [u8]) {
+        let range = self.luma_range(y);
+        (&mut self.nv12[range.clone()], &mut self.weight[range])
+    }
+
+    /// `cy` renk satırının yazılabilir dilimi.
+    pub fn uv_row_mut(&mut self, cy: usize) -> &mut [u8] {
+        let range = self.chroma_range(cy);
+        &mut self.nv12[range]
+    }
+
+    /// Bölgeyi sabit bir renk ve ağırlıkla doldurur (testler ve basit onarıcılar için).
+    pub fn paint(&mut self, roi: Rect, y: u8, u: u8, v: u8, weight: u8) -> Result<Rect, CoreError> {
+        let r = self.begin(roi)?;
+        for row in r.y..r.y + r.h {
+            let (ys, ws) = self.luma_rows_mut(row);
+            ys.fill(y);
+            ws.fill(weight);
+        }
+        for cy in r.y / 2..(r.y + r.h) / 2 {
+            for pair in self.uv_row_mut(cy).as_chunks_mut::<2>().0 {
+                pair[0] = u;
+                pair[1] = v;
+            }
+        }
+        Ok(r)
+    }
+}
+
+/// `dst` (orijinal karenin kopyası) üzerine tahminleri uygular; değiştirilen Y
+/// pikseli sayısını döndürür.
+///
+/// Tek tahmin varsa maskeli pikseller doğrudan seçilir (assembly çekirdeği).
+/// İki tahmin varsa her piksel `öncelik × ağırlık` oranında harmanlanır. Her iki
+/// tahminde de ağırlığı 0 olan piksele **hiç yazılmaz**.
+pub fn compose(
+    geo: FrameGeometry,
+    dst: &mut [u8],
+    est: &Estimate,
+    cached: Option<&Estimate>,
+) -> u64 {
+    let cached = cached.filter(|c| !c.roi.is_empty());
+    match (est.roi.is_empty(), cached) {
+        (true, None) => 0,
+        (false, None) => compose_single(geo, dst, est),
+        (true, Some(c)) => compose_single(geo, dst, c),
+        (false, Some(c)) => compose_fused(geo, dst, est, c),
+    }
+}
+
+fn compose_single(geo: FrameGeometry, dst: &mut [u8], est: &Estimate) -> u64 {
+    let w = geo.width();
+    let r = est.roi;
+    let uv_base = geo.luma_bytes();
+    let (dst_y, dst_uv) = dst.split_at_mut(uv_base);
+    let mut modified = 0u64;
+    for y in r.y..r.y + r.h {
+        let range = y * w + r.x..y * w + r.x + r.w;
+        let weights = &est.weight[range.clone()];
+        kernels::select_in_place(&mut dst_y[range.clone()], &est.nv12[range], weights);
+        modified += weights.iter().filter(|&&v| v != 0).count() as u64;
+    }
+    for cy in r.y / 2..(r.y + r.h) / 2 {
+        let w0 = &est.weight[2 * cy * w + r.x..][..r.w];
+        let w1 = &est.weight[(2 * cy + 1) * w + r.x..][..r.w];
+        let src = &est.nv12[uv_base + cy * w + r.x..][..r.w];
+        let out = &mut dst_uv[cy * w + r.x..][..r.w];
+        for i in (0..r.w).step_by(2) {
+            if (w0[i] | w0[i + 1] | w1[i] | w1[i + 1]) != 0 {
+                out[i] = src[i];
+                out[i + 1] = src[i + 1];
+            }
+        }
+    }
+    modified
+}
+
+fn compose_fused(geo: FrameGeometry, dst: &mut [u8], a: &Estimate, b: &Estimate) -> u64 {
+    let w = geo.width();
+    let r = a.roi.union(b.roi);
+    let uv_base = geo.luma_bytes();
+    let (pa, pb) = (a.prior.max(1) as u32, b.prior.max(1) as u32);
+    let (dst_y, dst_uv) = dst.split_at_mut(uv_base);
+    let mut modified = 0u64;
+    for cy in r.y / 2..(r.y + r.h) / 2 {
+        for cx in r.x / 2..(r.x + r.w) / 2 {
+            let (mut sum_a, mut sum_b) = (0u32, 0u32);
+            for dy in 0..2 {
+                for dx in 0..2 {
+                    let i = (2 * cy + dy) * w + 2 * cx + dx;
+                    let (wa, wb) = (a.weight[i] as u32, b.weight[i] as u32);
+                    sum_a += wa;
+                    sum_b += wb;
+                    let (ka, kb) = (pa * wa, pb * wb);
+                    let k = ka + kb;
+                    // k == 0: piksel iki tahminde de maskesiz → hiç yazılmaz.
+                    if let Some(value) =
+                        (a.nv12[i] as u32 * ka + b.nv12[i] as u32 * kb + k / 2).checked_div(k)
+                    {
+                        dst_y[i] = value as u8;
+                        modified += 1;
+                    }
+                }
+            }
+            let (ka, kb) = (pa * sum_a, pb * sum_b);
+            let k = ka + kb;
+            let i = cy * w + 2 * cx;
+            for c in 0..2 {
+                let (va, vb) = (
+                    a.nv12[uv_base + i + c] as u32,
+                    b.nv12[uv_base + i + c] as u32,
+                );
+                // k == 0: bloğun dört pikseli de maskesiz → renk örneği hiç yazılmaz.
+                if let Some(value) = (va * ka + vb * kb + k / 2).checked_div(k) {
+                    dst_uv[i + c] = value as u8;
+                }
+            }
+        }
+    }
+    modified
+}
+
+/// Koruma kapısının denetimi: tahminlerin dokunmadığı her bayt orijinalle aynı
+/// mı? İhlal sayısını döndürür (beklenen: 0).
+///
+/// * Y: iki tahminde de ağırlığı 0 olan her piksel.
+/// * UV: dört pikselinin hiçbiri maskeli olmayan her 2×2 blok.
+pub fn verify_preservation(
+    geo: FrameGeometry,
+    original: &[u8],
+    output: &[u8],
+    est: &Estimate,
+    cached: Option<&Estimate>,
+) -> u64 {
+    let (w, h) = (geo.width(), geo.height());
+    let uv_base = geo.luma_bytes();
+    let touched = est.roi.union(cached.map_or(Rect::EMPTY, |c| c.roi));
+    let weight = |i: usize| est.weight[i] as u32 + cached.map_or(0, |c| c.weight[i] as u32);
+    let mismatches = |range: Range<usize>| -> u64 {
+        if original[range.clone()] == output[range.clone()] {
+            0
+        } else {
+            range.filter(|&i| original[i] != output[i]).count() as u64
+        }
+    };
+    let mut bad = 0u64;
+    for y in 0..h {
+        if y < touched.y || y >= touched.y + touched.h {
+            bad += mismatches(y * w..(y + 1) * w);
+        } else {
+            bad += (0..w)
+                .filter(|&x| weight(y * w + x) == 0 && original[y * w + x] != output[y * w + x])
+                .count() as u64;
+        }
+    }
+    for cy in 0..h / 2 {
+        let row = uv_base + cy * w;
+        if 2 * cy < touched.y || 2 * cy >= touched.y + touched.h {
+            bad += mismatches(row..row + w);
+        } else {
+            for cx in 0..w / 2 {
+                let i = 2 * cy * w + 2 * cx;
+                let any = weight(i) + weight(i + 1) + weight(i + w) + weight(i + w + 1);
+                let j = row + 2 * cx;
+                if any == 0 && (original[j] != output[j] || original[j + 1] != output[j + 1]) {
+                    bad += 1;
+                }
+            }
+        }
+    }
+    bad
+}
+
+// ============================================================================
+// 7. Scheduler — pencere planlama (saf mantık)
+// ============================================================================
+
+/// Çalışma modu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// 14 geçmiş + 1 hedef + 15 gelecek; yalnızca hedef kare kesinleşir.
+    A,
+    /// 15+15 blok; `slide` kadar kare kesinleşir, son 15 konum önbelleğe alınır.
+    B,
+}
+
+/// Kare başına işleme ipucu. Detector çıktısından türetilir ve kare
+/// karara bağlanmadan önce [`Pipeline::set_hint`] ile verilir.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Hint {
+    /// Olağan: Mod B.
+    #[default]
+    Normal,
+    /// Zor kare (büyük maske, hızlı hareket, yoğun örtüşme): Mod A.
+    Precision,
+    /// Silinecek bir şey yok: modele sokmadan aynen geçir.
+    Bypass,
+}
+
+impl Hint {
+    /// JNI tamsayı değerinden dönüşüm.
+    pub fn from_i32(v: i32) -> Option<Hint> {
+        match v {
+            0 => Some(Hint::Normal),
+            1 => Some(Hint::Precision),
+            2 => Some(Hint::Bypass),
+            _ => None,
+        }
+    }
+}
+
+/// Modelin çalıştırılacağı 30 konumluk pencerenin tanımı.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowPlan {
+    /// Artan plan numarası.
+    pub id: u64,
+    /// Çalışma modu.
+    pub mode: Mode,
+    /// Bu pencereyle kesinleşen kare sayısı (Mod A: 1, Mod B: 0..=15).
+    pub slide: u8,
+    /// Konum 0'a karşılık gelen sıra numarası. Sahne başında negatif olabilir
+    /// (o konumlar dolgudur).
+    pub base_seq: i64,
+    /// Geçerlilik maskesi: bit `p` = konum `p` gerçek bir kare içeriyor.
+    pub valid: u32,
+    /// Çıktısı kesinleşecek konumlar `[başlangıç, bitiş)`.
+    pub emit: (u8, u8),
+    /// Tahmini önbelleğe alınacak konumlar `[başlangıç, bitiş)`.
+    pub cache: (u8, u8),
+    /// `PLAN_FLAG_*` bitleri.
+    pub flags: u32,
+}
+
+impl WindowPlan {
+    /// Konum gerçek bir kare içeriyor mu?
+    pub fn is_valid(&self, pos: usize) -> bool {
+        pos < WINDOW_FRAMES && self.valid & (1 << pos) != 0
+    }
+
+    /// Konumdaki karenin sıra numarası (dolgu ise `None`).
+    pub fn seq_at(&self, pos: usize) -> Option<u64> {
+        self.is_valid(pos)
+            .then(|| (self.base_seq + pos as i64) as u64)
+    }
+
+    /// Geçerli kare sayısı.
+    pub fn valid_count(&self) -> u32 {
+        self.valid.count_ones()
+    }
+
+    /// Konumdan önceki geçerli kare sayısı (geçmiş bağlam).
+    pub fn past_context(&self, pos: usize) -> u32 {
+        (self.valid & ((1u32 << pos) - 1)).count_ones()
+    }
+
+    /// Konumdan sonraki geçerli kare sayısı (gelecek bağlam).
+    pub fn future_context(&self, pos: usize) -> u32 {
+        (self.valid >> (pos + 1)).count_ones()
+    }
+
+    /// Bu konum için model çıktısı isteniyor mu?
+    pub fn wants_estimate(&self, pos: usize) -> bool {
+        let p = pos as u8;
+        (p >= self.emit.0 && p < self.emit.1) || (p >= self.cache.0 && p < self.cache.1)
+    }
+
+    /// Harmanlama önceliği: `1 + min(geçmiş, gelecek)`, en çok 15. Olağan Mod B
+    /// akışında örtüşen iki tahmin arasında üçgen (doğrusal) geçiş üretir.
+    pub fn prior_at(&self, pos: usize) -> u8 {
+        (1 + self.past_context(pos).min(self.future_context(pos))).min(15) as u8
+    }
+}
+
+/// Kesinleşen bir karenin piksel kaynağı.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputSource {
+    /// Orijinal kare aynen (bypass).
+    Original,
+    /// Model tahmini; `fuse_index` varsa önceki pencerenin önbelleğiyle harmanlanır.
+    Estimate {
+        /// Kesinleşen tahminler dizisindeki sıra.
+        emit_index: u8,
+        /// Önceki önbellek dizisindeki sıra (harmanlama yapılacaksa).
+        fuse_index: Option<u8>,
+    },
+}
+
+/// Çıkış kuyruğundaki kare.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutputItem {
+    /// Karenin sıra numarası.
+    pub seq: u64,
+    /// Piksel kaynağı.
+    pub source: OutputSource,
+    /// `OUT_FLAG_*` bitleri.
+    pub flags: u32,
+}
+
+/// Sürücünün atması gereken sıradaki adım.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Step {
+    /// En çok bu kadar kare itin (kaynak bittiyse `finish` çağırın).
+    NeedFrames(usize),
+    /// Bu pencere için modeli çalıştırıp `complete_window` çağırın.
+    Window(WindowPlan),
+    /// Bu kadar kare çıkışa hazır; `pop_output` ile alın.
+    Output(usize),
+    /// Tüm kareler çıktı.
+    Finished,
+}
+
+/// Zamanlayıcı sayaçları.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SchedStats {
+    /// Tamamlanan Mod A pencereleri.
+    pub windows_a: u64,
+    /// Tamamlanan (kare kesinleştiren) Mod B pencereleri.
+    pub windows_b: u64,
+    /// Köprü geçişleri (`B(0)`).
+    pub bridges: u64,
+    /// Modele sokulmadan geçirilen kareler.
+    pub bypassed: u64,
+    /// İki tahmini harmanlanan kareler.
+    pub fused: u64,
+    /// Tamamlanan sahne (segment) sayısı.
+    pub segments: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Action {
+    A,
+    B(u8),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CacheRange {
+    /// Önbellek dizisinin 0. elemanına karşılık gelen sıra numarası.
+    base: u64,
+    lo: u64,
+    hi: u64,
+}
+
+/// Pencere zamanlayıcı: yalnızca sıra numaralarıyla çalışan durum makinesi.
+///
+/// Her kararın alındığı "kanonik durum"da halka `[e-15, e+15)` aralığını tutar
+/// (`e` = sıradaki kesinleşecek kare): 15 kesinleşmiş kare geçmiş bağlam, 15 kare
+/// gelecek bağlam. Buradan Mod A 1 kare, Mod B `j` kare kaydırarak aynı duruma
+/// döner; bu yüzden iki mod kare kare karıştırılabilir ve halka hiçbir zaman 30
+/// kareyi aşmaz.
+pub struct Scheduler {
+    pushed: u64,
+    eos: bool,
+    cuts: VecDeque<u64>,
+    seg_start: u64,
+    emit_next: u64,
+    retired: u64,
+    decided_until: u64,
+    cache: Option<CacheRange>,
+    hints: [Hint; WINDOW_FRAMES],
+    pending: Option<Action>,
+    issued: Option<WindowPlan>,
+    outputs: VecDeque<OutputItem>,
+    next_plan_id: u64,
+    stats: SchedStats,
+}
+
+impl Default for Scheduler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Scheduler {
+    /// Boş zamanlayıcı.
+    pub fn new() -> Self {
+        Self {
+            pushed: 0,
+            eos: false,
+            cuts: VecDeque::new(),
+            seg_start: 0,
+            emit_next: 0,
+            retired: 0,
+            decided_until: 0,
+            cache: None,
+            hints: [Hint::Normal; WINDOW_FRAMES],
+            pending: None,
+            issued: None,
+            outputs: VecDeque::new(),
+            next_plan_id: 0,
+            stats: SchedStats::default(),
+        }
+    }
+
+    /// İtilen toplam kare sayısı.
+    pub fn pushed(&self) -> u64 {
+        self.pushed
+    }
+
+    /// Kesinleşen toplam kare sayısı.
+    pub fn emitted(&self) -> u64 {
+        self.emit_next
+    }
+
+    /// Bu numaradan küçük kareler artık gerekmez; halkadan çıkarılabilir.
+    pub fn retired(&self) -> u64 {
+        self.retired
+    }
+
+    /// Akış sonu bildirildi mi?
+    pub fn is_eos(&self) -> bool {
+        self.eos
+    }
+
+    /// Halkada kalan boş yuva sayısı.
+    pub fn capacity_left(&self) -> usize {
+        WINDOW_FRAMES - (self.pushed - self.retired) as usize
+    }
+
+    /// Verilmiş ama henüz tamamlanmamış plan.
+    pub fn issued(&self) -> Option<WindowPlan> {
+        self.issued
+    }
+
+    /// Sayaçlar.
+    pub fn stats(&self) -> SchedStats {
+        self.stats
+    }
+
+    fn hint(&self, seq: u64) -> Hint {
+        self.hints[(seq % WINDOW_FRAMES as u64) as usize]
+    }
+
+    /// Yeni bir kare geldiğini bildirir. `cut`, karenin yeni bir sahnenin ilk
+    /// karesi olduğunu söyler. Karenin sıra numarasını döndürür.
+    pub fn on_push(&mut self, cut: bool) -> Result<u64, CoreError> {
+        if self.eos {
+            return Err(CoreError::StreamFinished);
+        }
+        if self.capacity_left() == 0 {
+            return Err(CoreError::RingFull);
+        }
+        let seq = self.pushed;
+        if cut && seq > 0 {
+            self.cuts.push_back(seq);
+        }
+        self.hints[(seq % WINDOW_FRAMES as u64) as usize] = Hint::Normal;
+        self.pushed += 1;
+        Ok(seq)
+    }
+
+    /// Kaynağın bittiğini bildirir.
+    pub fn on_eos(&mut self) {
+        self.eos = true;
+    }
+
+    /// Henüz karara bağlanmamış bir kare için ipucu verir.
+    pub fn set_hint(&mut self, seq: u64, hint: Hint) -> Result<(), CoreError> {
+        if seq >= self.pushed {
+            return Err(CoreError::UnknownFrame);
+        }
+        if seq < self.decided_until {
+            return Err(CoreError::BadState);
+        }
+        self.hints[(seq % WINDOW_FRAMES as u64) as usize] = hint;
+        Ok(())
+    }
+
+    fn segment_end(&self) -> Option<u64> {
+        self.cuts
+            .front()
+            .copied()
+            .or(self.eos.then_some(self.pushed))
+    }
+
+    fn retire_before(&mut self, seq: u64) {
+        self.retired = self.retired.max(seq.min(self.pushed));
+    }
+
+    fn trim_cache(&mut self) {
+        if let Some(c) = &mut self.cache {
+            c.lo = c.lo.max(self.emit_next);
+            if c.lo >= c.hi {
+                self.cache = None;
+            }
+        }
+    }
+
+    /// Sıradaki adımı döndürür. Aynı durumda tekrar çağrılması güvenlidir.
+    pub fn poll(&mut self) -> Step {
+        if !self.outputs.is_empty() {
+            return Step::Output(self.outputs.len());
+        }
+        if let Some(plan) = self.issued {
+            return Step::Window(plan);
+        }
+        loop {
+            let end = self.segment_end();
+            let e = self.emit_next;
+            if end == Some(e) {
+                // Sahnenin tüm kareleri çıktı: kalan bağlam kareleri artık gereksiz.
+                self.retire_before(e);
+                if self.cuts.front() == Some(&e) {
+                    self.cuts.pop_front();
+                    self.seg_start = e;
+                    self.cache = None;
+                    self.pending = None;
+                    self.stats.segments += 1;
+                    continue;
+                }
+                return Step::Finished;
+            }
+            let s = self.seg_start;
+
+            if self.pending.is_none() {
+                // Karar için sıradaki 15 karenin (veya sahne sonuna kadarının) gelmiş olması gerekir.
+                let horizon = end.map_or(e + HALF_WINDOW as u64, |c| c.min(e + HALF_WINDOW as u64));
+                if self.pushed < horizon {
+                    self.retire_before(e.saturating_sub(HALF_WINDOW as u64).max(s));
+                    return Step::NeedFrames(
+                        ((horizon - self.pushed) as usize).min(self.capacity_left()),
+                    );
+                }
+                if self.decide(e, s, horizon) {
+                    return Step::Output(self.outputs.len());
+                }
+            }
+
+            let action = self.pending.expect("karar verilmiş olmalı");
+            let (w_lo, w_hi) = match action {
+                Action::A => (e as i64 - MODE_A_TARGET as i64, e + 16),
+                Action::B(j) => (
+                    e as i64 + j as i64 - HALF_WINDOW as i64,
+                    e + j as u64 + HALF_WINDOW as u64,
+                ),
+            };
+            let need_hi = end.map_or(w_hi, |c| c.min(w_hi));
+            self.retire_before(w_lo.max(s as i64) as u64);
+            if self.pushed < need_hi {
+                return Step::NeedFrames(
+                    ((need_hi - self.pushed) as usize).min(self.capacity_left()),
+                );
+            }
+            let plan = self.build_plan(action, w_lo, need_hi, s, end);
+            self.pending = None;
+            self.issued = Some(plan);
+            return Step::Window(plan);
+        }
+    }
+
+    /// `e` konumundaki kare için eylem seçer. Bypass kareleri hemen çıkışa
+    /// koyar ve `true` döndürür; aksi hâlde `pending` atanır.
+    fn decide(&mut self, e: u64, s: u64, horizon: u64) -> bool {
+        let run_of = |this: &Self, hint: Hint| -> u64 {
+            let mut n = 0;
+            while e + n < horizon && n < HALF_WINDOW as u64 && this.hint(e + n) == hint {
+                n += 1;
+            }
+            n
+        };
+        match self.hint(e) {
+            Hint::Bypass => {
+                let run = run_of(self, Hint::Bypass);
+                for k in 0..run {
+                    self.outputs.push_back(OutputItem {
+                        seq: e + k,
+                        source: OutputSource::Original,
+                        flags: OUT_FLAG_BYPASS,
+                    });
+                }
+                self.emit_next = e + run;
+                self.decided_until = self.emit_next;
+                self.stats.bypassed += run;
+                self.trim_cache();
+                true
+            }
+            Hint::Precision => {
+                self.pending = Some(Action::A);
+                self.decided_until = e + 1;
+                false
+            }
+            Hint::Normal => {
+                let run = run_of(self, Hint::Normal);
+                let covered = self
+                    .cache
+                    .filter(|c| c.lo == e && c.hi > e)
+                    .map(|c| c.hi - e);
+                let slide = match covered {
+                    // Önceki pencerenin ikinci yarı tahminleri hazır: harmanlayarak kesinleştir.
+                    Some(k) => run.min(k),
+                    // Geçmiş kare var ama önbellek yok: önce köprü geçişi.
+                    None if e > s => 0,
+                    // Sahne başı: geçmiş yok, harmanlanacak bir şey de yok.
+                    None => run,
+                };
+                self.pending = Some(Action::B(slide as u8));
+                self.decided_until = e + slide;
+                false
+            }
+        }
+    }
+
+    fn build_plan(
+        &mut self,
+        action: Action,
+        w_lo: i64,
+        need_hi: u64,
+        s: u64,
+        end: Option<u64>,
+    ) -> WindowPlan {
+        let mut valid = 0u32;
+        for p in 0..WINDOW_FRAMES {
+            let q = w_lo + p as i64;
+            if q >= s as i64 && (q as u64) < need_hi {
+                valid |= 1 << p;
+            }
+        }
+        let tail = (valid >> HALF_WINDOW).count_ones() as u8;
+        let (mode, slide, emit, cache) = match action {
+            Action::A => (
+                Mode::A,
+                1,
+                (MODE_A_TARGET as u8, MODE_A_TARGET as u8 + 1),
+                (0, 0),
+            ),
+            Action::B(j) => (
+                Mode::B,
+                j,
+                (HALF_WINDOW as u8 - j, HALF_WINDOW as u8),
+                (HALF_WINDOW as u8, HALF_WINDOW as u8 + tail),
+            ),
+        };
+        let mut flags = 0;
+        if w_lo <= s as i64 {
+            flags |= PLAN_FLAG_SEGMENT_START;
+        }
+        if end == Some(need_hi) {
+            flags |= PLAN_FLAG_SEGMENT_END;
+        }
+        if valid.count_ones() < LOW_CONTEXT_FRAMES {
+            flags |= PLAN_FLAG_LOW_CONTEXT;
+        }
+        if action == Action::B(0) {
+            flags |= PLAN_FLAG_BRIDGE;
+        }
+        let plan = WindowPlan {
+            id: self.next_plan_id,
+            mode,
+            slide,
+            base_seq: w_lo,
+            valid,
+            emit,
+            cache,
+            flags,
+        };
+        self.next_plan_id += 1;
+        debug_assert!((emit.0..emit.1).all(|p| plan.is_valid(p as usize)));
+        plan
+    }
+
+    /// Verilmiş planın model çıktılarının yazıldığını bildirir. Mod B için `true`
+    /// döner: çağıran, "önbellek" ve "yeni önbellek" tahmin dizilerini yer
+    /// değiştirmelidir (bkz. [`Pipeline::complete_window`]).
+    pub fn complete(&mut self, plan_id: u64) -> Result<bool, CoreError> {
+        let plan = self.issued.ok_or(CoreError::BadState)?;
+        if plan.id != plan_id {
+            return Err(CoreError::BadArgument);
+        }
+        self.issued = None;
+        let e = self.emit_next;
+        let low = if plan.flags & PLAN_FLAG_LOW_CONTEXT != 0 {
+            OUT_FLAG_LOW_CONTEXT
+        } else {
+            0
+        };
+        match plan.mode {
+            Mode::A => {
+                self.outputs.push_back(OutputItem {
+                    seq: e,
+                    source: OutputSource::Estimate {
+                        emit_index: 0,
+                        fuse_index: None,
+                    },
+                    flags: OUT_FLAG_RESTORED | OUT_FLAG_MODE_A | low,
+                });
+                self.emit_next = e + 1;
+                self.stats.windows_a += 1;
+                self.trim_cache();
+                Ok(false)
+            }
+            Mode::B => {
+                let j = plan.slide as u64;
+                for k in 0..j {
+                    let seq = e + k;
+                    let fuse = self
+                        .cache
+                        .filter(|c| seq >= c.lo && seq < c.hi)
+                        .map(|c| (seq - c.base) as u8);
+                    let mut flags = OUT_FLAG_RESTORED | low;
+                    if fuse.is_some() {
+                        flags |= OUT_FLAG_FUSED;
+                        self.stats.fused += 1;
+                    }
+                    self.outputs.push_back(OutputItem {
+                        seq,
+                        source: OutputSource::Estimate {
+                            emit_index: k as u8,
+                            fuse_index: fuse,
+                        },
+                        flags,
+                    });
+                }
+                let lo = e + j;
+                let count = (plan.cache.1 - plan.cache.0) as u64;
+                self.cache = (count > 0).then_some(CacheRange {
+                    base: lo,
+                    lo,
+                    hi: lo + count,
+                });
+                self.emit_next = lo;
+                if j == 0 {
+                    self.stats.bridges += 1;
+                } else {
+                    self.stats.windows_b += 1;
+                }
+                Ok(true)
+            }
+        }
+    }
+
+    /// Çıkış kuyruğunun başındaki kare (çıkarmadan).
+    pub fn peek_output(&self) -> Option<OutputItem> {
+        self.outputs.front().copied()
+    }
+
+    /// Çıkış kuyruğunun başındaki kareyi çıkarır.
+    pub fn pop_output(&mut self) -> Option<OutputItem> {
+        self.outputs.pop_front()
+    }
+}
+
+// ============================================================================
+// 8. Pipeline — kare giriş/çıkış hattı
+// ============================================================================
+
+/// Çıkan bir karenin bilgisi.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutputMeta {
+    /// Karenin sıra numarası (girişle aynı).
+    pub seq: u64,
+    /// Zaman damgası (girişle aynı).
+    pub pts_us: i64,
+    /// `OUT_FLAG_*` bitleri.
+    pub flags: u32,
+    /// Değiştirilen Y pikseli sayısı.
+    pub modified_pixels: u64,
+}
+
+/// Hat sayaçları ve bütünlük göstergeleri.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PipelineStats {
+    /// Kabul edilen kare sayısı.
+    pub frames_in: u64,
+    /// Çıkan kare sayısı (akış sonunda `frames_in` ile eşit olmalıdır).
+    pub frames_out: u64,
+    /// Algılanan/bildirilen sahne geçişi sayısı.
+    pub scene_cuts: u64,
+    /// Değiştirilen toplam Y pikseli.
+    pub modified_pixels: u64,
+    /// Koruma kapısı ihlali (bütünlük denetimi açıkken; beklenen 0).
+    pub preservation_violations: u64,
+    /// Sıra dışı çıkan kare sayısı (beklenen 0).
+    pub order_violations: u64,
+    /// Halkanın ulaştığı en yüksek doluluk.
+    pub max_occupancy: u32,
+    /// Zamanlayıcı sayaçları.
+    pub sched: SchedStats,
+}
+
+/// Bir pencere için modelin okuyacağı kareler ve yazacağı tahminler.
+pub struct WindowIo<'p> {
+    plan: WindowPlan,
+    geo: FrameGeometry,
+    ring: &'p FrameRing,
+    emit: &'p mut [Estimate],
+    tail: &'p mut [Estimate],
+}
+
+impl<'p> WindowIo<'p> {
+    /// Pencere planı.
+    pub fn plan(&self) -> &WindowPlan {
+        &self.plan
+    }
+
+    /// Kare geometrisi.
+    pub fn geometry(&self) -> FrameGeometry {
+        self.geo
+    }
+
+    /// Pencere konumundaki giriş karesi (dolgu ise `None`).
+    pub fn frame(&self, pos: usize) -> Option<ReadLease<'p>> {
+        self.ring.read(self.plan.seq_at(pos)?).ok()
+    }
+
+    /// Pencere konumu için yazılacak tahmin (çıktı istenmeyen konumlarda `None`).
+    pub fn estimate_mut(&mut self, pos: usize) -> Option<&mut Estimate> {
+        let p = pos as u8;
+        if p >= self.plan.emit.0 && p < self.plan.emit.1 {
+            Some(&mut self.emit[(p - self.plan.emit.0) as usize])
+        } else if p >= self.plan.cache.0 && p < self.plan.cache.1 {
+            Some(&mut self.tail[(p - HALF_WINDOW as u8) as usize])
+        } else {
+            None
+        }
+    }
+}
+
+/// Model çıkarımının çekirdeğe bağlandığı arayüz (Detector → Flow → Mamba zinciri
+/// tek bir `restore` çağrısının arkasındadır).
+pub trait Restorer {
+    /// Planın istediği her konum için tahmin yazar. Yazılmayan tahmin boş kalır
+    /// ve o kare orijinal hâliyle çıkar.
+    fn restore(&mut self, io: &mut WindowIo<'_>) -> Result<(), CoreError>;
+}
+
+/// Hiçbir pikseli değiştirmeyen onarıcı (altyapı testleri ve model öncesi aşama için).
+pub struct IdentityRestorer;
+
+impl Restorer for IdentityRestorer {
+    fn restore(&mut self, _io: &mut WindowIo<'_>) -> Result<(), CoreError> {
+        Ok(())
+    }
+}
+
+/// Kare giriş/çıkış hattı: halka + zamanlayıcı + tahmin bellekleri + sahne algılama.
+///
+/// ```text
+/// loop {
+///     match hat.poll() {
+///         Step::NeedFrames(n) => { /* en çok n kare it; kaynak bittiyse finish() */ }
+///         Step::Window(_)     => { /* window_io() ile modeli çalıştır, complete_window() */ }
+///         Step::Output(_)     => { /* pop_output() ile kareleri kodlayıcıya ver */ }
+///         Step::Finished      => break,
+///     }
+/// }
+/// ```
+pub struct Pipeline {
+    geo: FrameGeometry,
+    ring: FrameRing,
+    sched: Scheduler,
+    scene: SceneDetector,
+    est_emit: Vec<Estimate>,
+    est_tail: Vec<Estimate>,
+    est_cache: Vec<Estimate>,
+    prepared: Option<u64>,
+    auto_scene_cut: bool,
+    integrity_check: bool,
+    stats: PipelineStats,
+}
+
+impl Pipeline {
+    /// Verilen geometri için hat kurar.
+    pub fn new(geo: FrameGeometry) -> Result<Self, CoreError> {
+        let estimates = || {
+            (0..HALF_WINDOW)
+                .map(|_| Estimate::new(geo))
+                .collect::<Vec<_>>()
+        };
+        Ok(Self {
+            geo,
+            ring: FrameRing::new(geo)?,
+            sched: Scheduler::new(),
+            scene: SceneDetector::new(geo, SceneCutConfig::default()),
+            est_emit: estimates(),
+            est_tail: estimates(),
+            est_cache: estimates(),
+            prepared: None,
+            auto_scene_cut: true,
+            integrity_check: false,
+            stats: PipelineStats::default(),
+        })
+    }
+
+    /// Kare geometrisi.
+    pub fn geometry(&self) -> FrameGeometry {
+        self.geo
+    }
+
+    /// Halka belleği (salt-okunur erişim ve tanılama için).
+    pub fn ring(&self) -> &FrameRing {
+        &self.ring
+    }
+
+    /// Otomatik sahne geçişi algılamayı açar/kapatır (varsayılan: açık).
+    pub fn set_auto_scene_cut(&mut self, on: bool) {
+        self.auto_scene_cut = on;
+    }
+
+    /// Sahne geçişi eşiklerini değiştirir.
+    pub fn set_scene_config(&mut self, cfg: SceneCutConfig) {
+        self.scene = SceneDetector::new(self.geo, cfg);
+    }
+
+    /// Her çıkan karede koruma kapısını yeniden denetler (yavaş; test/tanılama için).
+    pub fn set_integrity_check(&mut self, on: bool) {
+        self.integrity_check = on;
+    }
+
+    /// Sayaçlar.
+    pub fn stats(&self) -> PipelineStats {
+        PipelineStats {
+            sched: self.sched.stats(),
+            ..self.stats
+        }
+    }
+
+    /// Henüz karara bağlanmamış bir kare için işleme ipucu.
+    pub fn set_hint(&mut self, seq: u64, hint: Hint) -> Result<(), CoreError> {
+        self.sched.set_hint(seq, hint)
+    }
+
+    /// Kaynağın bittiğini bildirir; kalan kareler dolgulu pencerelerle çıkarılır.
+    pub fn finish(&mut self) {
+        self.sched.on_eos();
+    }
+
+    /// Sıradaki adım.
+    pub fn poll(&mut self) -> Step {
+        let step = self.sched.poll();
+        self.ring.retire_before(self.sched.retired());
+        if let Step::Window(plan) = step
+            && self.prepared != Some(plan.id)
+        {
+            for p in plan.emit.0..plan.emit.1 {
+                let est = &mut self.est_emit[(p - plan.emit.0) as usize];
+                est.clear();
+                est.prior = plan.prior_at(p as usize);
+            }
+            for p in plan.cache.0..plan.cache.1 {
+                let est = &mut self.est_tail[(p - HALF_WINDOW as u8) as usize];
+                est.clear();
+                est.prior = plan.prior_at(p as usize);
+            }
+            self.prepared = Some(plan.id);
+        }
+        step
+    }
+
+    /// Halkadaki boş yuvaya doğrudan yazarak kare ekler. `fill`, NV12 belleğini
+    /// doldurup `(zaman damgası, bayraklar)` döndürür; `None` dönerse kare eklenmez.
+    pub fn push_with<F>(&mut self, fill: F) -> Result<Option<FrameMeta>, CoreError>
+    where
+        F: FnOnce(&mut [u8]) -> Result<Option<(i64, u32)>, CoreError>,
+    {
+        if self.sched.is_eos() {
+            return Err(CoreError::StreamFinished);
+        }
+        if self.sched.capacity_left() == 0 {
+            return Err(CoreError::RingFull);
+        }
+        let mut lease = self.ring.begin_write()?;
+        let Some((pts_us, mut flags)) = fill(lease.data())? else {
+            return Ok(None);
+        };
+        let verdict = self.scene.feed(&lease.data()[..self.geo.luma_bytes()]);
+        let first = self.sched.pushed() == 0;
+        if first || (self.auto_scene_cut && verdict.cut) {
+            flags |= FRAME_FLAG_SCENE_CUT;
+        }
+        let meta = lease.commit(pts_us, flags)?;
+        let cut = flags & FRAME_FLAG_SCENE_CUT != 0 && !first;
+        let seq = self.sched.on_push(cut)?;
+        debug_assert_eq!(seq, meta.seq);
+        self.stats.frames_in += 1;
+        if cut {
+            self.stats.scene_cuts += 1;
+        }
+        self.stats.max_occupancy = self.stats.max_occupancy.max(self.ring.len() as u32);
+        Ok(Some(meta))
+    }
+
+    /// Hazır bir NV12 karesini kopyalayarak ekler.
+    pub fn push_frame(
+        &mut self,
+        nv12: &[u8],
+        pts_us: i64,
+        flags: u32,
+    ) -> Result<FrameMeta, CoreError> {
+        let bytes = self.geo.frame_bytes();
+        if nv12.len() < bytes {
+            return Err(CoreError::BufferTooSmall);
+        }
+        let meta = self.push_with(|dst| {
+            dst.copy_from_slice(&nv12[..bytes]);
+            Ok(Some((pts_us, flags)))
+        })?;
+        meta.ok_or(CoreError::Internal)
+    }
+
+    /// Verilmiş pencerenin giriş kareleri ve yazılacak tahminleri.
+    pub fn window_io(&mut self) -> Result<WindowIo<'_>, CoreError> {
+        let plan = self.sched.issued().ok_or(CoreError::BadState)?;
+        if self.prepared != Some(plan.id) {
+            return Err(CoreError::BadState);
+        }
+        Ok(WindowIo {
+            plan,
+            geo: self.geo,
+            ring: &self.ring,
+            emit: &mut self.est_emit,
+            tail: &mut self.est_tail,
+        })
+    }
+
+    /// Model çıktılarının yazıldığını bildirir; kesinleşen kareler çıkış kuyruğuna girer.
+    pub fn complete_window(&mut self) -> Result<(), CoreError> {
+        let plan = self.sched.issued().ok_or(CoreError::BadState)?;
+        if self.sched.complete(plan.id)? {
+            // Yeni ikinci yarı tahminleri önbellek olur; eski önbellek (est_tail)
+            // çıkış kuyruğu boşalana kadar harmanlama kaynağı olarak kalır.
+            std::mem::swap(&mut self.est_cache, &mut self.est_tail);
+        }
+        self.prepared = None;
+        Ok(())
+    }
+
+    /// Sıradaki kesinleşmiş kareyi `dst` içine NV12 olarak yazar.
+    ///
+    /// Çıktı her zaman orijinal karenin kopyasıyla başlar; yalnızca tahminlerin
+    /// işaretlediği pikseller üzerine yazılır (bit-exact koruma kapısı).
+    pub fn pop_output(&mut self, dst: &mut [u8]) -> Result<Option<OutputMeta>, CoreError> {
+        let Some(item) = self.sched.peek_output() else {
+            return Ok(None);
+        };
+        let bytes = self.geo.frame_bytes();
+        if dst.len() < bytes {
+            return Err(CoreError::BufferTooSmall);
+        }
+        let dst = &mut dst[..bytes];
+        let lease = self.ring.read(item.seq)?;
+        dst.copy_from_slice(lease.data());
+        let mut modified = 0;
+        if let OutputSource::Estimate {
+            emit_index,
+            fuse_index,
+        } = item.source
+        {
+            let est = &self.est_emit[emit_index as usize];
+            let cached = fuse_index.map(|i| &self.est_tail[i as usize]);
+            modified = compose(self.geo, dst, est, cached);
+            if self.integrity_check {
+                self.stats.preservation_violations +=
+                    verify_preservation(self.geo, lease.data(), dst, est, cached);
+            }
+        }
+        let frame = lease.meta();
+        drop(lease);
+        self.sched.pop_output();
+
+        if item.seq != self.stats.frames_out {
+            self.stats.order_violations += 1;
+        }
+        self.stats.frames_out += 1;
+        self.stats.modified_pixels += modified;
+        let mut flags = item.flags;
+        if frame.flags & FRAME_FLAG_SCENE_CUT != 0 {
+            flags |= OUT_FLAG_SCENE_START;
+        }
+        Ok(Some(OutputMeta {
+            seq: item.seq,
+            pts_us: frame.pts_us,
+            flags,
+            modified_pixels: modified,
+        }))
+    }
+
+    /// Hattı baştan sona sürer: `source` kare üretir (`None` = kaynak bitti),
+    /// `restorer` pencereleri onarır, `sink` kesinleşen kareleri alır.
+    pub fn run<S, R, K>(
+        &mut self,
+        mut source: S,
+        restorer: &mut R,
+        mut sink: K,
+    ) -> Result<(), CoreError>
+    where
+        S: FnMut(&mut [u8]) -> Option<(i64, u32)>,
+        R: Restorer + ?Sized,
+        K: FnMut(&[u8], &OutputMeta),
+    {
+        let mut out = vec![0u8; self.geo.frame_bytes()];
+        loop {
+            match self.poll() {
+                Step::NeedFrames(n) => {
+                    for _ in 0..n {
+                        if self.push_with(|dst| Ok(source(dst)))?.is_none() {
+                            self.finish();
+                            break;
+                        }
+                    }
+                }
+                Step::Window(_) => {
+                    let mut io = self.window_io()?;
+                    restorer.restore(&mut io)?;
+                    self.complete_window()?;
+                }
+                Step::Output(_) => {
+                    while let Some(meta) = self.pop_output(&mut out)? {
+                        sink(&out, &meta);
+                    }
+                }
+                Step::Finished => return Ok(()),
+            }
+        }
+    }
+}
+
+// ============================================================================
+// 9. Düzlemsel YUV 4:2:0 ↔ NV12 (MediaCodec Image düzlemleri için)
+// ============================================================================
+
+/// Satır ve piksel adımlı tek bir düzlem (ham işaretçi; U ve V düzlemleri aynı
+/// belleğin iç içe görünümleri olabileceği için dilim kullanılmaz).
+#[derive(Debug, Clone, Copy)]
+pub struct RawPlane {
+    /// Düzlemin ilk baytı.
+    pub ptr: *mut u8,
+    /// Erişilebilir bayt sayısı.
+    pub len: usize,
+    /// Satırlar arası bayt adımı.
+    pub row_stride: usize,
+    /// Aynı satırdaki örnekler arası bayt adımı (Y için 1; UV için 1 veya 2).
+    pub pixel_stride: usize,
+}
+
+impl RawPlane {
+    /// `cols × rows` örnek için gereken en küçük uzunluk sağlanıyor mu?
+    fn fits(&self, cols: usize, rows: usize) -> bool {
+        !self.ptr.is_null()
+            && self.pixel_stride >= 1
+            && self.row_stride > (cols - 1) * self.pixel_stride
+            && self.len > (rows - 1) * self.row_stride + (cols - 1) * self.pixel_stride
+    }
+}
+
+fn check_planes(
+    geo: FrameGeometry,
+    y: &RawPlane,
+    u: &RawPlane,
+    v: &RawPlane,
+    packed_y: bool,
+) -> Result<(), CoreError> {
+    let (w, h) = (geo.width(), geo.height());
+    let uv_ok = u.fits(w / 2, h / 2)
+        && v.fits(w / 2, h / 2)
+        && u.row_stride == v.row_stride
+        && u.pixel_stride == v.pixel_stride;
+    if (y.pixel_stride == 1 || !packed_y) && y.fits(w, h) && uv_ok {
+        Ok(())
+    } else {
+        Err(CoreError::BufferTooSmall)
+    }
+}
+
+/// Üç düzlemli YUV 4:2:0 görüntüyü (I420, NV12 veya NV21 yerleşimi) sıkı NV12'ye paketler.
+///
+/// # Safety
+/// Her düzlemin `ptr..ptr+len` aralığı çağrı boyunca okunabilir olmalıdır.
+pub unsafe fn pack_nv12(
+    geo: FrameGeometry,
+    y: RawPlane,
+    u: RawPlane,
+    v: RawPlane,
+    dst: &mut [u8],
+) -> Result<(), CoreError> {
+    check_planes(geo, &y, &u, &v, false)?;
+    if dst.len() < geo.frame_bytes() {
+        return Err(CoreError::BufferTooSmall);
+    }
+    let (w, h) = (geo.width(), geo.height());
+    let (dst_y, dst_uv) = dst[..geo.frame_bytes()].split_at_mut(geo.luma_bytes());
+    // SAFETY: check_planes, aşağıda okunan her ofsetin düzlem uzunluğu içinde olduğunu doğruladı.
+    unsafe {
+        for row in 0..h {
+            let src = y.ptr.add(row * y.row_stride);
+            if y.pixel_stride == 1 {
+                std::ptr::copy_nonoverlapping(src, dst_y.as_mut_ptr().add(row * w), w);
+            } else {
+                // Örnek başına birden çok bayt (ör. 10 bit P010'un üst baytı).
+                for (x, out) in dst_y[row * w..(row + 1) * w].iter_mut().enumerate() {
+                    *out = *src.add(x * y.pixel_stride);
+                }
+            }
+        }
+        let ps = u.pixel_stride;
+        for cy in 0..h / 2 {
+            let out = &mut dst_uv[cy * w..(cy + 1) * w];
+            let (ur, vr) = (u.ptr.add(cy * u.row_stride), v.ptr.add(cy * v.row_stride));
+            if ps == 2 && vr == ur.add(1) {
+                // NV12: U düzlemi zaten "U V U V…"; son V baytı yalnızca V düzleminden okunabilir.
+                std::ptr::copy_nonoverlapping(ur, out.as_mut_ptr(), w - 1);
+                out[w - 1] = *vr.add(w - 2);
+            } else {
+                for cx in 0..w / 2 {
+                    out[2 * cx] = *ur.add(cx * ps);
+                    out[2 * cx + 1] = *vr.add(cx * ps);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Sıkı NV12 kareyi üç düzlemli hedefe (kodlayıcı giriş görüntüsü) açar.
+///
+/// # Safety
+/// Her düzlemin `ptr..ptr+len` aralığı çağrı boyunca yazılabilir olmalıdır.
+pub unsafe fn unpack_nv12(
+    geo: FrameGeometry,
+    src: &[u8],
+    y: RawPlane,
+    u: RawPlane,
+    v: RawPlane,
+) -> Result<(), CoreError> {
+    check_planes(geo, &y, &u, &v, true)?;
+    if src.len() < geo.frame_bytes() {
+        return Err(CoreError::BufferTooSmall);
+    }
+    let (w, h) = (geo.width(), geo.height());
+    let (src_y, src_uv) = src[..geo.frame_bytes()].split_at(geo.luma_bytes());
+    // SAFETY: check_planes, aşağıda yazılan her ofsetin düzlem uzunluğu içinde olduğunu doğruladı.
+    unsafe {
+        for row in 0..h {
+            std::ptr::copy_nonoverlapping(
+                src_y.as_ptr().add(row * w),
+                y.ptr.add(row * y.row_stride),
+                w,
+            );
+        }
+        let ps = u.pixel_stride;
+        for cy in 0..h / 2 {
+            let row = &src_uv[cy * w..(cy + 1) * w];
+            let (ur, vr) = (u.ptr.add(cy * u.row_stride), v.ptr.add(cy * v.row_stride));
+            if ps == 2 && vr == ur.add(1) {
+                std::ptr::copy_nonoverlapping(row.as_ptr(), ur, w - 1);
+                *vr.add(w - 2) = row[w - 1];
+            } else {
+                for cx in 0..w / 2 {
+                    *ur.add(cx * ps) = row[2 * cx];
+                    *vr.add(cx * ps) = row[2 * cx + 1];
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+// ============================================================================
+// 10. JNI köprüsü (Kotlin: com.videocleaner.engine.NativeCore)
+// ============================================================================
+
+/// Kotlin köprüsü. Harici JNI crate'i kullanılmaz: JNIEnv işlev tablosundan
+/// yalnızca `GetDirectBufferAddress` (230) ve `GetDirectBufferCapacity` (231)
+/// çağrılır. Tüm veri alışverişi doğrudan (direct) `ByteBuffer`'lar üzerindendir;
+/// hatalar istisna yerine negatif [`CoreError`] kodu olarak döner.
+pub mod jni {
+    use super::*;
+
+    /// `JNIEnv` = `const struct JNINativeInterface *` (işlev işaretçileri tablosu).
+    pub type JniEnv = *const *const c_void;
+    /// Herhangi bir Java nesne başvurusu.
+    pub type JObject = *mut c_void;
+
+    const JNI_GET_DIRECT_BUFFER_ADDRESS: usize = 230;
+    const JNI_GET_DIRECT_BUFFER_CAPACITY: usize = 231;
+    const HANDLE_MAGIC: u64 = 0x5643_4C45_414E_3230; // "VCLEAN20"
+
+    /// `nativePoll` adım kodları.
+    pub const STEP_NEED_FRAMES: i32 = 0;
+    /// Pencere hazır: çıkarımı çalıştırıp `nativeCompleteWindow` çağırın.
+    pub const STEP_WINDOW: i32 = 1;
+    /// Çıkış kareleri hazır.
+    pub const STEP_OUTPUT: i32 = 2;
+    /// Akış tamamlandı.
+    pub const STEP_FINISHED: i32 = 3;
+    /// `nativePoll` bilgi tamponunun en küçük boyutu.
+    pub const POLL_INFO_BYTES: usize = 64;
+    /// `nativePopOutput*` bilgi tamponunun en küçük boyutu.
+    pub const OUTPUT_META_BYTES: usize = 32;
+    /// `nativeStats` tamponunun en küçük boyutu.
+    pub const STATS_BYTES: usize = 112;
+
+    struct Session {
+        pipeline: Pipeline,
+        scratch: Vec<u8>,
+    }
+
+    struct Handle {
+        magic: u64,
+        session: Mutex<Session>,
+    }
+
+    /// Doğrudan ByteBuffer'ın adresi ve kapasitesi.
+    ///
+    /// # Safety
+    /// `env`, çağıran iş parçacığı için geçerli bir `JNIEnv*` olmalıdır.
+    unsafe fn direct_buffer(env: *mut JniEnv, buf: JObject) -> Result<(*mut u8, usize), CoreError> {
+        if env.is_null() || buf.is_null() {
+            return Err(CoreError::BadArgument);
+        }
+        type GetAddress = unsafe extern "system" fn(*mut JniEnv, JObject) -> *mut c_void;
+        type GetCapacity = unsafe extern "system" fn(*mut JniEnv, JObject) -> i64;
+        // SAFETY: JNI belirtimi gereği *env, JNINativeInterface işlev tablosunu
+        // gösterir; 230 ve 231 numaralı girişler bu iki işlevdir (JNI 1.4+).
+        unsafe {
+            let table: *const *const c_void = *env;
+            if table.is_null() {
+                return Err(CoreError::BadArgument);
+            }
+            let get_address: GetAddress =
+                std::mem::transmute(*table.add(JNI_GET_DIRECT_BUFFER_ADDRESS));
+            let get_capacity: GetCapacity =
+                std::mem::transmute(*table.add(JNI_GET_DIRECT_BUFFER_CAPACITY));
+            let address = get_address(env, buf);
+            let capacity = get_capacity(env, buf);
+            if address.is_null() || capacity <= 0 {
+                // Doğrudan olmayan (heap) ByteBuffer verildi.
+                return Err(CoreError::BadArgument);
+            }
+            Ok((address as *mut u8, capacity as usize))
+        }
+    }
+
+    /// # Safety
+    /// `env` geçerli bir `JNIEnv*` olmalıdır.
+    unsafe fn plane(
+        env: *mut JniEnv,
+        buf: JObject,
+        offset: i32,
+        row_stride: i32,
+        pixel_stride: i32,
+    ) -> Result<RawPlane, CoreError> {
+        // SAFETY: çağıranın sözleşmesi.
+        let (ptr, cap) = unsafe { direct_buffer(env, buf)? };
+        if offset < 0 || row_stride <= 0 || pixel_stride <= 0 || offset as usize >= cap {
+            return Err(CoreError::BadArgument);
+        }
+        // SAFETY: offset < cap olduğundan sonuç tampon içindedir.
+        let ptr = unsafe { ptr.add(offset as usize) };
+        Ok(RawPlane {
+            ptr,
+            len: cap - offset as usize,
+            row_stride: row_stride as usize,
+            pixel_stride: pixel_stride as usize,
+        })
+    }
+
+    /// Doğrudan tamponu yazılabilir dilim olarak verir.
+    ///
+    /// # Safety
+    /// `env` geçerli olmalı; tampon çağrı boyunca yaşamalı ve başka yerden erişilmemelidir.
+    unsafe fn buffer_mut<'a>(
+        env: *mut JniEnv,
+        buf: JObject,
+        min_len: usize,
+    ) -> Result<&'a mut [u8], CoreError> {
+        // SAFETY: çağıranın sözleşmesi.
+        let (ptr, cap) = unsafe { direct_buffer(env, buf)? };
+        if cap < min_len {
+            return Err(CoreError::BufferTooSmall);
+        }
+        // SAFETY: JVM, doğrudan tamponun [ptr, ptr+cap) aralığının geçerli olduğunu garanti eder.
+        Ok(unsafe { std::slice::from_raw_parts_mut(ptr, cap) })
+    }
+
+    fn put_i32(buf: &mut [u8], at: usize, v: i32) {
+        buf[at..at + 4].copy_from_slice(&v.to_ne_bytes());
+    }
+
+    fn put_i64(buf: &mut [u8], at: usize, v: i64) {
+        buf[at..at + 8].copy_from_slice(&v.to_ne_bytes());
+    }
+
+    fn call<F>(handle: i64, f: F) -> i64
+    where
+        F: FnOnce(&mut Session) -> Result<i64, CoreError>,
+    {
+        let ptr = handle as usize as *const Handle;
+        if ptr.is_null() || !ptr.is_aligned() {
+            return CoreError::InvalidHandle.code() as i64;
+        }
+        // SAFETY: Tutamak nativeCreate tarafından Box::into_raw ile üretilir ve
+        // nativeDestroy çağrılana kadar geçerlidir (Kotlin sarmalayıcının sözleşmesi).
+        // Sihirli sayı, yanlış veya serbest bırakılmış tutamakların çoğunu yakalar.
+        let handle = unsafe { &*ptr };
+        if handle.magic != HANDLE_MAGIC {
+            return CoreError::InvalidHandle.code() as i64;
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut session = lock(&handle.session);
+            f(&mut session)
+        }));
+        match result {
+            Ok(Ok(value)) => value,
+            Ok(Err(error)) => error.code() as i64,
+            Err(_) => CoreError::Internal.code() as i64,
+        }
+    }
+
+    /// `external fun nativeAbiVersion(): Int`
+    #[unsafe(no_mangle)]
+    pub extern "system" fn Java_com_videocleaner_engine_NativeCore_nativeAbiVersion(
+        _env: *mut JniEnv,
+        _class: JObject,
+    ) -> i32 {
+        ABI_VERSION
+    }
+
+    /// `external fun nativeKernelBackend(): Int` — 0 taşınabilir, 1 AVX2, 2 NEON.
+    #[unsafe(no_mangle)]
+    pub extern "system" fn Java_com_videocleaner_engine_NativeCore_nativeKernelBackend(
+        _env: *mut JniEnv,
+        _class: JObject,
+    ) -> i32 {
+        kernels::backend_id()
+    }
+
+    /// `external fun nativePageSize(): Int` — çalışma anındaki sayfa boyutu.
+    #[unsafe(no_mangle)]
+    pub extern "system" fn Java_com_videocleaner_engine_NativeCore_nativePageSize(
+        _env: *mut JniEnv,
+        _class: JObject,
+    ) -> i32 {
+        page_size() as i32
+    }
+
+    /// `external fun nativeCreate(width: Int, height: Int): Long` — tutamak veya negatif hata kodu.
+    #[unsafe(no_mangle)]
+    pub extern "system" fn Java_com_videocleaner_engine_NativeCore_nativeCreate(
+        _env: *mut JniEnv,
+        _class: JObject,
+        width: i32,
+        height: i32,
+    ) -> i64 {
+        let created = std::panic::catch_unwind(|| -> Result<i64, CoreError> {
+            if width <= 0 || height <= 0 {
+                return Err(CoreError::InvalidGeometry);
+            }
+            let geo = FrameGeometry::new(width as usize, height as usize)?;
+            let session = Session {
+                pipeline: Pipeline::new(geo)?,
+                scratch: vec![0u8; geo.frame_bytes()],
+            };
+            let handle = Box::new(Handle {
+                magic: HANDLE_MAGIC,
+                session: Mutex::new(session),
+            });
+            Ok(Box::into_raw(handle) as usize as i64)
+        });
+        match created {
+            Ok(Ok(handle)) => handle,
+            Ok(Err(error)) => error.code() as i64,
+            Err(_) => CoreError::Internal.code() as i64,
+        }
+    }
+
+    /// `external fun nativeDestroy(handle: Long)`
+    ///
+    /// # Safety
+    /// `handle`, `nativeCreate`'ten dönen ve daha önce yok edilmemiş bir değer olmalıdır.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "system" fn Java_com_videocleaner_engine_NativeCore_nativeDestroy(
+        _env: *mut JniEnv,
+        _class: JObject,
+        handle: i64,
+    ) {
+        let ptr = handle as usize as *mut Handle;
+        if ptr.is_null() || !ptr.is_aligned() {
+            return;
+        }
+        // SAFETY: çağıranın sözleşmesi; sihirli sayı çift serbest bırakmayı çoğu durumda yakalar.
+        unsafe {
+            if (*ptr).magic != HANDLE_MAGIC {
+                return;
+            }
+            (*ptr).magic = 0;
+            drop(Box::from_raw(ptr));
+        }
+    }
+
+    /// `external fun nativeSetOption(handle: Long, key: Int, value: Int): Int`
+    /// — 1: otomatik sahne geçişi, 2: bütünlük denetimi.
+    #[unsafe(no_mangle)]
+    pub extern "system" fn Java_com_videocleaner_engine_NativeCore_nativeSetOption(
+        _env: *mut JniEnv,
+        _class: JObject,
+        handle: i64,
+        key: i32,
+        value: i32,
+    ) -> i32 {
+        call(handle, |s| {
+            match key {
+                1 => s.pipeline.set_auto_scene_cut(value != 0),
+                2 => s.pipeline.set_integrity_check(value != 0),
+                _ => return Err(CoreError::BadArgument),
+            }
+            Ok(0)
+        }) as i32
+    }
+
+    /// `external fun nativePoll(handle: Long, info: ByteBuffer): Int` — adım kodu.
+    ///
+    /// `info` (yerel bayt sırası, ≥ 64 bayt): `i32 adım, i32 sayı, i64 planNo,
+    /// i32 mod(0=A,1=B), i32 kayma, i32 geçerliSayısı, i32 emitBaş, i32 emitSon,
+    /// i32 önbellekBaş, i32 önbellekSon, i32 bayraklar, i64 tabanSıra, i32 geçerlilikMaskesi`.
+    ///
+    /// # Safety
+    /// `env` geçerli bir `JNIEnv*`, `info` doğrudan bir ByteBuffer olmalıdır.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "system" fn Java_com_videocleaner_engine_NativeCore_nativePoll(
+        env: *mut JniEnv,
+        _class: JObject,
+        handle: i64,
+        info: JObject,
+    ) -> i32 {
+        // SAFETY: çağıranın sözleşmesi.
+        let info = match unsafe { buffer_mut(env, info, POLL_INFO_BYTES) } {
+            Ok(buf) => buf,
+            Err(error) => return error.code(),
+        };
+        call(handle, |s| {
+            info[..POLL_INFO_BYTES].fill(0);
+            let code = match s.pipeline.poll() {
+                Step::NeedFrames(n) => {
+                    put_i32(info, 4, n as i32);
+                    STEP_NEED_FRAMES
+                }
+                Step::Output(n) => {
+                    put_i32(info, 4, n as i32);
+                    STEP_OUTPUT
+                }
+                Step::Finished => STEP_FINISHED,
+                Step::Window(plan) => {
+                    put_i64(info, 8, plan.id as i64);
+                    put_i32(info, 16, if plan.mode == Mode::A { 0 } else { 1 });
+                    put_i32(info, 20, plan.slide as i32);
+                    put_i32(info, 24, plan.valid_count() as i32);
+                    put_i32(info, 28, plan.emit.0 as i32);
+                    put_i32(info, 32, plan.emit.1 as i32);
+                    put_i32(info, 36, plan.cache.0 as i32);
+                    put_i32(info, 40, plan.cache.1 as i32);
+                    put_i32(info, 44, plan.flags as i32);
+                    put_i64(info, 48, plan.base_seq);
+                    put_i32(info, 56, plan.valid as i32);
+                    STEP_WINDOW
+                }
+            };
+            put_i32(info, 0, code);
+            Ok(code as i64)
+        }) as i32
+    }
+
+    /// `external fun nativePushYuv420(...)`: MediaCodec `Image` düzlemlerinden kare iter.
+    /// Örnek başına birden çok bayt taşıyan biçimlerde (P010) piksel adımları ve ofsetler üst
+    /// baytı gösterecek şekilde verilir; çekirdek her zaman 8 bit NV12 saklar.
+    /// Karenin sıra numarasını veya negatif hata kodunu döndürür.
+    ///
+    /// # Safety
+    /// `env` geçerli olmalı; üç tampon da doğrudan ByteBuffer olmalıdır.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "system" fn Java_com_videocleaner_engine_NativeCore_nativePushYuv420(
+        env: *mut JniEnv,
+        _class: JObject,
+        handle: i64,
+        y_buf: JObject,
+        y_offset: i32,
+        y_row_stride: i32,
+        y_pixel_stride: i32,
+        u_buf: JObject,
+        u_offset: i32,
+        v_buf: JObject,
+        v_offset: i32,
+        uv_row_stride: i32,
+        uv_pixel_stride: i32,
+        pts_us: i64,
+        flags: i32,
+    ) -> i64 {
+        // SAFETY: çağıranın sözleşmesi.
+        let planes = unsafe {
+            (|| {
+                Ok::<_, CoreError>((
+                    plane(env, y_buf, y_offset, y_row_stride, y_pixel_stride)?,
+                    plane(env, u_buf, u_offset, uv_row_stride, uv_pixel_stride)?,
+                    plane(env, v_buf, v_offset, uv_row_stride, uv_pixel_stride)?,
+                ))
+            })()
+        };
+        let (y, u, v) = match planes {
+            Ok(p) => p,
+            Err(error) => return error.code() as i64,
+        };
+        call(handle, |s| {
+            let geo = s.pipeline.geometry();
+            let meta = s.pipeline.push_with(|dst| {
+                // SAFETY: düzlemler JVM'in doğrudan tamponlarıdır ve çağrı boyunca geçerlidir.
+                unsafe { pack_nv12(geo, y, u, v, dst)? };
+                Ok(Some((pts_us, flags as u32)))
+            })?;
+            meta.map(|m| m.seq as i64).ok_or(CoreError::Internal)
+        })
+    }
+
+    /// `external fun nativePushNv12(handle: Long, frame: ByteBuffer, ptsUs: Long, flags: Int): Long`
+    ///
+    /// # Safety
+    /// `env` geçerli olmalı; `frame` doğrudan ByteBuffer olmalıdır.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "system" fn Java_com_videocleaner_engine_NativeCore_nativePushNv12(
+        env: *mut JniEnv,
+        _class: JObject,
+        handle: i64,
+        frame: JObject,
+        pts_us: i64,
+        flags: i32,
+    ) -> i64 {
+        // SAFETY: çağıranın sözleşmesi.
+        let src = match unsafe { buffer_mut(env, frame, 1) } {
+            Ok(buf) => buf,
+            Err(error) => return error.code() as i64,
+        };
+        call(handle, |s| {
+            s.pipeline
+                .push_frame(src, pts_us, flags as u32)
+                .map(|m| m.seq as i64)
+        })
+    }
+
+    /// `external fun nativeFinish(handle: Long): Int` — kaynak bitti.
+    #[unsafe(no_mangle)]
+    pub extern "system" fn Java_com_videocleaner_engine_NativeCore_nativeFinish(
+        _env: *mut JniEnv,
+        _class: JObject,
+        handle: i64,
+    ) -> i32 {
+        call(handle, |s| {
+            s.pipeline.finish();
+            Ok(0)
+        }) as i32
+    }
+
+    /// `external fun nativeSetHint(handle: Long, seq: Long, hint: Int): Int`
+    /// — 0 olağan, 1 hassas (Mod A), 2 bypass.
+    #[unsafe(no_mangle)]
+    pub extern "system" fn Java_com_videocleaner_engine_NativeCore_nativeSetHint(
+        _env: *mut JniEnv,
+        _class: JObject,
+        handle: i64,
+        seq: i64,
+        hint: i32,
+    ) -> i32 {
+        call(handle, |s| {
+            let hint = Hint::from_i32(hint).ok_or(CoreError::BadArgument)?;
+            if seq < 0 {
+                return Err(CoreError::BadArgument);
+            }
+            s.pipeline.set_hint(seq as u64, hint).map(|_| 0)
+        }) as i32
+    }
+
+    /// `external fun nativeReadWindowFrame(handle: Long, pos: Int, dst: ByteBuffer): Int`
+    /// — pencere konumundaki kareyi NV12 olarak kopyalar. 1: kopyalandı, 0: dolgu konumu.
+    ///
+    /// # Safety
+    /// `env` geçerli olmalı; `dst` doğrudan ByteBuffer olmalıdır.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "system" fn Java_com_videocleaner_engine_NativeCore_nativeReadWindowFrame(
+        env: *mut JniEnv,
+        _class: JObject,
+        handle: i64,
+        pos: i32,
+        dst: JObject,
+    ) -> i32 {
+        // SAFETY: çağıranın sözleşmesi.
+        let dst = match unsafe { buffer_mut(env, dst, 1) } {
+            Ok(buf) => buf,
+            Err(error) => return error.code(),
+        };
+        call(handle, |s| {
+            if !(0..WINDOW_FRAMES as i32).contains(&pos) {
+                return Err(CoreError::BadArgument);
+            }
+            let bytes = s.pipeline.geometry().frame_bytes();
+            if dst.len() < bytes {
+                return Err(CoreError::BufferTooSmall);
+            }
+            let io = s.pipeline.window_io()?;
+            match io.frame(pos as usize) {
+                Some(lease) => {
+                    dst[..bytes].copy_from_slice(lease.data());
+                    Ok(1)
+                }
+                None => Ok(0),
+            }
+        }) as i32
+    }
+
+    /// `external fun nativeSubmitEstimate(...)`: bir pencere konumunun model çıktısını verir.
+    /// `y`/`weight`: ROI genişliği × ROI yüksekliği; `uv`: ROI genişliği × ROI yüksekliği / 2
+    /// bayt (ROI, çift sınırlara hizalanmış hâliyle; hizalı ROI 0 dönerse reddedilmiştir).
+    ///
+    /// # Safety
+    /// `env` geçerli olmalı; üç tampon da doğrudan ByteBuffer olmalıdır.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "system" fn Java_com_videocleaner_engine_NativeCore_nativeSubmitEstimate(
+        env: *mut JniEnv,
+        _class: JObject,
+        handle: i64,
+        pos: i32,
+        roi_x: i32,
+        roi_y: i32,
+        roi_w: i32,
+        roi_h: i32,
+        y_buf: JObject,
+        uv_buf: JObject,
+        weight_buf: JObject,
+    ) -> i32 {
+        // SAFETY: çağıranın sözleşmesi.
+        let buffers = unsafe {
+            (|| {
+                Ok::<_, CoreError>((
+                    buffer_mut(env, y_buf, 1)?,
+                    buffer_mut(env, uv_buf, 1)?,
+                    buffer_mut(env, weight_buf, 1)?,
+                ))
+            })()
+        };
+        let (y_src, uv_src, w_src) = match buffers {
+            Ok(b) => b,
+            Err(error) => return error.code(),
+        };
+        call(handle, |s| {
+            if !(0..WINDOW_FRAMES as i32).contains(&pos)
+                || roi_x < 0
+                || roi_y < 0
+                || roi_w <= 0
+                || roi_h <= 0
+            {
+                return Err(CoreError::BadArgument);
+            }
+            let geo = s.pipeline.geometry();
+            let asked = Rect::new(
+                roi_x as usize,
+                roi_y as usize,
+                roi_w as usize,
+                roi_h as usize,
+            );
+            let roi = asked.aligned(geo).ok_or(CoreError::BadArgument)?;
+            if roi != asked {
+                // Tampon yerleşimi belirsiz olmasın: çağıran hizalı ROI vermelidir.
+                return Err(CoreError::BadArgument);
+            }
+            if y_src.len() < roi.w * roi.h
+                || w_src.len() < roi.w * roi.h
+                || uv_src.len() < roi.w * roi.h / 2
+            {
+                return Err(CoreError::BufferTooSmall);
+            }
+            let mut io = s.pipeline.window_io()?;
+            let est = io
+                .estimate_mut(pos as usize)
+                .ok_or(CoreError::BadArgument)?;
+            est.begin(roi)?;
+            for row in 0..roi.h {
+                let (ys, ws) = est.luma_rows_mut(roi.y + row);
+                ys.copy_from_slice(&y_src[row * roi.w..(row + 1) * roi.w]);
+                ws.copy_from_slice(&w_src[row * roi.w..(row + 1) * roi.w]);
+            }
+            for row in 0..roi.h / 2 {
+                est.uv_row_mut(roi.y / 2 + row)
+                    .copy_from_slice(&uv_src[row * roi.w..(row + 1) * roi.w]);
+            }
+            Ok(0)
+        }) as i32
+    }
+
+    /// `external fun nativeCompleteWindow(handle: Long): Int`
+    /// — tahmin verilmeyen konumlar orijinal hâliyle çıkar.
+    #[unsafe(no_mangle)]
+    pub extern "system" fn Java_com_videocleaner_engine_NativeCore_nativeCompleteWindow(
+        _env: *mut JniEnv,
+        _class: JObject,
+        handle: i64,
+    ) -> i32 {
+        call(handle, |s| s.pipeline.complete_window().map(|_| 0)) as i32
+    }
+
+    fn write_output_meta(meta_out: &mut [u8], meta: &OutputMeta) {
+        put_i64(meta_out, 0, meta.seq as i64);
+        put_i64(meta_out, 8, meta.pts_us);
+        put_i32(meta_out, 16, meta.flags as i32);
+        put_i32(meta_out, 20, 0);
+        put_i64(meta_out, 24, meta.modified_pixels as i64);
+    }
+
+    /// `external fun nativePopOutputYuv420(...)`: sıradaki kareyi kodlayıcının `Image`
+    /// düzlemlerine yazar. 1: kare yazıldı, 0: hazır kare yok, negatif: hata.
+    /// `meta` (≥ 32 bayt): `i64 sıra, i64 ptsUs, i32 bayraklar, i32 0, i64 değişenPiksel`.
+    ///
+    /// # Safety
+    /// `env` geçerli olmalı; tüm tamponlar doğrudan ByteBuffer olmalıdır.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "system" fn Java_com_videocleaner_engine_NativeCore_nativePopOutputYuv420(
+        env: *mut JniEnv,
+        _class: JObject,
+        handle: i64,
+        y_buf: JObject,
+        y_offset: i32,
+        y_row_stride: i32,
+        u_buf: JObject,
+        u_offset: i32,
+        v_buf: JObject,
+        v_offset: i32,
+        uv_row_stride: i32,
+        uv_pixel_stride: i32,
+        meta_buf: JObject,
+    ) -> i32 {
+        // SAFETY: çağıranın sözleşmesi.
+        let prepared = unsafe {
+            (|| {
+                Ok::<_, CoreError>((
+                    plane(env, y_buf, y_offset, y_row_stride, 1)?,
+                    plane(env, u_buf, u_offset, uv_row_stride, uv_pixel_stride)?,
+                    plane(env, v_buf, v_offset, uv_row_stride, uv_pixel_stride)?,
+                    buffer_mut(env, meta_buf, OUTPUT_META_BYTES)?,
+                ))
+            })()
+        };
+        let (y, u, v, meta_out) = match prepared {
+            Ok(p) => p,
+            Err(error) => return error.code(),
+        };
+        call(handle, |s| {
+            let geo = s.pipeline.geometry();
+            // Kareyi kuyruktan çıkarmadan önce hedefi doğrula: hata olursa kare kaybolmasın.
+            check_planes(geo, &y, &u, &v, true)?;
+            let Session { pipeline, scratch } = s;
+            let Some(meta) = pipeline.pop_output(scratch)? else {
+                return Ok(0);
+            };
+            // SAFETY: düzlemler JVM'in doğrudan tamponlarıdır ve çağrı boyunca geçerlidir.
+            unsafe { unpack_nv12(geo, scratch, y, u, v)? };
+            write_output_meta(meta_out, &meta);
+            Ok(1)
+        }) as i32
+    }
+
+    /// `external fun nativePopOutputNv12(handle: Long, dst: ByteBuffer, meta: ByteBuffer): Int`
+    ///
+    /// # Safety
+    /// `env` geçerli olmalı; tamponlar doğrudan ByteBuffer olmalıdır.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "system" fn Java_com_videocleaner_engine_NativeCore_nativePopOutputNv12(
+        env: *mut JniEnv,
+        _class: JObject,
+        handle: i64,
+        dst: JObject,
+        meta_buf: JObject,
+    ) -> i32 {
+        // SAFETY: çağıranın sözleşmesi.
+        let prepared = unsafe {
+            (|| {
+                Ok::<_, CoreError>((
+                    buffer_mut(env, dst, 1)?,
+                    buffer_mut(env, meta_buf, OUTPUT_META_BYTES)?,
+                ))
+            })()
+        };
+        let (dst, meta_out) = match prepared {
+            Ok(p) => p,
+            Err(error) => return error.code(),
+        };
+        call(handle, |s| match s.pipeline.pop_output(dst)? {
+            Some(meta) => {
+                write_output_meta(meta_out, &meta);
+                Ok(1)
+            }
+            None => Ok(0),
+        }) as i32
+    }
+
+    /// `external fun nativeStats(handle: Long, out: ByteBuffer): Int` — 14 adet `i64`
+    /// (≥ 112 bayt): girenKare, çıkanKare, sahneGeçişi, değişenPiksel, korumaİhlali,
+    /// sıraİhlali, enYüksekDoluluk, pencereA, pencereB, köprü, bypass, harman, sahne,
+    /// havuzBayt.
+    ///
+    /// # Safety
+    /// `env` geçerli olmalı; `out` doğrudan ByteBuffer olmalıdır.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "system" fn Java_com_videocleaner_engine_NativeCore_nativeStats(
+        env: *mut JniEnv,
+        _class: JObject,
+        handle: i64,
+        out: JObject,
+    ) -> i32 {
+        // SAFETY: çağıranın sözleşmesi.
+        let out = match unsafe { buffer_mut(env, out, STATS_BYTES) } {
+            Ok(buf) => buf,
+            Err(error) => return error.code(),
+        };
+        call(handle, |s| {
+            let st = s.pipeline.stats();
+            let values = [
+                st.frames_in,
+                st.frames_out,
+                st.scene_cuts,
+                st.modified_pixels,
+                st.preservation_violations,
+                st.order_violations,
+                st.max_occupancy as u64,
+                st.sched.windows_a,
+                st.sched.windows_b,
+                st.sched.bridges,
+                st.sched.bypassed,
+                st.sched.fused,
+                st.sched.segments,
+                s.pipeline.ring().pool_bytes() as u64,
+            ];
+            for (i, v) in values.iter().enumerate() {
+                put_i64(out, i * 8, *v as i64);
+            }
+            Ok(values.len() as i64)
+        }) as i32
+    }
+}
+
+// ============================================================================
+// 11. Testler
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::jni::*;
+    use super::*;
+    use std::collections::{BTreeSet, HashMap};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    /// Küçük, bağımlılıksız sözde rastgele üreteç (xorshift64*).
+    struct Rng(u64);
+
+    impl Rng {
+        fn new(seed: u64) -> Self {
+            Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1)
+        }
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+        fn fill(&mut self, buf: &mut [u8]) {
+            for b in buf {
+                *b = (self.next() >> 32) as u8;
+            }
+        }
+    }
+
+    fn small() -> FrameGeometry {
+        FrameGeometry::new(64, 48).unwrap()
+    }
+
+    /// Sıra numarasına özgü, her baytı farklı kare içeriği.
+    fn frame_content(geo: FrameGeometry, seq: u64) -> Vec<u8> {
+        let mut buf = vec![0u8; geo.frame_bytes()];
+        Rng::new(seq + 1).fill(&mut buf);
+        buf
+    }
+
+    // ---- geometri ve bellek --------------------------------------------------
+
+    #[test]
+    fn geometry_and_pool_match_spec() {
+        let geo = FrameGeometry::HD720;
+        assert_eq!(geo.frame_bytes(), 1_382_400);
+        let ring = FrameRing::new(geo).unwrap();
+        assert_eq!(ring.pool_bytes(), 41_472_000);
+        assert_eq!(ring.base_addr() % page_size(), 0);
+        assert!(page_size() == 4096 || page_size() == 16384 || page_size() == 65536);
+        assert_eq!(
+            FrameGeometry::new(1281, 720),
+            Err(CoreError::InvalidGeometry)
+        );
+        assert_eq!(FrameGeometry::new(1280, 0), Err(CoreError::InvalidGeometry));
+        assert_eq!(
+            FrameGeometry::new(16384, 720),
+            Err(CoreError::InvalidGeometry)
+        );
+    }
+
+    // ---- halka ve sahiplik ---------------------------------------------------
+
+    #[test]
+    fn ring_write_read_retire() {
+        let geo = small();
+        let ring = FrameRing::new(geo).unwrap();
+        for seq in 0..WINDOW_FRAMES as u64 {
+            let mut w = ring.begin_write().unwrap();
+            w.data().copy_from_slice(&frame_content(geo, seq));
+            let meta = w.commit(seq as i64 * 16_667, 0).unwrap();
+            assert_eq!(meta.seq, seq);
+        }
+        assert_eq!(ring.len(), 30);
+        assert_eq!(ring.begin_write().err(), Some(CoreError::RingFull));
+        for seq in [0u64, 7, 29] {
+            let lease = ring.read(seq).unwrap();
+            assert_eq!(lease.data(), &frame_content(geo, seq)[..]);
+            assert_eq!(lease.meta().pts_us, seq as i64 * 16_667);
+            assert_eq!(lease.luma().len() + lease.chroma().len(), geo.frame_bytes());
+        }
+        assert_eq!(ring.retire_before(15), 15);
+        assert_eq!(ring.bounds(), (15, 30));
+        assert_eq!(ring.read(14).err(), Some(CoreError::UnknownFrame));
+        assert!(ring.meta(14).is_none() && ring.meta(15).is_some());
+        // Boşalan yuvalar yeniden kullanılır; eski kareler bozulmaz.
+        for seq in 30..45u64 {
+            let mut w = ring.begin_write().unwrap();
+            w.data().copy_from_slice(&frame_content(geo, seq));
+            w.commit(seq as i64 * 16_667, 0).unwrap();
+        }
+        for seq in 15..45u64 {
+            assert_eq!(ring.read(seq).unwrap().data(), &frame_content(geo, seq)[..]);
+        }
+    }
+
+    #[test]
+    fn ring_rejects_bad_usage() {
+        let ring = FrameRing::new(small()).unwrap();
+        let w = ring.begin_write().unwrap();
+        assert_eq!(ring.begin_write().err(), Some(CoreError::WriteInProgress));
+        drop(w); // commit edilmeyen kira kare eklemez
+        assert!(ring.is_empty());
+
+        ring.begin_write().unwrap().commit(100, 0).unwrap();
+        assert_eq!(
+            ring.begin_write().unwrap().commit(100, 0).err(),
+            Some(CoreError::NonMonotonicPts)
+        );
+        assert_eq!(
+            ring.begin_write().unwrap().commit(50, 0).err(),
+            Some(CoreError::NonMonotonicPts)
+        );
+        assert_eq!(ring.len(), 1);
+        for i in 1..WINDOW_FRAMES as i64 {
+            ring.begin_write().unwrap().commit(100 + i, 0).unwrap();
+        }
+
+        // Okuyucusu olan yuva halkadan çıkarılsa bile üzerine yazılamaz.
+        let reader = ring.read(0).unwrap();
+        ring.retire_before(1);
+        assert_eq!(ring.begin_write().err(), Some(CoreError::SlotBusy));
+        assert_eq!(reader.meta().seq, 0);
+        drop(reader);
+        ring.begin_write().unwrap().commit(1000, 0).unwrap();
+        assert_eq!(ring.bounds(), (1, 31));
+    }
+
+    #[test]
+    fn ring_concurrent_readers_never_see_torn_frames() {
+        let ring = FrameRing::new(small()).unwrap();
+        let stop = AtomicBool::new(false);
+        let verified = AtomicU64::new(0);
+        let pattern = |seq: u64| (seq.wrapping_mul(31).wrapping_add(7)) as u8;
+        std::thread::scope(|scope| {
+            for t in 0..3u64 {
+                let (ring, stop, verified) = (&ring, &stop, &verified);
+                scope.spawn(move || {
+                    let mut rng = Rng::new(1000 + t);
+                    while !stop.load(Ordering::Relaxed) {
+                        let (head, tail) = ring.bounds();
+                        if tail == head {
+                            continue;
+                        }
+                        if let Ok(lease) = ring.read(head + rng.below(tail - head)) {
+                            let expect = pattern(lease.meta().seq);
+                            assert!(
+                                lease.data().iter().all(|&b| b == expect),
+                                "yırtık kare okundu"
+                            );
+                            verified.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                });
+            }
+            // Yazıcı, okuyucular yeterince doğrulama yapana kadar sürer: test, iş
+            // parçacıklarının ne zaman zamanlandığına dair bir varsayıma dayanmaz.
+            let mut seq = 0u64;
+            while seq < 4000 || verified.load(Ordering::Relaxed) < 3000 {
+                assert!(seq < 50_000_000, "okuyucular ilerlemiyor");
+                match ring.begin_write() {
+                    Ok(mut w) => {
+                        let value = pattern(seq);
+                        let (first, second) = w.data().split_at_mut(1000);
+                        first.fill(value);
+                        std::thread::yield_now();
+                        second.fill(value);
+                        w.commit(seq as i64, 0).unwrap();
+                        seq += 1;
+                    }
+                    Err(CoreError::RingFull) => {
+                        let (head, _) = ring.bounds();
+                        ring.retire_before(head + 7);
+                    }
+                    Err(CoreError::SlotBusy) => std::thread::yield_now(),
+                    Err(other) => panic!("beklenmeyen hata: {other}"),
+                }
+            }
+            stop.store(true, Ordering::Relaxed);
+        });
+        assert!(verified.load(Ordering::Relaxed) >= 3000);
+    }
+
+    // ---- SIMD çekirdekleri ---------------------------------------------------
+
+    #[test]
+    fn kernels_match_portable_reference() {
+        println!("çekirdek arka ucu: {}", kernels::backend());
+        let mut rng = Rng::new(42);
+        for trial in 0..400 {
+            let n = match trial {
+                0 => 0,
+                1 => 31,
+                2 => 32,
+                3 => 33,
+                _ => rng.below(700) as usize,
+            };
+            let (mut a, mut b, mut m) = (vec![0u8; n], vec![0u8; n], vec![0u8; n]);
+            rng.fill(&mut a);
+            rng.fill(&mut b);
+            rng.fill(&mut m);
+            for v in m.iter_mut() {
+                // Maskede hem 0 hem sıfırdan farklı (yalnızca 255 değil) değerler bulunsun.
+                *v = if *v < 150 { 0 } else { *v & 0x81 | 1 };
+            }
+            assert_eq!(
+                kernels::sad_u8(&a, &b),
+                kernels::portable::sad_u8(&a, &b),
+                "sad n={n}"
+            );
+
+            let (mut got, mut want) = (vec![0u8; n], vec![0u8; n]);
+            kernels::select_u8(&mut got, &a, &b, &m);
+            kernels::portable::select_u8(&mut want, &a, &b, &m);
+            assert_eq!(got, want, "select n={n}");
+
+            let mut in_place = b.clone();
+            kernels::select_in_place(&mut in_place, &a, &m);
+            assert_eq!(in_place, want, "select_in_place n={n}");
+        }
+        // En kötü durum: 0 ile 255 arasındaki fark taşmadan toplanmalı.
+        let (zeros, full) = (vec![0u8; 1 << 16], vec![255u8; 1 << 16]);
+        assert_eq!(kernels::sad_u8(&zeros, &full), 255 << 16);
+    }
+
+    #[test]
+    fn haar_matches_reference_and_roundtrips_losslessly() {
+        let mut rng = Rng::new(7);
+        for trial in 0..200 {
+            let n = if trial < 4 {
+                [0usize, 15, 16, 17][trial]
+            } else {
+                rng.below(200) as usize
+            };
+            let (mut r0, mut r1) = (vec![0u8; 2 * n], vec![0u8; 2 * n]);
+            rng.fill(&mut r0);
+            rng.fill(&mut r1);
+            if trial % 5 == 0 {
+                // Uç değerler: katsayılar ±510 ve 1020 sınırlarına dayanır.
+                for (i, (a, b)) in r0.iter_mut().zip(r1.iter_mut()).enumerate() {
+                    *a = if i % 2 == 0 { 255 } else { 0 };
+                    *b = if (i / 2) % 2 == 0 { 255 } else { 0 };
+                }
+            }
+            let mut got = [vec![0i16; n], vec![0i16; n], vec![0i16; n], vec![0i16; n]];
+            let mut want = got.clone();
+            {
+                let [ll, hl, lh, hh] = &mut got;
+                kernels::haar_fwd_rows(&r0, &r1, ll, hl, lh, hh);
+                let [ll, hl, lh, hh] = &mut want;
+                kernels::portable::haar_fwd_rows(&r0, &r1, ll, hl, lh, hh);
+            }
+            assert_eq!(got, want, "haar_fwd n={n}");
+
+            let (mut b0, mut b1) = (vec![0u8; 2 * n], vec![0u8; 2 * n]);
+            kernels::haar_inv_rows(&got[0], &got[1], &got[2], &got[3], &mut b0, &mut b1);
+            assert_eq!((b0, b1), (r0, r1), "haar gidiş-dönüş kayıpsız olmalı n={n}");
+        }
+    }
+
+    #[test]
+    fn haar_inverse_matches_reference_on_arbitrary_coefficients() {
+        let mut rng = Rng::new(99);
+        for trial in 0..200 {
+            let n = 16 + rng.below(100) as usize;
+            let mut bands = [vec![0i16; n], vec![0i16; n], vec![0i16; n], vec![0i16; n]];
+            for band in bands.iter_mut() {
+                for v in band.iter_mut() {
+                    *v = match (trial + rng.below(4) as usize) % 4 {
+                        0 => rng.next() as i16, // tüm i16 aralığı (doygunluk)
+                        1 => (rng.below(4096) as i16) - 2048,
+                        2 => [i16::MIN, i16::MAX, -1, 0, 1, 2, 3][rng.below(7) as usize],
+                        _ => (rng.below(1021)) as i16,
+                    };
+                }
+            }
+            let (mut g0, mut g1) = (vec![0u8; 2 * n], vec![0u8; 2 * n]);
+            let (mut w0, mut w1) = (vec![0u8; 2 * n], vec![0u8; 2 * n]);
+            kernels::haar_inv_rows(&bands[0], &bands[1], &bands[2], &bands[3], &mut g0, &mut g1);
+            kernels::portable::haar_inv_rows(
+                &bands[0], &bands[1], &bands[2], &bands[3], &mut w0, &mut w1,
+            );
+            assert_eq!((g0, g1), (w0, w1), "haar_inv n={n}");
+        }
+    }
+
+    #[test]
+    fn haar_bands_plane_roundtrip_and_detail_energy() {
+        let (w, h, stride) = (96usize, 40usize, 100usize);
+        let mut plane = vec![0u8; stride * h];
+        Rng::new(5).fill(&mut plane);
+        let mut bands = HaarBands::new(w, h).unwrap();
+        bands.forward(&plane, stride);
+        assert!(
+            bands.detail_energy() > 50.0,
+            "gürültü yüksek frekans enerjisi taşımalı"
+        );
+        let mut back = vec![0u8; stride * h];
+        bands.inverse(&mut back, stride);
+        for y in 0..h {
+            assert_eq!(
+                &back[y * stride..y * stride + w],
+                &plane[y * stride..y * stride + w]
+            );
+        }
+        let flat = vec![128u8; stride * h];
+        bands.forward(&flat, stride);
+        assert_eq!(bands.detail_energy(), 0.0);
+        assert!(bands.ll.iter().all(|&v| v == 512));
+        assert!(HaarBands::new(95, 40).is_err());
+    }
+
+    // ---- sahne geçişi --------------------------------------------------------
+
+    /// Yumuşak bir doku: sahne kimliğine göre farklı parlaklık ve desen.
+    fn scene_luma(geo: FrameGeometry, scene: u64, shift: usize, noise_seed: u64) -> Vec<u8> {
+        let (w, h) = (geo.width(), geo.height());
+        let mut rng = Rng::new(noise_seed);
+        let mut luma = vec![0u8; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let xx = x + shift;
+                let base = match scene {
+                    0 => 60 + ((xx / 40 + y / 40) % 2) as i32 * 30,
+                    1 => 170 + ((xx / 16) % 3) as i32 * 20 - (y as i32 * 40 / h as i32),
+                    _ => 20 + (y as i32 * 200 / h as i32),
+                };
+                let noise = (rng.next() % 5) as i32 - 2;
+                luma[y * w + x] = (base + noise).clamp(0, 255) as u8;
+            }
+        }
+        luma
+    }
+
+    #[test]
+    fn scene_detector_flags_hard_cuts_only() {
+        let geo = FrameGeometry::new(320, 180).unwrap();
+        let mut det = SceneDetector::new(geo, SceneCutConfig::default());
+        let mut cuts = Vec::new();
+        // 0..19: sahne 0 (yavaş kaydırma), 20..39: sahne 1, 40..59: sahne 2.
+        for i in 0..60u64 {
+            let scene = i / 20;
+            let verdict = det.feed(&scene_luma(geo, scene, (i % 20) as usize, i));
+            if verdict.cut {
+                cuts.push(i);
+            }
+        }
+        assert_eq!(cuts, vec![20, 40]);
+
+        // Aynı sahnede kademeli parlaklık değişimi (fade) sert geçiş sayılmaz.
+        let mut det = SceneDetector::new(geo, SceneCutConfig::default());
+        let base = scene_luma(geo, 0, 0, 1);
+        for step in 0..30u32 {
+            let frame: Vec<u8> = base
+                .iter()
+                .map(|&v| (v as u32 + step * 3).min(255) as u8)
+                .collect();
+            assert!(
+                !det.feed(&frame).cut,
+                "kademeli değişim kesme sayıldı (adım {step})"
+            );
+        }
+    }
+
+    // ---- zamanlayıcı ---------------------------------------------------------
+
+    /// Zamanlayıcıyı kare içeriği olmadan sürer; verilen planları ve çıkışları toplar.
+    fn drive_scheduler(
+        total: u64,
+        cuts: &BTreeSet<u64>,
+        hint_of: &dyn Fn(u64) -> Hint,
+    ) -> (Vec<WindowPlan>, Vec<OutputItem>, Scheduler) {
+        let mut s = Scheduler::new();
+        let (mut plans, mut outputs) = (Vec::new(), Vec::new());
+        loop {
+            match s.poll() {
+                Step::NeedFrames(n) => {
+                    assert!(n >= 1);
+                    if s.pushed() == total {
+                        s.on_eos();
+                        continue;
+                    }
+                    for _ in 0..n {
+                        if s.pushed() == total {
+                            break;
+                        }
+                        let seq = s.on_push(cuts.contains(&s.pushed())).unwrap();
+                        s.set_hint(seq, hint_of(seq)).unwrap();
+                    }
+                }
+                Step::Window(plan) => {
+                    plans.push(plan);
+                    s.complete(plan.id).unwrap();
+                }
+                Step::Output(n) => {
+                    for _ in 0..n {
+                        outputs.push(s.pop_output().unwrap());
+                    }
+                }
+                Step::Finished => return (plans, outputs, s),
+            }
+        }
+    }
+
+    #[test]
+    fn scheduler_steady_state_is_15_plus_15_with_stride_15() {
+        let (plans, outputs, s) = drive_scheduler(75, &BTreeSet::new(), &|_| Hint::Normal);
+        let bases: Vec<i64> = plans.iter().map(|p| p.base_seq).collect();
+        assert_eq!(bases, vec![0, 15, 30, 45, 60]);
+        for (i, plan) in plans.iter().enumerate() {
+            assert_eq!(plan.mode, Mode::B);
+            assert_eq!(plan.slide, 15);
+            assert_eq!(plan.emit, (0, 15));
+            if i < 4 {
+                assert_eq!(plan.valid, (1 << 30) - 1, "tam 30 karelik pencere");
+                assert_eq!(plan.cache, (15, 30));
+            }
+        }
+        assert_ne!(plans[0].flags & PLAN_FLAG_SEGMENT_START, 0);
+        // Son pencere: 60..74 kareleri geçerli, gelecek tarafı dolgu.
+        let last = plans[4];
+        assert_eq!(last.valid, (1 << 15) - 1);
+        assert_eq!(last.cache, (15, 15));
+        assert_ne!(last.flags & PLAN_FLAG_SEGMENT_END, 0);
+
+        assert_eq!(outputs.len(), 75);
+        for (i, item) in outputs.iter().enumerate() {
+            assert_eq!(item.seq, i as u64);
+            let fused = item.flags & OUT_FLAG_FUSED != 0;
+            assert_eq!(
+                fused,
+                i >= 15,
+                "ilk 15 kare dışında her kare iki pencereden harmanlanır"
+            );
+        }
+        assert_eq!(s.stats().windows_b, 5);
+        assert_eq!(s.stats().fused, 60);
+        // Üçgen geçiş: örtüşen iki tahminin öncelikleri (15-k) : (k+1).
+        for k in 0..15 {
+            assert_eq!(plans[1].prior_at(k), (k + 1) as u8);
+            assert_eq!(plans[0].prior_at(15 + k), (15 - k) as u8);
+        }
+    }
+
+    #[test]
+    fn scheduler_pads_short_and_tail_windows() {
+        // 20 kare: [0,20) dolgulu pencere + son 5 kare için [5,20) penceresi.
+        let (plans, outputs, _) = drive_scheduler(20, &BTreeSet::new(), &|_| Hint::Normal);
+        assert_eq!(plans.len(), 2);
+        assert_eq!(
+            (
+                plans[0].base_seq,
+                plans[0].valid_count(),
+                plans[0].emit,
+                plans[0].cache
+            ),
+            (0, 20, (0, 15), (15, 20))
+        );
+        assert_eq!(
+            (plans[1].base_seq, plans[1].slide, plans[1].emit),
+            (5, 5, (10, 15))
+        );
+        assert_eq!(plans[1].valid, (1 << 15) - 1);
+        assert_eq!(outputs.len(), 20);
+
+        // 5 kare: tek pencere, düşük bağlam işaretli.
+        let (plans, outputs, _) = drive_scheduler(5, &BTreeSet::new(), &|_| Hint::Normal);
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].base_seq, -10);
+        assert_eq!(plans[0].valid, 0b11111 << 10);
+        assert_eq!(plans[0].emit, (10, 15));
+        assert_ne!(plans[0].flags & PLAN_FLAG_LOW_CONTEXT, 0);
+        assert!(outputs.iter().all(|o| o.flags & OUT_FLAG_LOW_CONTEXT != 0));
+
+        // Boş akış.
+        let (plans, outputs, _) = drive_scheduler(0, &BTreeSet::new(), &|_| Hint::Normal);
+        assert!(plans.is_empty() && outputs.is_empty());
+    }
+
+    #[test]
+    fn scheduler_windows_never_cross_scene_cuts() {
+        let cuts: BTreeSet<u64> = [37u64, 38, 90].into_iter().collect();
+        let (plans, outputs, s) = drive_scheduler(120, &cuts, &|_| Hint::Normal);
+        let segment = |seq: u64| cuts.iter().filter(|&&c| c <= seq).count();
+        for plan in &plans {
+            let seqs: Vec<u64> = (0..30).filter_map(|p| plan.seq_at(p)).collect();
+            assert!(!seqs.is_empty());
+            assert!(
+                seqs.iter().all(|&q| segment(q) == segment(seqs[0])),
+                "pencere sahne geçişini aştı: {plan:?}"
+            );
+        }
+        assert_eq!(outputs.len(), 120);
+        assert_eq!(s.stats().segments, 3);
+    }
+
+    #[test]
+    fn scheduler_precision_and_bypass_hints() {
+        // 20..22 hassas: önce B(5) ile 15..19, sonra üç Mod A adımı, sonra önbelleğin
+        // kapsadığı 12 kare için B(12).
+        let hint = |seq: u64| {
+            if (20..23).contains(&seq) {
+                Hint::Precision
+            } else {
+                Hint::Normal
+            }
+        };
+        let (plans, outputs, s) = drive_scheduler(60, &BTreeSet::new(), &hint);
+        let summary: Vec<(Mode, u8, i64)> = plans
+            .iter()
+            .take(6)
+            .map(|p| (p.mode, p.slide, p.base_seq))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                (Mode::B, 15, 0),
+                (Mode::B, 5, 5),
+                (Mode::A, 1, 6),
+                (Mode::A, 1, 7),
+                (Mode::A, 1, 8),
+                (Mode::B, 12, 20)
+            ]
+        );
+        for plan in plans.iter().filter(|p| p.mode == Mode::A) {
+            assert_eq!(plan.emit, (14, 15));
+            assert_eq!(plan.past_context(14), 14);
+            assert_eq!(plan.future_context(14), 15);
+        }
+        assert_eq!(s.stats().windows_a, 3);
+        assert_eq!(
+            s.stats().bridges,
+            0,
+            "kırpılmış önbellek köprüye gerek bırakmaz"
+        );
+        for item in &outputs {
+            assert_eq!(
+                item.flags & OUT_FLAG_MODE_A != 0,
+                (20..23).contains(&item.seq)
+            );
+        }
+
+        // 0..39 bypass, 40'tan itibaren altyazı: 40. kare için önce köprü geçişi
+        // çalışır ki altyazıdan önceki temiz kareler bağlam olarak kullanılsın.
+        let hint = |seq: u64| if seq < 40 { Hint::Bypass } else { Hint::Normal };
+        let (plans, outputs, s) = drive_scheduler(100, &BTreeSet::new(), &hint);
+        assert_eq!(plans[0].flags & PLAN_FLAG_BRIDGE, PLAN_FLAG_BRIDGE);
+        assert_eq!(
+            (
+                plans[0].base_seq,
+                plans[0].slide,
+                plans[0].emit,
+                plans[0].cache
+            ),
+            (25, 0, (15, 15), (15, 30))
+        );
+        assert_eq!((plans[1].base_seq, plans[1].slide), (40, 15));
+        assert_eq!(s.stats().bypassed, 40);
+        assert_eq!(s.stats().bridges, 1);
+        for item in &outputs {
+            if item.seq < 40 {
+                assert_eq!(item.source, OutputSource::Original);
+            } else {
+                assert_ne!(
+                    item.flags & OUT_FLAG_FUSED,
+                    0,
+                    "kare {} harmanlanmalı",
+                    item.seq
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn scheduler_rejects_late_or_unknown_hints() {
+        let mut s = Scheduler::new();
+        assert_eq!(s.set_hint(0, Hint::Bypass), Err(CoreError::UnknownFrame));
+        for _ in 0..15 {
+            s.on_push(false).unwrap();
+        }
+        assert_eq!(s.poll(), Step::NeedFrames(15)); // B(15) kararı verildi: 0..14 artık değişmez
+        assert_eq!(s.set_hint(3, Hint::Precision), Err(CoreError::BadState));
+        assert_eq!(s.complete(0), Err(CoreError::BadState));
+        s.on_eos();
+        assert_eq!(s.on_push(false), Err(CoreError::StreamFinished));
+    }
+
+    /// Rastgele akışlar: uzunluk, sahne geçişleri, ipuçları ve itme düzeni rastgele.
+    /// Denetlenen değişmezler:
+    ///  1. Her kare tam bir kez ve sırayla çıkar.
+    ///  2. Halka doluluğu 30'u aşmaz; planlar yalnızca halkadaki kareleri kullanır.
+    ///  3. Pencereler sahne geçişini aşmaz.
+    ///  4. Bağlam güvencesi: onarılan her kare en az min(15|14, sahne başına uzaklık)
+    ///     geçmiş ve min(15, sahne sonuna uzaklık) gelecek kareye erişmiştir.
+    #[test]
+    fn scheduler_random_streams_keep_invariants() {
+        let mut rng = Rng::new(2026);
+        for case in 0..600 {
+            let total = match case % 6 {
+                0 => rng.below(40),
+                1 => 29 + rng.below(4),
+                _ => rng.below(260),
+            };
+            let cut_rate = [0u64, 0, 4, 15, 40][rng.below(5) as usize];
+            let cuts: BTreeSet<u64> = (1..total)
+                .filter(|_| cut_rate != 0 && rng.below(100) < cut_rate / 2 + 1)
+                .collect();
+            let style = rng.below(5);
+            let hints: Vec<Hint> = {
+                let mut v = Vec::with_capacity(total as usize);
+                let mut current = Hint::Normal;
+                for _ in 0..total {
+                    if rng.below(100) < [0u64, 8, 25, 60, 100][style as usize] {
+                        current =
+                            [Hint::Normal, Hint::Precision, Hint::Bypass][rng.below(3) as usize];
+                    }
+                    v.push(current);
+                }
+                v
+            };
+            let seg_start = |seq: u64| cuts.range(..=seq).next_back().copied().unwrap_or(0);
+            let seg_end = |seq: u64| cuts.range(seq + 1..).next().copied().unwrap_or(total);
+
+            let mut s = Scheduler::new();
+            let mut next_out = 0u64;
+            let mut past = vec![0u32; total as usize];
+            let mut future = vec![0u32; total as usize];
+            let mut emit_ctx: HashMap<u64, (u32, u32)> = HashMap::new();
+            let mut cache_ctx: HashMap<u64, (u32, u32)> = HashMap::new();
+            let mut old_cache_ctx: HashMap<u64, (u32, u32)> = HashMap::new();
+            let mut steps = 0u64;
+            loop {
+                steps += 1;
+                assert!(steps < 100_000, "zamanlayıcı ilerlemiyor (durum {case})");
+                match s.poll() {
+                    Step::NeedFrames(n) => {
+                        assert!(n >= 1 && n <= s.capacity_left(), "durum {case}: n={n}");
+                        if s.pushed() == total {
+                            s.on_eos();
+                            continue;
+                        }
+                        for _ in 0..1 + rng.below(n as u64) {
+                            if s.pushed() == total {
+                                break;
+                            }
+                            let seq = s.on_push(cuts.contains(&s.pushed())).unwrap();
+                            s.set_hint(seq, hints[seq as usize]).unwrap();
+                        }
+                    }
+                    Step::Window(plan) => {
+                        let seqs: Vec<u64> = (0..30).filter_map(|p| plan.seq_at(p)).collect();
+                        assert!(!seqs.is_empty());
+                        // Geçerli konumlar kesintisiz bir aralıktır.
+                        assert_eq!(seqs.len() as u64, seqs[seqs.len() - 1] - seqs[0] + 1);
+                        for &q in &seqs {
+                            assert!(
+                                q >= s.retired() && q < s.pushed(),
+                                "durum {case}: plan halkada olmayan kareyi istedi"
+                            );
+                            assert_eq!(
+                                seg_start(q),
+                                seg_start(next_out),
+                                "durum {case}: pencere sahne geçişini aştı"
+                            );
+                        }
+                        emit_ctx.clear();
+                        for p in plan.emit.0..plan.emit.1 {
+                            let seq = plan
+                                .seq_at(p as usize)
+                                .expect("kesinleşen konum geçerli olmalı");
+                            assert_eq!(seq, next_out + (p - plan.emit.0) as u64);
+                            let want = if plan.mode == Mode::A {
+                                Hint::Precision
+                            } else {
+                                Hint::Normal
+                            };
+                            assert_eq!(
+                                hints[seq as usize], want,
+                                "durum {case}: kare {seq} yanlış modda"
+                            );
+                            emit_ctx.insert(
+                                seq,
+                                (
+                                    plan.past_context(p as usize),
+                                    plan.future_context(p as usize),
+                                ),
+                            );
+                        }
+                        let mut new_cache = HashMap::new();
+                        for p in plan.cache.0..plan.cache.1 {
+                            let seq = plan
+                                .seq_at(p as usize)
+                                .expect("önbellek konumu geçerli olmalı");
+                            new_cache.insert(
+                                seq,
+                                (
+                                    plan.past_context(p as usize),
+                                    plan.future_context(p as usize),
+                                ),
+                            );
+                        }
+                        if s.complete(plan.id).unwrap() {
+                            old_cache_ctx = std::mem::replace(&mut cache_ctx, new_cache);
+                        }
+                    }
+                    Step::Output(n) => {
+                        for _ in 0..n {
+                            let item = s.pop_output().unwrap();
+                            assert_eq!(item.seq, next_out, "durum {case}: sıra bozuldu");
+                            let i = item.seq as usize;
+                            match item.source {
+                                OutputSource::Original => assert_eq!(hints[i], Hint::Bypass),
+                                OutputSource::Estimate { fuse_index, .. } => {
+                                    let (p, f) = emit_ctx[&item.seq];
+                                    past[i] = p;
+                                    future[i] = f;
+                                    if fuse_index.is_some() {
+                                        let (cp, cf) = old_cache_ctx[&item.seq];
+                                        past[i] = past[i].max(cp);
+                                        future[i] = future[i].max(cf);
+                                    }
+                                }
+                            }
+                            next_out += 1;
+                        }
+                    }
+                    Step::Finished => break,
+                }
+                assert!(s.pushed() - s.retired() <= 30, "durum {case}: halka taştı");
+            }
+            assert_eq!(next_out, total, "durum {case}: her kare çıkmalı");
+            for seq in 0..total {
+                let i = seq as usize;
+                if hints[i] == Hint::Bypass {
+                    continue;
+                }
+                let reach = if hints[i] == Hint::Precision { 14 } else { 15 };
+                let need_past = (seq - seg_start(seq)).min(reach) as u32;
+                let need_future = (seg_end(seq) - 1 - seq).min(15) as u32;
+                assert!(
+                    past[i] >= need_past,
+                    "durum {case}: kare {seq} geçmiş {} < {need_past}",
+                    past[i]
+                );
+                assert!(
+                    future[i] >= need_future,
+                    "durum {case}: kare {seq} gelecek {} < {need_future}",
+                    future[i]
+                );
+            }
+        }
+    }
+
+    // ---- hat -----------------------------------------------------------------
+
+    fn run_pipeline<R: Restorer>(
+        geo: FrameGeometry,
+        total: u64,
+        restorer: &mut R,
+        setup: impl FnOnce(&mut Pipeline),
+    ) -> (Vec<(OutputMeta, Vec<u8>)>, PipelineStats) {
+        let mut pipe = Pipeline::new(geo).unwrap();
+        pipe.set_auto_scene_cut(false);
+        pipe.set_integrity_check(true);
+        setup(&mut pipe);
+        let mut produced = 0u64;
+        let mut outputs = Vec::new();
+        pipe.run(
+            |dst| {
+                if produced == total {
+                    return None;
+                }
+                dst.copy_from_slice(&frame_content(geo, produced));
+                produced += 1;
+                Some(((produced - 1) as i64 * 16_667 + 5, 0))
+            },
+            restorer,
+            |frame, meta| outputs.push((*meta, frame.to_vec())),
+        )
+        .unwrap();
+        (outputs, pipe.stats())
+    }
+
+    #[test]
+    fn pipeline_identity_is_bit_exact_ordered_and_keeps_pts() {
+        let geo = small();
+        for total in [0u64, 1, 14, 15, 16, 29, 30, 31, 44, 45, 46, 100, 181] {
+            let (outputs, stats) = run_pipeline(geo, total, &mut IdentityRestorer, |_| {});
+            assert_eq!(outputs.len() as u64, total);
+            for (i, (meta, frame)) in outputs.iter().enumerate() {
+                assert_eq!(meta.seq, i as u64);
+                assert_eq!(meta.pts_us, i as i64 * 16_667 + 5);
+                assert_eq!(meta.modified_pixels, 0);
+                assert_eq!(
+                    frame,
+                    &frame_content(geo, i as u64),
+                    "kare {i} (toplam {total}) bit düzeyinde aynı olmalı"
+                );
+            }
+            assert_eq!((stats.frames_in, stats.frames_out), (total, total));
+            assert_eq!(stats.order_violations + stats.preservation_violations, 0);
+            assert!(stats.max_occupancy <= 30);
+        }
+    }
+
+    /// Her konum için sabit bir bölgeyi konuma bağlı renkle boyar.
+    struct PaintRestorer {
+        roi: Rect,
+        weight: fn(usize) -> u8,
+    }
+
+    impl PaintRestorer {
+        fn value(pos: usize) -> (u8, u8, u8) {
+            (100 + pos as u8, 40 + pos as u8, 220 - pos as u8)
+        }
+    }
+
+    impl Restorer for PaintRestorer {
+        fn restore(&mut self, io: &mut WindowIo<'_>) -> Result<(), CoreError> {
+            for pos in 0..WINDOW_FRAMES {
+                let valid = io.plan().is_valid(pos);
+                if let Some(est) = io.estimate_mut(pos) {
+                    assert!(valid, "dolgu konumu için tahmin istenmemeli");
+                    let (y, u, v) = Self::value(pos);
+                    est.paint(self.roi, y, u, v, (self.weight)(pos))?;
+                }
+            }
+            Ok(())
+        }
+    }
+
+    fn blend(a: u8, wa: u32, b: u8, wb: u32) -> u8 {
+        ((a as u32 * wa + b as u32 * wb + (wa + wb) / 2) / (wa + wb)) as u8
+    }
+
+    #[test]
+    fn pipeline_fuses_overlap_with_triangular_weights_and_preserves_unmasked() {
+        let geo = small();
+        // 48 piksel genişlik: her satırda 32 baytlık bir assembly bloğu + 16 baytlık kuyruk.
+        let roi = Rect::new(8, 4, 48, 8);
+        let total = 75u64;
+        for weight in [(|_| 255u8) as fn(usize) -> u8, |pos| 40 + 7 * pos as u8] {
+            let mut restorer = PaintRestorer { roi, weight };
+            let (outputs, stats) = run_pipeline(geo, total, &mut restorer, |_| {});
+            assert_eq!(outputs.len() as u64, total);
+            assert_eq!(stats.preservation_violations, 0);
+            assert_eq!(stats.modified_pixels, total * (roi.w * roi.h) as u64);
+            for (meta, frame) in &outputs {
+                let original = frame_content(geo, meta.seq);
+                let k = (meta.seq % 15) as usize;
+                // Öncelik = 1 + min(geçerli geçmiş, geçerli gelecek). Tam pencerelerde bu,
+                // (konum k → k+1) ile (konum 15+k → 15-k) arasında üçgen geçiş verir; akışın
+                // sonundaki dolgulu pencerede gelecek kısaldığı için öncelik de küçülür.
+                let prior = |window_base: u64, pos: u64| -> u32 {
+                    let last = (total - 1 - window_base).min(29);
+                    1 + pos.min(last - pos).min(14) as u32
+                };
+                let base = meta.seq - k as u64;
+                // İlk 15 kare tek tahminden; sonrakiler bu pencerenin (konum k) ve önceki
+                // pencerenin (konum 15+k) tahminlerinden harmanlanır.
+                let expect = |plane: usize| -> u8 {
+                    let cur = [
+                        PaintRestorer::value(k).0,
+                        PaintRestorer::value(k).1,
+                        PaintRestorer::value(k).2,
+                    ][plane];
+                    if meta.seq < 15 {
+                        return cur;
+                    }
+                    let old = PaintRestorer::value(15 + k);
+                    let old = [old.0, old.1, old.2][plane];
+                    // Y pikseli başına ağırlık w; UV bloğu başına 4w — oran aynıdır.
+                    blend(
+                        cur,
+                        prior(base, k as u64) * weight(k) as u32,
+                        old,
+                        prior(base - 15, 15 + k as u64) * weight(15 + k) as u32,
+                    )
+                };
+                for y in 0..geo.height() {
+                    for x in 0..geo.width() {
+                        let i = y * geo.width() + x;
+                        let inside =
+                            x >= roi.x && x < roi.x + roi.w && y >= roi.y && y < roi.y + roi.h;
+                        let want = if inside { expect(0) } else { original[i] };
+                        assert_eq!(frame[i], want, "Y kare {} ({x},{y})", meta.seq);
+                    }
+                }
+                for cy in 0..geo.height() / 2 {
+                    for cx in 0..geo.width() / 2 {
+                        let i = geo.luma_bytes() + cy * geo.width() + 2 * cx;
+                        let inside = 2 * cx >= roi.x
+                            && 2 * cx < roi.x + roi.w
+                            && 2 * cy >= roi.y
+                            && 2 * cy < roi.y + roi.h;
+                        let want = if inside {
+                            (expect(1), expect(2))
+                        } else {
+                            (original[i], original[i + 1])
+                        };
+                        assert_eq!(
+                            (frame[i], frame[i + 1]),
+                            want,
+                            "UV kare {} ({cx},{cy})",
+                            meta.seq
+                        );
+                    }
+                }
+                assert_eq!(meta.flags & OUT_FLAG_FUSED != 0, meta.seq >= 15);
+            }
+        }
+    }
+
+    #[test]
+    fn pipeline_mode_a_bypass_and_odd_masks() {
+        let geo = small();
+        // Tek sayılı sınırlı ROI çift sınırlara genişler: (9,5,3,3) → (8,4,4,4).
+        struct OddMask;
+        impl Restorer for OddMask {
+            fn restore(&mut self, io: &mut WindowIo<'_>) -> Result<(), CoreError> {
+                for pos in 0..WINDOW_FRAMES {
+                    if let Some(est) = io.estimate_mut(pos) {
+                        let r = est.begin(Rect::new(9, 5, 3, 3))?;
+                        assert_eq!(r, Rect::new(8, 4, 4, 4));
+                        // Yalnızca tek bir piksel maskeli: (9,5).
+                        for row in r.y..r.y + r.h {
+                            let (ys, ws) = est.luma_rows_mut(row);
+                            ys.fill(200);
+                            ws.fill(0);
+                            if row == 5 {
+                                ws[1] = 255;
+                            }
+                        }
+                        for cy in r.y / 2..(r.y + r.h) / 2 {
+                            est.uv_row_mut(cy).fill(77);
+                        }
+                    }
+                }
+                Ok(())
+            }
+        }
+        let hints = |seq: u64| match seq {
+            20..=24 => Hint::Precision,
+            50..=69 => Hint::Bypass,
+            _ => Hint::Normal,
+        };
+        let total = 90u64;
+        let mut pipe = Pipeline::new(geo).unwrap();
+        pipe.set_auto_scene_cut(false);
+        pipe.set_integrity_check(true);
+        let mut outputs = Vec::new();
+        let mut out = vec![0u8; geo.frame_bytes()];
+        let mut produced = 0u64;
+        loop {
+            match pipe.poll() {
+                Step::NeedFrames(n) => {
+                    for _ in 0..n {
+                        if produced == total {
+                            pipe.finish();
+                            break;
+                        }
+                        let meta = pipe
+                            .push_frame(&frame_content(geo, produced), produced as i64 * 1000, 0)
+                            .unwrap();
+                        pipe.set_hint(meta.seq, hints(meta.seq)).unwrap();
+                        produced += 1;
+                    }
+                }
+                Step::Window(plan) => {
+                    let mut io = pipe.window_io().unwrap();
+                    if plan.mode == Mode::A {
+                        assert!(io.frame(MODE_A_TARGET).is_some());
+                        assert!(io.estimate_mut(0).is_none() && io.estimate_mut(15).is_none());
+                    }
+                    OddMask.restore(&mut io).unwrap();
+                    pipe.complete_window().unwrap();
+                }
+                Step::Output(_) => {
+                    while let Some(meta) = pipe.pop_output(&mut out).unwrap() {
+                        outputs.push((meta, out.clone()));
+                    }
+                }
+                Step::Finished => break,
+            }
+        }
+        let stats = pipe.stats();
+        assert_eq!(outputs.len() as u64, total);
+        assert_eq!(stats.preservation_violations, 0);
+        assert_eq!((stats.sched.windows_a, stats.sched.bypassed), (5, 20));
+        for (meta, frame) in &outputs {
+            let original = frame_content(geo, meta.seq);
+            let w = geo.width();
+            let bypass = (50..70).contains(&meta.seq);
+            assert_eq!(meta.flags & OUT_FLAG_BYPASS != 0, bypass);
+            assert_eq!(
+                meta.flags & OUT_FLAG_MODE_A != 0,
+                (20..25).contains(&meta.seq)
+            );
+            assert_eq!(meta.modified_pixels, if bypass { 0 } else { 1 });
+            let mut expected = original.clone();
+            if !bypass {
+                expected[5 * w + 9] = 200; // tek maskeli Y pikseli
+                let uv = geo.luma_bytes() + 2 * w + 8; // onu içeren 2×2 bloğun rengi
+                expected[uv] = 77;
+                expected[uv + 1] = 77;
+            }
+            assert_eq!(frame, &expected, "kare {}", meta.seq);
+        }
+    }
+
+    #[test]
+    fn pipeline_detects_scene_cut_and_reports_errors() {
+        let geo = FrameGeometry::new(320, 180).unwrap();
+        let mut pipe = Pipeline::new(geo).unwrap();
+        let mut frame = vec![128u8; geo.frame_bytes()];
+        let mut out = vec![0u8; geo.frame_bytes()];
+        assert_eq!(pipe.pop_output(&mut out), Ok(None));
+        assert_eq!(pipe.window_io().err(), Some(CoreError::BadState));
+        assert_eq!(pipe.complete_window(), Err(CoreError::BadState));
+        assert_eq!(
+            pipe.push_frame(&frame[..10], 0, 0).err(),
+            Some(CoreError::BufferTooSmall)
+        );
+
+        let mut starts = Vec::new();
+        let mut pushed = 0u64;
+        loop {
+            match pipe.poll() {
+                Step::NeedFrames(n) => {
+                    for _ in 0..n {
+                        if pushed == 50 {
+                            pipe.finish();
+                            break;
+                        }
+                        frame[..geo.luma_bytes()].copy_from_slice(&scene_luma(
+                            geo,
+                            pushed / 25,
+                            (pushed % 25) as usize,
+                            pushed,
+                        ));
+                        pipe.push_frame(&frame, pushed as i64, 0).unwrap();
+                        pushed += 1;
+                    }
+                }
+                Step::Window(plan) => {
+                    let first = plan.seq_at(plan.valid.trailing_zeros() as usize).unwrap();
+                    let last = plan
+                        .seq_at(31 - plan.valid.leading_zeros() as usize)
+                        .unwrap();
+                    assert_eq!(
+                        first / 25,
+                        last / 25,
+                        "pencere algılanan sahne geçişini aşmamalı"
+                    );
+                    pipe.complete_window().unwrap();
+                }
+                Step::Output(_) => {
+                    while let Some(meta) = pipe.pop_output(&mut out).unwrap() {
+                        if meta.flags & OUT_FLAG_SCENE_START != 0 {
+                            starts.push(meta.seq);
+                        }
+                    }
+                }
+                Step::Finished => break,
+            }
+        }
+        assert_eq!(starts, vec![0, 25]);
+        assert_eq!(pipe.stats().scene_cuts, 1);
+        assert_eq!(
+            pipe.push_frame(&frame, 1_000_000, 0).err(),
+            Some(CoreError::StreamFinished)
+        );
+    }
+
+    #[test]
+    fn pipeline_preserves_variable_frame_timing() {
+        // Değişken kare hızı: düzensiz aralıklar, negatif başlangıç ve çok büyük damgalar.
+        // Çekirdek damgaları yorumlamaz; yalnızca kesin artan olmalarını ister ve aynen taşır.
+        let geo = small();
+        let mut rng = Rng::new(77);
+        let mut pts = Vec::new();
+        let mut t = -5_000_000i64;
+        for i in 0..97u64 {
+            t += match i % 7 {
+                0 => 1,             // art arda en küçük adım
+                1 => 41_708,        // 23,976 kare/sn
+                2 => 16_667,        // 60 kare/sn
+                3 => 3_600_000_000, // bir saatlik boşluk
+                _ => 1 + rng.below(100_000) as i64,
+            };
+            pts.push(t);
+        }
+        let mut pipe = Pipeline::new(geo).unwrap();
+        pipe.set_auto_scene_cut(false);
+        let mut produced = 0usize;
+        let mut seen = Vec::new();
+        pipe.run(
+            |dst| {
+                let i = produced;
+                if i == pts.len() {
+                    return None;
+                }
+                dst.copy_from_slice(&frame_content(geo, i as u64));
+                produced += 1;
+                Some((pts[i], 0))
+            },
+            &mut IdentityRestorer,
+            |frame, meta| {
+                assert_eq!(frame, &frame_content(geo, meta.seq)[..]);
+                seen.push(meta.pts_us);
+            },
+        )
+        .unwrap();
+        assert_eq!(seen, pts, "zaman damgaları sırasıyla ve değişmeden çıkmalı");
+
+        // Geri giden veya yinelenen damga kareyi reddeder, akışı bozmaz.
+        let mut pipe = Pipeline::new(geo).unwrap();
+        let frame = frame_content(geo, 0);
+        pipe.push_frame(&frame, 1000, 0).unwrap();
+        assert_eq!(
+            pipe.push_frame(&frame, 1000, 0).err(),
+            Some(CoreError::NonMonotonicPts)
+        );
+        assert_eq!(
+            pipe.push_frame(&frame, 999, 0).err(),
+            Some(CoreError::NonMonotonicPts)
+        );
+        assert_eq!(pipe.push_frame(&frame, 1001, 0).unwrap().seq, 1);
+        assert_eq!(pipe.stats().frames_in, 2);
+    }
+
+    #[test]
+    fn estimate_roi_is_clipped_validated_and_cleared() {
+        let geo = small(); // 64×48
+        let mut est = Estimate::new(geo);
+        // Kare dışı veya boş bölge reddedilir.
+        assert_eq!(
+            est.begin(Rect::new(64, 0, 4, 4)).err(),
+            Some(CoreError::BadArgument)
+        );
+        assert_eq!(
+            est.begin(Rect::new(0, 48, 4, 4)).err(),
+            Some(CoreError::BadArgument)
+        );
+        assert_eq!(
+            est.begin(Rect::new(10, 10, 0, 4)).err(),
+            Some(CoreError::BadArgument)
+        );
+        assert!(est.roi().is_empty());
+        // Kareden taşan bölge kırpılır; tek sınırlar çifte genişler.
+        assert_eq!(
+            est.begin(Rect::new(59, 43, 100, 100)).unwrap(),
+            Rect::new(58, 42, 6, 6)
+        );
+        assert_eq!(
+            est.begin(Rect::new(0, 0, usize::MAX, usize::MAX)).unwrap(),
+            Rect::new(0, 0, 64, 48)
+        );
+        // Yeni bölgeye geçince eski bölgenin ağırlıkları sıfırlanır (bayat maske kalmaz).
+        est.paint(Rect::new(0, 0, 64, 48), 9, 9, 9, 255).unwrap();
+        est.paint(Rect::new(8, 8, 4, 4), 1, 2, 3, 200).unwrap();
+        let mut frame = frame_content(geo, 5);
+        let original = frame.clone();
+        assert_eq!(compose(geo, &mut frame, &est, None), 16);
+        assert_eq!(verify_preservation(geo, &original, &frame, &est, None), 0);
+        let changed = (0..geo.luma_bytes())
+            .filter(|&i| frame[i] != original[i])
+            .count();
+        assert!(
+            changed <= 16,
+            "yalnızca 4×4 bölge değişebilir, değişen: {changed}"
+        );
+        // Kapı denetimi bozulmayı gerçekten yakalıyor: maske dışı tek bir bayt değişirse sayılır.
+        frame[0] ^= 0xFF;
+        *frame.last_mut().unwrap() ^= 0xFF;
+        assert_eq!(verify_preservation(geo, &original, &frame, &est, None), 2);
+        est.clear();
+        let mut untouched = original.clone();
+        assert_eq!(compose(geo, &mut untouched, &est, None), 0);
+        assert_eq!(untouched, original);
+    }
+
+    #[test]
+    #[should_panic(expected = "satır ROI dışında")]
+    fn estimate_rejects_writes_outside_roi() {
+        let mut est = Estimate::new(small());
+        est.begin(Rect::new(8, 8, 4, 4)).unwrap();
+        let _ = est.luma_rows_mut(12);
+    }
+
+    // ---- düzlem dönüşümleri --------------------------------------------------
+
+    #[test]
+    fn yuv_planes_pack_and_unpack_for_i420_nv12_nv21() {
+        let geo = FrameGeometry::new(32, 16).unwrap();
+        let (w, h) = (geo.width(), geo.height());
+        let nv12 = frame_content(geo, 3);
+        let (y_stride, uv_stride) = (40usize, 44usize);
+        let mut y_buf = vec![0xEEu8; y_stride * h];
+        for row in 0..h {
+            y_buf[row * y_stride..row * y_stride + w]
+                .copy_from_slice(&nv12[row * w..(row + 1) * w]);
+        }
+        let y_plane = |buf: &mut Vec<u8>| RawPlane {
+            ptr: buf.as_mut_ptr(),
+            len: buf.len(),
+            row_stride: y_stride,
+            pixel_stride: 1,
+        };
+        let uv_src = &nv12[geo.luma_bytes()..];
+
+        // I420: ayrı U ve V düzlemleri, piksel adımı 1.
+        let (mut u_buf, mut v_buf) = (vec![0u8; uv_stride * h / 2], vec![0u8; uv_stride * h / 2]);
+        for cy in 0..h / 2 {
+            for cx in 0..w / 2 {
+                u_buf[cy * uv_stride + cx] = uv_src[cy * w + 2 * cx];
+                v_buf[cy * uv_stride + cx] = uv_src[cy * w + 2 * cx + 1];
+            }
+        }
+        let planar = |b: &mut Vec<u8>| RawPlane {
+            ptr: b.as_mut_ptr(),
+            len: b.len(),
+            row_stride: uv_stride,
+            pixel_stride: 1,
+        };
+        let mut packed = vec![0u8; geo.frame_bytes()];
+        unsafe {
+            pack_nv12(
+                geo,
+                y_plane(&mut y_buf),
+                planar(&mut u_buf),
+                planar(&mut v_buf),
+                &mut packed,
+            )
+            .unwrap()
+        };
+        assert_eq!(packed, nv12);
+        let (mut y2, mut u2, mut v2) = (
+            vec![0u8; y_stride * h],
+            vec![0u8; uv_stride * h / 2],
+            vec![0u8; uv_stride * h / 2],
+        );
+        unsafe {
+            unpack_nv12(
+                geo,
+                &nv12,
+                y_plane(&mut y2),
+                planar(&mut u2),
+                planar(&mut v2),
+            )
+            .unwrap()
+        };
+        let mut again = vec![0u8; geo.frame_bytes()];
+        unsafe {
+            pack_nv12(
+                geo,
+                y_plane(&mut y2),
+                planar(&mut u2),
+                planar(&mut v2),
+                &mut again,
+            )
+            .unwrap()
+        };
+        assert_eq!(again, nv12);
+
+        // Yarı düzlemsel (piksel adımı 2): U ve V aynı belleğin 1 bayt kaydırılmış görünümleri.
+        // MediaCodec'te olduğu gibi her düzlem son örneğinde biter (uzunluk = adım*(satır-1) + w - 1).
+        for swap in [false, true] {
+            let len = uv_stride * (h / 2 - 1) + w;
+            let mut inter = vec![0u8; len];
+            for cy in 0..h / 2 {
+                for cx in 0..w / 2 {
+                    let (u, v) = (uv_src[cy * w + 2 * cx], uv_src[cy * w + 2 * cx + 1]);
+                    inter[cy * uv_stride + 2 * cx] = if swap { v } else { u };
+                    inter[cy * uv_stride + 2 * cx + 1] = if swap { u } else { v };
+                }
+            }
+            let views = |b: &mut Vec<u8>| {
+                let first = RawPlane {
+                    ptr: b.as_mut_ptr(),
+                    len: len - 1,
+                    row_stride: uv_stride,
+                    pixel_stride: 2,
+                };
+                let second = RawPlane {
+                    ptr: unsafe { b.as_mut_ptr().add(1) },
+                    len: len - 1,
+                    row_stride: uv_stride,
+                    pixel_stride: 2,
+                };
+                if swap {
+                    (second, first)
+                } else {
+                    (first, second)
+                }
+            };
+            let (u, v) = views(&mut inter);
+            let mut packed = vec![0u8; geo.frame_bytes()];
+            unsafe { pack_nv12(geo, y_plane(&mut y_buf), u, v, &mut packed).unwrap() };
+            assert_eq!(packed, nv12, "paketleme (swap={swap})");
+            let mut target = vec![0u8; len];
+            let (u, v) = views(&mut target);
+            unsafe { unpack_nv12(geo, &nv12, y_plane(&mut y2), u, v).unwrap() };
+            assert_eq!(target, inter, "açma (swap={swap})");
+        }
+
+        // 10 bit (P010 yerleşimi): örnekler 16 bit küçük-endian, değer üst 10 bitte. Ofset +1 ve
+        // piksel adımı 2 (Y) / 4 (UV) ile üst baytlar okunur → 8 bit NV12.
+        let mut y16 = vec![0u8; 2 * y_stride * h];
+        for row in 0..h {
+            for x in 0..w {
+                y16[2 * (row * y_stride + x)] = 0xC0; // alt 2 bit: atılacak
+                y16[2 * (row * y_stride + x) + 1] = nv12[row * w + x];
+            }
+        }
+        let mut uv16 = vec![0u8; 2 * w * (h / 2)];
+        for i in 0..w * (h / 2) {
+            uv16[2 * i] = 0x40;
+            uv16[2 * i + 1] = uv_src[i];
+        }
+        let y_hi = RawPlane {
+            ptr: unsafe { y16.as_mut_ptr().add(1) },
+            len: y16.len() - 1,
+            row_stride: 2 * y_stride,
+            pixel_stride: 2,
+        };
+        let u_hi = RawPlane {
+            ptr: unsafe { uv16.as_mut_ptr().add(1) },
+            len: uv16.len() - 1,
+            row_stride: 2 * w,
+            pixel_stride: 4,
+        };
+        let v_hi = RawPlane {
+            ptr: unsafe { uv16.as_mut_ptr().add(3) },
+            len: uv16.len() - 3,
+            row_stride: 2 * w,
+            pixel_stride: 4,
+        };
+        let mut packed = vec![0u8; geo.frame_bytes()];
+        unsafe { pack_nv12(geo, y_hi, u_hi, v_hi, &mut packed).unwrap() };
+        assert_eq!(packed, nv12, "P010 üst bayt paketleme");
+        // Çıkış (kodlayıcı) tarafında Y adımı 1 olmak zorundadır.
+        let result = unsafe { unpack_nv12(geo, &nv12, y_hi, u_hi, v_hi) };
+        assert_eq!(result, Err(CoreError::BufferTooSmall));
+
+        // Çok kısa düzlem reddedilir.
+        let short = RawPlane {
+            ptr: u_buf.as_mut_ptr(),
+            len: 10,
+            row_stride: uv_stride,
+            pixel_stride: 1,
+        };
+        let result = unsafe {
+            pack_nv12(
+                geo,
+                y_plane(&mut y_buf),
+                short,
+                planar(&mut v_buf),
+                &mut packed,
+            )
+        };
+        assert_eq!(result, Err(CoreError::BufferTooSmall));
+    }
+
+    // ---- JNI yüzeyi (sahte JNIEnv ile) ---------------------------------------
+
+    /// Testte "doğrudan ByteBuffer" yerine geçen nesne.
+    #[repr(C)]
+    struct FakeBuffer {
+        ptr: *mut u8,
+        cap: i64,
+    }
+
+    unsafe extern "system" fn fake_address(_env: *mut JniEnv, buf: JObject) -> *mut c_void {
+        unsafe { (*(buf as *const FakeBuffer)).ptr as *mut c_void }
+    }
+
+    unsafe extern "system" fn fake_capacity(_env: *mut JniEnv, buf: JObject) -> i64 {
+        unsafe { (*(buf as *const FakeBuffer)).cap }
+    }
+
+    struct FakeEnv {
+        _table: Box<[*const c_void; 232]>,
+        env: Box<JniEnv>,
+    }
+
+    impl FakeEnv {
+        fn new() -> Self {
+            let mut table = Box::new([std::ptr::null::<c_void>(); 232]);
+            table[230] = fake_address as *const c_void;
+            table[231] = fake_capacity as *const c_void;
+            let env = Box::new(table.as_ptr() as JniEnv);
+            Self { _table: table, env }
+        }
+        fn ptr(&mut self) -> *mut JniEnv {
+            &mut *self.env
+        }
+    }
+
+    fn fake(buf: &mut [u8]) -> FakeBuffer {
+        FakeBuffer {
+            ptr: buf.as_mut_ptr(),
+            cap: buf.len() as i64,
+        }
+    }
+
+    fn obj(b: &mut FakeBuffer) -> JObject {
+        b as *mut FakeBuffer as JObject
+    }
+
+    fn read_i32(buf: &[u8], at: usize) -> i32 {
+        i32::from_ne_bytes(buf[at..at + 4].try_into().unwrap())
+    }
+
+    fn read_i64(buf: &[u8], at: usize) -> i64 {
+        i64::from_ne_bytes(buf[at..at + 8].try_into().unwrap())
+    }
+
+    #[test]
+    fn jni_surface_roundtrip_with_fake_env() {
+        let mut fake_env = FakeEnv::new();
+        let env = fake_env.ptr();
+        let null = std::ptr::null_mut();
+        let geo = small();
+        let (w, h) = (geo.width(), geo.height());
+        let total = 47u64;
+
+        assert_eq!(
+            Java_com_videocleaner_engine_NativeCore_nativeAbiVersion(env, null),
+            ABI_VERSION
+        );
+        assert_eq!(
+            Java_com_videocleaner_engine_NativeCore_nativePageSize(env, null) as usize,
+            page_size()
+        );
+        assert_eq!(
+            Java_com_videocleaner_engine_NativeCore_nativeCreate(env, null, 63, 48),
+            CoreError::InvalidGeometry.code() as i64
+        );
+        let handle =
+            Java_com_videocleaner_engine_NativeCore_nativeCreate(env, null, w as i32, h as i32);
+        assert!(handle > 0);
+        assert_eq!(
+            Java_com_videocleaner_engine_NativeCore_nativeSetOption(env, null, handle, 1, 0),
+            0
+        );
+        assert_eq!(
+            Java_com_videocleaner_engine_NativeCore_nativeSetOption(env, null, handle, 2, 1),
+            0
+        );
+        assert_eq!(
+            Java_com_videocleaner_engine_NativeCore_nativeSetOption(env, null, handle, 9, 1),
+            CoreError::BadArgument.code()
+        );
+        assert_eq!(
+            Java_com_videocleaner_engine_NativeCore_nativeFinish(env, null, 0),
+            CoreError::InvalidHandle.code()
+        );
+
+        let mut info = vec![0u8; POLL_INFO_BYTES];
+        let mut meta = vec![0u8; OUTPUT_META_BYTES];
+        let mut small_info = vec![0u8; 8];
+        let code = unsafe {
+            Java_com_videocleaner_engine_NativeCore_nativePoll(
+                env,
+                null,
+                handle,
+                obj(&mut fake(&mut small_info)),
+            )
+        };
+        assert_eq!(code, CoreError::BufferTooSmall.code());
+        // Null tampon (Kotlin tarafında yanlış tür / null aktarımı) çökme yerine hata kodu döndürür.
+        let code =
+            unsafe { Java_com_videocleaner_engine_NativeCore_nativePoll(env, null, handle, null) };
+        assert_eq!(code, CoreError::BadArgument.code());
+        let mut scratch = vec![0u8; geo.frame_bytes()];
+        let code = unsafe {
+            Java_com_videocleaner_engine_NativeCore_nativePushYuv420(
+                env,
+                null,
+                handle,
+                obj(&mut fake(&mut scratch)),
+                0,
+                w as i32,
+                1,
+                null,
+                0,
+                null,
+                0,
+                (w / 2) as i32,
+                1,
+                0,
+                0,
+            )
+        };
+        assert_eq!(code, CoreError::BadArgument.code() as i64);
+        // Negatif ofset, sıfır adım ve tampondan büyük ofset de reddedilir.
+        for (offset, stride) in [(-1, w as i32), (0, 0), (i32::MAX, w as i32)] {
+            let code = unsafe {
+                Java_com_videocleaner_engine_NativeCore_nativePushYuv420(
+                    env,
+                    null,
+                    handle,
+                    obj(&mut fake(&mut scratch)),
+                    offset,
+                    stride,
+                    1,
+                    obj(&mut fake(&mut scratch)),
+                    0,
+                    obj(&mut fake(&mut scratch)),
+                    0,
+                    (w / 2) as i32,
+                    1,
+                    0,
+                    0,
+                )
+            };
+            assert_eq!(
+                code,
+                CoreError::BadArgument.code() as i64,
+                "ofset {offset}, adım {stride}"
+            );
+        }
+        // Çok küçük düzlem: kare eklenmez.
+        let mut tiny = vec![0u8; 16];
+        let code = unsafe {
+            Java_com_videocleaner_engine_NativeCore_nativePushYuv420(
+                env,
+                null,
+                handle,
+                obj(&mut fake(&mut scratch)),
+                0,
+                w as i32,
+                1,
+                obj(&mut fake(&mut tiny)),
+                0,
+                obj(&mut fake(&mut tiny)),
+                0,
+                (w / 2) as i32,
+                1,
+                0,
+                0,
+            )
+        };
+        assert_eq!(code, CoreError::BufferTooSmall.code() as i64);
+
+        // Giriş: I420 düzlemleri (satır adımı genişlikten büyük). Çıkış: NV12 görünümlü düzlemler.
+        let (ys, cs) = (w + 8, w / 2 + 4);
+        let (mut y_in, mut u_in, mut v_in) = (
+            vec![0u8; ys * h],
+            vec![0u8; cs * h / 2],
+            vec![0u8; cs * h / 2],
+        );
+        let mut y_out = vec![0u8; ys * h];
+        let mut uv_out = vec![0u8; w * h / 2];
+        let mut roi_y = vec![150u8; 8 * 4];
+        let mut roi_uv = vec![90u8; 8 * 2];
+        let mut roi_w = vec![255u8; 8 * 4];
+        let mut window_frame = vec![0u8; geo.frame_bytes()];
+        let (mut pushed, mut popped) = (0u64, 0u64);
+        let mut windows = 0;
+        loop {
+            let step = unsafe {
+                Java_com_videocleaner_engine_NativeCore_nativePoll(
+                    env,
+                    null,
+                    handle,
+                    obj(&mut fake(&mut info)),
+                )
+            };
+            assert_eq!(step, read_i32(&info, 0));
+            match step {
+                STEP_NEED_FRAMES => {
+                    for _ in 0..read_i32(&info, 4) {
+                        if pushed == total {
+                            assert_eq!(
+                                Java_com_videocleaner_engine_NativeCore_nativeFinish(
+                                    env, null, handle
+                                ),
+                                0
+                            );
+                            break;
+                        }
+                        let nv12 = frame_content(geo, pushed);
+                        for row in 0..h {
+                            y_in[row * ys..row * ys + w]
+                                .copy_from_slice(&nv12[row * w..(row + 1) * w]);
+                        }
+                        for cy in 0..h / 2 {
+                            for cx in 0..w / 2 {
+                                u_in[cy * cs + cx] = nv12[geo.luma_bytes() + cy * w + 2 * cx];
+                                v_in[cy * cs + cx] = nv12[geo.luma_bytes() + cy * w + 2 * cx + 1];
+                            }
+                        }
+                        let seq = unsafe {
+                            Java_com_videocleaner_engine_NativeCore_nativePushYuv420(
+                                env,
+                                null,
+                                handle,
+                                obj(&mut fake(&mut y_in)),
+                                0,
+                                ys as i32,
+                                1,
+                                obj(&mut fake(&mut u_in)),
+                                0,
+                                obj(&mut fake(&mut v_in)),
+                                0,
+                                cs as i32,
+                                1,
+                                pushed as i64 * 33_333,
+                                0,
+                            )
+                        };
+                        assert_eq!(seq, pushed as i64);
+                        pushed += 1;
+                    }
+                }
+                STEP_WINDOW => {
+                    windows += 1;
+                    let (emit0, emit1) = (read_i32(&info, 28), read_i32(&info, 32));
+                    let valid = read_i32(&info, 56) as u32;
+                    let base = read_i64(&info, 48);
+                    // Pencere karesi okunabilir ve doğru kareyi verir; dolgu konumu 0 döner.
+                    for pos in [0, 14, 29] {
+                        let got = unsafe {
+                            Java_com_videocleaner_engine_NativeCore_nativeReadWindowFrame(
+                                env,
+                                null,
+                                handle,
+                                pos,
+                                obj(&mut fake(&mut window_frame)),
+                            )
+                        };
+                        if valid & (1 << pos) != 0 {
+                            assert_eq!(got, 1);
+                            assert_eq!(
+                                window_frame,
+                                frame_content(geo, (base + pos as i64) as u64)
+                            );
+                        } else {
+                            assert_eq!(got, 0);
+                        }
+                    }
+                    // Kesinleşen her konuma (4,2)-(12,6) bölgesi için tahmin ver.
+                    for pos in emit0..emit1 {
+                        let rc = unsafe {
+                            Java_com_videocleaner_engine_NativeCore_nativeSubmitEstimate(
+                                env,
+                                null,
+                                handle,
+                                pos,
+                                4,
+                                2,
+                                8,
+                                4,
+                                obj(&mut fake(&mut roi_y)),
+                                obj(&mut fake(&mut roi_uv)),
+                                obj(&mut fake(&mut roi_w)),
+                            )
+                        };
+                        assert_eq!(rc, 0);
+                    }
+                    // Hizasız ROI ve çıktı istenmeyen konum reddedilir.
+                    let bad = unsafe {
+                        Java_com_videocleaner_engine_NativeCore_nativeSubmitEstimate(
+                            env,
+                            null,
+                            handle,
+                            emit0.max(0),
+                            5,
+                            2,
+                            8,
+                            4,
+                            obj(&mut fake(&mut roi_y)),
+                            obj(&mut fake(&mut roi_uv)),
+                            obj(&mut fake(&mut roi_w)),
+                        )
+                    };
+                    assert_eq!(bad, CoreError::BadArgument.code());
+                    assert_eq!(
+                        Java_com_videocleaner_engine_NativeCore_nativeCompleteWindow(
+                            env, null, handle
+                        ),
+                        0
+                    );
+                }
+                STEP_OUTPUT => loop {
+                    let got = unsafe {
+                        Java_com_videocleaner_engine_NativeCore_nativePopOutputYuv420(
+                            env,
+                            null,
+                            handle,
+                            obj(&mut fake(&mut y_out)),
+                            0,
+                            ys as i32,
+                            obj(&mut fake(&mut uv_out[..w * h / 2 - 1])),
+                            0,
+                            obj(&mut fake(&mut uv_out[1..])),
+                            0,
+                            w as i32,
+                            2,
+                            obj(&mut fake(&mut meta)),
+                        )
+                    };
+                    if got == 0 {
+                        break;
+                    }
+                    assert_eq!(got, 1);
+                    assert_eq!(read_i64(&meta, 0), popped as i64);
+                    assert_eq!(read_i64(&meta, 8), popped as i64 * 33_333);
+                    assert_eq!(read_i64(&meta, 24), 32);
+                    let original = frame_content(geo, popped);
+                    for y in 0..h {
+                        for x in 0..w {
+                            let inside = (4..12).contains(&x) && (2..6).contains(&y);
+                            assert_eq!(
+                                y_out[y * ys + x],
+                                if inside { 150 } else { original[y * w + x] }
+                            );
+                        }
+                    }
+                    for cy in 0..h / 2 {
+                        for x in 0..w {
+                            let inside = (4..12).contains(&x) && (1..3).contains(&cy);
+                            assert_eq!(
+                                uv_out[cy * w + x],
+                                if inside {
+                                    90
+                                } else {
+                                    original[geo.luma_bytes() + cy * w + x]
+                                }
+                            );
+                        }
+                    }
+                    popped += 1;
+                },
+                STEP_FINISHED => break,
+                other => panic!("beklenmeyen adım kodu {other}"),
+            }
+        }
+        assert_eq!((pushed, popped), (total, total));
+        assert!(windows >= 3);
+
+        let mut stats = vec![0u8; STATS_BYTES];
+        let n = unsafe {
+            Java_com_videocleaner_engine_NativeCore_nativeStats(
+                env,
+                null,
+                handle,
+                obj(&mut fake(&mut stats)),
+            )
+        };
+        assert_eq!(n, 14);
+        assert_eq!(read_i64(&stats, 0), total as i64); // giren
+        assert_eq!(read_i64(&stats, 8), total as i64); // çıkan
+        assert_eq!(read_i64(&stats, 32), 0); // koruma ihlali
+        assert_eq!(read_i64(&stats, 40), 0); // sıra ihlali
+
+        unsafe { Java_com_videocleaner_engine_NativeCore_nativeDestroy(env, null, handle) };
+    }
+
+    // ---- hız ölçümü (cargo test --release -- --ignored --nocapture bench) -----
+
+    #[test]
+    #[ignore = "hız ölçümü; --ignored ile çalıştırın"]
+    fn bench_720p_core_overhead() {
+        use std::time::Instant;
+        let geo = FrameGeometry::HD720;
+        println!(
+            "arka uç: {}, sayfa: {} bayt",
+            kernels::backend(),
+            page_size()
+        );
+
+        let mut a = vec![0u8; geo.luma_bytes()];
+        let mut b = vec![0u8; geo.luma_bytes()];
+        Rng::new(1).fill(&mut a);
+        Rng::new(2).fill(&mut b);
+        let mask: Vec<u8> = a.iter().map(|&v| if v > 200 { 255 } else { 0 }).collect();
+        let mut dst = vec![0u8; geo.luma_bytes()];
+        let mut bands = HaarBands::new(geo.width(), geo.height()).unwrap();
+        let time = |name: &str, f: &mut dyn FnMut()| {
+            let reps = 200;
+            let start = Instant::now();
+            for _ in 0..reps {
+                f();
+            }
+            let us = start.elapsed().as_secs_f64() * 1e6 / reps as f64;
+            println!("  {name:<28} {us:>9.1} µs / 720p Y düzlemi");
+        };
+        for portable in [false, true] {
+            kernels::force_portable(portable);
+            println!("[{}]", kernels::backend());
+            time("sad_u8", &mut || {
+                std::hint::black_box(kernels::sad_u8(&a, &b));
+            });
+            time("select_u8", &mut || {
+                kernels::select_u8(&mut dst, &a, &b, &mask)
+            });
+            time("haar ileri", &mut || bands.forward(&a, geo.width()));
+            time("haar ters", &mut || bands.inverse(&mut dst, geo.width()));
+        }
+        kernels::force_portable(false);
+
+        let frames = 600u64;
+        let source_frame = frame_content(geo, 1);
+        let mut pipe = Pipeline::new(geo).unwrap();
+        let mut produced = 0u64;
+        let start = Instant::now();
+        pipe.run(
+            |dst| {
+                if produced == frames {
+                    return None;
+                }
+                dst.copy_from_slice(&source_frame);
+                produced += 1;
+                Some((produced as i64, 0))
+            },
+            &mut IdentityRestorer,
+            |frame, _| {
+                std::hint::black_box(frame[0]);
+            },
+        )
+        .unwrap();
+        let secs = start.elapsed().as_secs_f64();
+        let stats = pipe.stats();
+        assert_eq!(stats.frames_out, frames);
+        println!(
+            "hat (model yok): {frames} kare {:.3} s → {:.0} kare/sn, {:.3} ms/kare; pencere: {}, halka: {:.2} MiB",
+            secs,
+            frames as f64 / secs,
+            secs * 1e3 / frames as f64,
+            stats.sched.windows_b,
+            pipe.ring().pool_bytes() as f64 / (1024.0 * 1024.0)
+        );
+    }
+}

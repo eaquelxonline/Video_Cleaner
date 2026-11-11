@@ -1,0 +1,33 @@
+# Video_Cleaner v2.0 — Rust çekirdeği
+#
+# Tek kaynak dosyası: Rust/Core.rs (Assembly/ dosyaları global_asm! ile içine gömülür).
+# Bilerek SIFIR harici bağımlılık: build.rs, cc, nasm veya JNI crate'i yoktur.
+#
+#   Masaüstü test      : cargo test --release
+#   Hız ölçümü         : cargo test --release -- --ignored --nocapture bench
+#   Android (Gradle)   : ./gradlew assembleDebug   (cargo-ndk'yi kendisi çağırır)
+
+[package]
+name = "video_cleaner"
+version = "2.0.0"
+edition = "2024"
+rust-version = "1.99"
+description = "Video_Cleaner çekirdeği: 30 karelik ring buffer, 15+15 / 14+1+15 pencere zamanlayıcı, bit-exact koruma kapısı, SIMD çekirdekleri"
+publish = false
+
+[lib]
+name = "video_cleaner"
+path = "Rust/Core.rs"
+crate-type = ["cdylib", "rlib"]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+debug = false
+strip = "debuginfo"
+# panic = "unwind" (varsayılan) bilerek korunur: JNI sınırında catch_unwind ile
+# iç hatalar süreç çökmesi yerine hata koduna çevrilir.
+
+[profile.test]
+opt-level = 2

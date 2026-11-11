@@ -1,0 +1,130 @@
+# Video Cleaner — gerçek Android (ART) üzerinde uçtan uca testler.
+#
+# GitHub'ın barındırdığı Linux koşucularında KVM bulunduğu için emülatör donanım
+# hızlandırmalı çalışır. Her iş: Rust çekirdek testleri → APK derleme → 16 KB hizalama
+# denetimi → emülatörde cihaz testleri (AndroidTest/VideoPipelineTest.kt).
+# Sonuç satırları ("VCTEST") iş özetine yazılır; raporlar ve çıktı videoları ek olarak yüklenir.
+
+name: Video Cleaner Android Test
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+  pull_request:
+
+concurrency:
+  group: android-test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  android-test:
+    name: API ${{ matrix.api-level }} (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    continue-on-error: ${{ matrix.experimental }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Android 11 = uygulamanın desteklediği en düşük sürüm (minSdk 30)
+          - { api-level: '30',   target: default,           page-size: '4096',  experimental: false }
+          - { api-level: '34',   target: default,           page-size: '4096',  experimental: false }
+          # Android 17 = hedef sürüm (targetSdk 37)
+          - { api-level: '37.0', target: default,           page-size: '4096',  experimental: false }
+          # Android 17, 16 KB bellek sayfası
+          - { api-level: '37.0', target: google_apis_ps16k, page-size: '16384', experimental: true }
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add aarch64-linux-android x86_64-linux-android
+          rustc --version
+
+      - name: Cache cargo-ndk
+        id: cargo-ndk
+        uses: actions/cache@v6
+        with:
+          path: ~/.cargo/bin/cargo-ndk
+          key: cargo-ndk-4.1.2-${{ runner.os }}
+
+      - name: Install cargo-ndk
+        if: steps.cargo-ndk.outputs.cache-hit != 'true'
+        run: cargo install cargo-ndk --version 4.1.2 --locked
+
+      - name: Rust core tests (host)
+        run: cargo test --release
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Install Android SDK components
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-37.0" "build-tools;37.0.0" "ndk;30.0.16248370"
+
+      - name: Build APKs and verify 16 KB alignment
+        run: ./gradlew assembleDebug assembleDebugAndroidTest verifyDebugApkAlignment --stacktrace
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+
+      - name: Run instrumented tests on the emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: ${{ matrix.api-level }}
+          target: ${{ matrix.target }}
+          arch: x86_64
+          profile: pixel_6
+          cores: 4
+          ram-size: 4096M
+          disk-size: 6G
+          emulator-boot-timeout: 900
+          disable-animations: true
+          emulator-options: -no-window -no-snapshot -noaudio -no-boot-anim -gpu swiftshader_indirect
+          script: |
+            adb shell getprop ro.build.version.release
+            adb shell getconf PAGE_SIZE
+            adb logcat -c
+            ./gradlew connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.expectPageSize=${{ matrix.page-size }} --stacktrace || touch test-failed
+            adb logcat -d -s VCTEST:I VideoCleaner:I AndroidRuntime:E > vc-logcat.txt || true
+            mkdir -p vc-output && adb pull /sdcard/Movies/VideoCleanerTest vc-output || true
+            test ! -f test-failed
+
+      - name: Summarize results
+        if: always()
+        run: |
+          {
+            echo "## API ${{ matrix.api-level }} · ${{ matrix.target }} · sayfa ${{ matrix.page-size }}"
+            echo '```'
+            grep -E 'VCTEST' vc-logcat.txt | sed -E 's/^.*VCTEST *: //' || echo "sonuç satırı yok"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: video-cleaner-api${{ matrix.api-level }}-${{ matrix.target }}
+          if-no-files-found: warn
+          path: |
+            vc-logcat.txt
+            vc-output/
+            build/reports/androidTests/
+            build/outputs/androidTest-results/
+            build/outputs/apk/debug/*.apk

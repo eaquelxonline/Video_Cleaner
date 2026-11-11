@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Video_Cleaner v2.0
+
+    * API düzeyleri, sürüm ve paket adı (namespace) build.gradle.kts içindedir.
+    * Depolama izni YOKTUR: video, Depolama Erişim Çerçevesi (SAF) ile kullanıcının
+      seçtiği belge üzerinden okunur ve yazılır.
+    * res/ yalnızca uygulama simgesini (mipmap) ve logoyu içerir; tema çerçevenin kendi temasıdır.
+    * Uygulama başka uygulamalardan "Birlikte aç" ve "Paylaş" ile video kabul eder.
+    * 16 KB sayfa uyumluluğu bir manifest bayrağıyla değil, derlemeyle sağlanır
+      (NDK r30 + sıkıştırılmamış, hizalı .so) ve Gradle görevleriyle doğrulanır.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Uzun süren işleme sırasında ilerleme bildirimi (Android 13+ çalışma anı izni). -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- Ön plan hizmeti: Android 15+ için mediaProcessing, Android 11-14 için dataSync türü. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROCESSING" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+
+    <!-- Ekran kapalıyken işlemenin durmaması için (yalnızca iş süresince tutulur). -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <application
+        android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:label="Video Cleaner"
+        android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+
+        <activity
+            android:name=".App"
+            android:exported="true"
+            android:launchMode="singleTop">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:scheme="content" android:mimeType="video/*" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="video/*" />
+            </intent-filter>
+        </activity>
+
+        <service
+            android:name=".CleanerService"
+            android:exported="false"
+            android:foregroundServiceType="mediaProcessing|dataSync" />
+
+    </application>
+
+</manifest>
