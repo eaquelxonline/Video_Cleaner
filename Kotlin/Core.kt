@@ -435,7 +435,36 @@ data class JobOptions(
     val preferHevc: Boolean = false,
     /** Bit hızı çarpanı: 1.0 = kaynağa yakın, 2.0 = yüksek kalite. */
     val quality: Float = 1.0f,
+    /** Yalnızca ölçüm/kalibrasyon testleri için: bit hızı politikasını atlayıp kodlayıcıyı doğrudan ayarlar. */
+    val tuning: EncoderTuning? = null,
 )
+
+/**
+ * Kodlayıcı ayarlarının elle verilmesi (kalibrasyon testleri). Boş alanlar politikaya bırakılır.
+ * [bitrateMode] MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_* değeridir; [cqQuality] yalnızca CQ'da kullanılır.
+ */
+data class EncoderTuning(
+    val bitrateBps: Int? = null,
+    val bitrateMode: Int? = null,
+    val cqQuality: Int? = null,
+    val iFrameIntervalSec: Float? = null,
+)
+
+/** Kaynak video akışının örnek tablosundan ölçülen gerçek değerleri (kapsayıcının beyan ettiği değil). */
+data class SourceVideoStats(
+    /** Yalnızca video örneklerinin toplam baytı. */
+    val videoBytes: Long,
+    val samples: Int,
+    val syncSamples: Int,
+    /** İlk örnekten son örneğin bitişine kadar süre (µs). */
+    val durationUs: Long,
+) {
+    /** Video akışının ortalama bit hızı; ölçülemediyse 0. */
+    val videoBitsPerSecond: Long get() = if (durationUs > 0) videoBytes * 8_000_000L / durationUs else 0L
+
+    /** Ortalama anahtar kare aralığı (µs); tek anahtar kare varsa süre. */
+    val averageGopUs: Long get() = if (syncSamples > 0) durationUs / syncSamples else 0L
+}
 
 data class JobProgress(
     val framesDecoded: Long = 0,
@@ -472,6 +501,13 @@ data class JobResult(
     /** Kullanıcının bilmesi gereken dönüşümler (kırpma, 10 bit → 8 bit…). */
     val notes: List<String>,
     val stats: CoreStats,
+    /** Kodlayıcıya verilen ayarlar (tanılama ve kalibrasyon için). */
+    val encoderSettings: EncoderSettings = EncoderSettings(),
+    /** Kaynak video akışının ölçülen değerleri; ölçülemediyse null. */
+    val sourceVideo: SourceVideoStats? = null,
+    /** Kapsayıcının video izi için beyan ettiği bit hızı (MediaFormat.KEY_BIT_RATE); yoksa 0. */
+    val sourceDeclaredBitrate: Int = 0,
+    val sourceFrameRate: Float = 0f,
 ) {
     /** Kare kaybı ve sıra hatası yok mu? (çözülen = çekirdekten çıkan = kodlayıcıya verilen = kodlanan) */
     val intact: Boolean
@@ -481,6 +517,20 @@ data class JobResult(
 
     val framesPerSecond: Double get() = if (elapsedMs > 0) framesEncoded * 1000.0 / elapsedMs else 0.0
 }
+
+/** Kodlayıcıya gerçekten verilen ayarlar. */
+data class EncoderSettings(
+    val bitrateBps: Int = 0,
+    /** "VBR", "CBR", "CQ" veya "varsayılan" (mod verilmedi; kodlayıcı kendisi seçer). */
+    val bitrateMode: String = "",
+    val cqQuality: Int = -1,
+    val qpMin: Int = -1,
+    val qpMax: Int = -1,
+    val iFrameIntervalSec: Float = 0f,
+    val frameRate: Float = 0f,
+    /** Politikanın gerekçesi (ör. "kaynak×1.00", "taban 0.06 bpppf"). */
+    val reason: String = "",
+)
 
 class JobException(message: String, cause: Throwable? = null) : Exception(message, cause)
 class JobCancelledException : Exception("İptal edildi")
@@ -769,7 +819,7 @@ class VideoJob(
         }
     }
 
-    private class Encoder(val codec: MediaCodec, val mime: String, val name: String)
+    private class Encoder(val codec: MediaCodec, val mime: String, val name: String, val settings: EncoderSettings)
 
     /** Verilen boyutu destekleyen bir kodlayıcı seçip yapılandırır; tercih edilen tür olmazsa diğerini dener. */
     private fun startEncoder(width: Int, height: Int, frameRate: Float, sourceBitrate: Int, color: MediaFormat?): Encoder {
@@ -786,14 +836,34 @@ class VideoJob(
                 if (MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible !in caps.colorFormats) continue
                 val format = MediaFormat.createVideoFormat(mime, width, height)
                 format.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible)
+                val tuning = options.tuning
+                val encoderCaps = caps.encoderCapabilities
                 // Yeniden kodlama kayıplıdır: kalite kaybını sınırlamak için kaynağın bit hızının altına inilmez.
                 val floor = (width.toLong() * height * frameRate * 0.14).toLong()
-                val wanted = (max(sourceBitrate * 5L / 4, floor) * options.quality).toLong()
-                format.setInteger(MediaFormat.KEY_BIT_RATE, wanted.coerceIn(video.bitrateRange.lower.toLong(), video.bitrateRange.upper.toLong()).toInt())
+                val wanted = tuning?.bitrateBps?.toLong() ?: (max(sourceBitrate * 5L / 4, floor) * options.quality).toLong()
+                val bitrate = wanted.coerceIn(video.bitrateRange.lower.toLong(), video.bitrateRange.upper.toLong()).toInt()
+                format.setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
+                var modeLabel = "varsayılan"
+                var cq = -1
+                val mode = tuning?.bitrateMode
+                if (mode != null) {
+                    if (encoderCaps == null || !encoderCaps.isBitrateModeSupported(mode)) continue     // bu kodlayıcı istenen modu desteklemiyor
+                    format.setInteger(MediaFormat.KEY_BITRATE_MODE, mode)
+                    modeLabel = bitrateModeName(mode)
+                    if (mode == MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CQ) {
+                        cq = (tuning?.cqQuality ?: encoderCaps.qualityRange.upper).coerceIn(encoderCaps.qualityRange.lower, encoderCaps.qualityRange.upper)
+                        format.setInteger(MediaFormat.KEY_QUALITY, cq)
+                    }
+                }
                 val rates = runCatching { video.getSupportedFrameRatesFor(width, height) }.getOrNull()
                 val rate = if (rates != null) frameRate.toDouble().coerceIn(rates.lower, rates.upper).toFloat() else frameRate
                 format.setFloat(MediaFormat.KEY_FRAME_RATE, rate)
-                format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+                val gop = tuning?.iFrameIntervalSec ?: 1f
+                format.setFloat(MediaFormat.KEY_I_FRAME_INTERVAL, gop)
+                val settings = EncoderSettings(
+                    bitrateBps = bitrate, bitrateMode = modeLabel, cqQuality = cq, iFrameIntervalSec = gop, frameRate = rate,
+                    reason = if (tuning?.bitrateBps != null) "elle (kalibrasyon)" else "eski: max(beyan×1.25, 0.14 bpppf)×${options.quality}",
+                )
                 if (color != null) {
                     for (key in arrayOf(MediaFormat.KEY_COLOR_STANDARD, MediaFormat.KEY_COLOR_RANGE, MediaFormat.KEY_COLOR_TRANSFER)) {
                         if (color.containsKey(key)) format.setInteger(key, color.getInteger(key))
@@ -809,7 +879,7 @@ class VideoJob(
                     try {
                         codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
                         codec.start()
-                        return Encoder(codec, mime, candidate.name)
+                        return Encoder(codec, mime, candidate.name, settings)
                     } catch (e: Exception) {
                         codec.release()
                         lastError = e
@@ -820,6 +890,39 @@ class VideoJob(
             }
         }
         throw JobException("Bu cihazda ${width}×$height çözünürlüğünü kodlayabilen bir H.264/HEVC kodlayıcı yok", lastError)
+    }
+
+    /**
+     * Video izinin örnek tablosunu (veriyi okumadan, yalnızca boyutları) tarayıp gerçek video bit hızını ölçer.
+     * Kapsayıcının KEY_BIT_RATE beyanı çoğu dosyada yoktur ya da ses dahil toplamdır; ona güvenilmez.
+     */
+    private fun measureVideoTrack(track: Int): SourceVideoStats? {
+        val probe = MediaExtractor()
+        try {
+            probe.setDataSource(context, input, null)
+            probe.selectTrack(track)
+            var bytes = 0L
+            var samples = 0
+            var sync = 0
+            var first = Long.MAX_VALUE
+            var last = Long.MIN_VALUE
+            while (probe.sampleTrackIndex >= 0) {
+                val size = probe.sampleSize
+                if (size > 0) bytes += size
+                val time = probe.sampleTime
+                first = minOf(first, time)
+                last = maxOf(last, time)
+                if (probe.sampleFlags and MediaExtractor.SAMPLE_FLAG_SYNC != 0) sync++
+                samples++
+                if (!probe.advance()) break
+            }
+            if (samples < 2 || last <= first) return null
+            // Son karenin süresi: ortalama kare aralığı.
+            val durationUs = (last - first) + (last - first) / (samples - 1)
+            return SourceVideoStats(bytes, samples, sync, durationUs)
+        } finally {
+            probe.release()
+        }
     }
 
     /** [mime] türünü çözebilen çözücü adları; yazılım çözücüler donanımdakilerden sonra gelir. */
@@ -858,6 +961,7 @@ class VideoJob(
             val rotation = sourceFormat.intOr(MediaFormat.KEY_ROTATION, 0)
             val frameRate = (sourceFormat.getNumber(MediaFormat.KEY_FRAME_RATE)?.toFloat() ?: 30f).coerceIn(1f, 960f)
             val sourceBitrate = sourceFormat.intOr(MediaFormat.KEY_BIT_RATE, 0)
+            val sourceVideo = runCatching { measureVideoTrack(videoTrack) }.getOrNull()
 
             sourceFormat.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible)
             // Yapılandırılamayan çözücü atlanır; sıradaki denenir (ör. tek sayılı boyutu reddeden VP9 çözücü).
@@ -1090,6 +1194,8 @@ class VideoJob(
                 framesDecoded, framesEncoded, SystemClock.elapsedRealtime() - started,
                 finalSession.width, finalSession.height, framesQueued, audioLabel, finalEncoder.mime, finalEncoder.name,
                 restorer != null, notes, stats,
+                encoderSettings = finalEncoder.settings, sourceVideo = sourceVideo,
+                sourceDeclaredBitrate = sourceBitrate, sourceFrameRate = frameRate,
             )
         } finally {
             session?.close()
@@ -1109,6 +1215,14 @@ class VideoJob(
     companion object {
         private const val CODEC_TIMEOUT_US = 10_000L
         private const val MAX_DECODER_ATTEMPTS = 4
+
+        fun bitrateModeName(mode: Int): String = when (mode) {
+            MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CQ -> "CQ"
+            MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR -> "VBR"
+            MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR -> "CBR"
+            3 -> "CBR_FD"      // BITRATE_MODE_CBR_FD (API 31)
+            else -> "mod($mode)"
+        }
         private const val PROGRESS_INTERVAL_MS = 250L
 
         /** MP4 çoklayıcının doğrudan yazabildiği ses türleri; diğerleri AAC'ye dönüştürülür. */

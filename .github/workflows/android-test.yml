@@ -102,7 +102,7 @@ jobs:
             adb shell getconf PAGE_SIZE
             adb logcat -c
             ./gradlew connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.expectPageSize=${{ matrix.page-size }} --stacktrace || touch test-failed
-            adb logcat -d -s VCTEST:I VideoCleaner:I AndroidRuntime:E > vc-logcat.txt || true
+            adb logcat -d -s VCTEST:I VCCAPS:I VideoCleaner:I AndroidRuntime:E > vc-logcat.txt || true
             mkdir -p vc-output && adb pull /sdcard/Movies/VideoCleanerTest vc-output || true
             test ! -f test-failed
 
@@ -112,7 +112,7 @@ jobs:
           {
             echo "## API ${{ matrix.api-level }} · ${{ matrix.target }} · sayfa ${{ matrix.page-size }}"
             echo '```'
-            grep -E 'VCTEST' vc-logcat.txt | sed -E 's/^.*VCTEST *: //' || echo "sonuç satırı yok"
+            grep -E 'VCTEST|VCCAPS' vc-logcat.txt | sed -E 's/^.*VCTEST *: //' || echo "sonuç satırı yok"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
