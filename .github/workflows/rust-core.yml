@@ -30,19 +30,27 @@ jobs:
           rustup target add aarch64-unknown-linux-gnu aarch64-linux-android x86_64-linux-android
           rustc --version
 
-      - name: Install QEMU and ARM64 cross linker
-        timeout-minutes: 20
+      - name: Install QEMU and ARM64 cross linker (apt)
+        id: apt
+        continue-on-error: true
+        timeout-minutes: 15
         run: |
           # Koşucularda security.ubuntu.com DNS hatası görüldü: güvenlik deposu da Azure aynasından alınır.
           sudo sed -i -E 's#https?://security.ubuntu.com/ubuntu#http://azure.archive.ubuntu.com/ubuntu#g' /etc/apt/sources.list /etc/apt/sources.list.d/*.sources 2>/dev/null || true
           APT="-o Acquire::Retries=3 -o Acquire::http::Timeout=30"
-          # Paket sunucusuna geçici erişim hatalarına karşı 3 deneme; her adım en çok 5 dk.
-          for attempt in 1 2 3; do
-            timeout 300 sudo apt-get $APT update -qq && timeout 300 sudo apt-get $APT install -y -qq --fix-missing qemu-user gcc-aarch64-linux-gnu libc6-dev-arm64-cross > /dev/null && exit 0
-            echo "apt denemesi $attempt başarısız; 20 sn sonra yeniden"
-            sleep 20
+          # 2 deneme; hata çıktısı görünür kalır. Başarısızsa ARM64 testleri cross (Docker) ile koşar.
+          for attempt in 1 2; do
+            if timeout 300 sudo apt-get $APT update && timeout 300 sudo apt-get $APT install -y --no-install-recommends --fix-missing qemu-user gcc-aarch64-linux-gnu libc6-dev-arm64-cross; then exit 0; fi
+            echo "::warning::apt denemesi $attempt başarısız"
+            sleep 15
           done
           exit 1
+
+      - name: Install cross (yedek yol, Docker içinde QEMU + çapraz derleyici)
+        if: steps.apt.outcome != 'success'
+        run: |
+          cargo install cross --locked --version 0.2.5
+          cross --version
 
       - name: rustfmt
         run: cargo fmt --check
@@ -57,7 +65,12 @@ jobs:
         run: cargo test --release
 
       - name: Tests ARM64 (NEON, QEMU)
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER: qemu-aarch64 -L /usr/aarch64-linux-gnu
-        run: cargo test --release --target aarch64-unknown-linux-gnu
+        run: |
+          if [ "${{ steps.apt.outcome }}" = "success" ]; then
+            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER="qemu-aarch64 -L /usr/aarch64-linux-gnu"
+            cargo test --release --target aarch64-unknown-linux-gnu
+          else
+            echo "apt kullanılamadı: ARM64 testleri cross (ghcr.io imajı) ile koşuyor"
+            cross test --release --target aarch64-unknown-linux-gnu
+          fi
