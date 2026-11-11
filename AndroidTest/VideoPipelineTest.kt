@@ -10,6 +10,7 @@ package com.video.cleaner
 import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.ImageFormat
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
@@ -471,6 +472,17 @@ class VideoPipelineTest {
         val input = asset("s9_tiny_128x96.mp4")
         val output = File(app.cacheDir, "service_out.mp4")
         output.delete()
+        // Samsung (MARs "auto_disabler"): testle yüklenip hiç açılmamış uygulama "kullanılana dek devre dışı" (4)
+        // durumuna alınır; ilk Activity açılışında yeniden etkinleştirilirken süreç — test süreci dahil — öldürülür
+        // (Galaxy Z Flip8, Android 17). Uygulama kendi paketini süreci öldürmeden (DONT_KILL_APP) önceden etkinleştirir.
+        val pm = app.packageManager
+        val state = pm.getApplicationEnabledSetting(app.packageName)
+        if (state != PackageManager.COMPONENT_ENABLED_STATE_ENABLED && state != PackageManager.COMPONENT_ENABLED_STATE_DEFAULT) {
+            log("SERVICE paket durumu $state → etkinleştiriliyor (DONT_KILL_APP)")
+            runCatching {
+                pm.setApplicationEnabledSetting(app.packageName, PackageManager.COMPONENT_ENABLED_STATE_ENABLED, PackageManager.DONT_KILL_APP)
+            }.onFailure { log("SERVICE paket etkinleştirilemedi: ${it.message}") }
+        }
         val intent = Intent(app, App::class.java).putExtra("vc_input", input.path).putExtra("vc_output", output.path)
         ActivityScenario.launch<App>(intent).use {
             val deadline = SystemClock.elapsedRealtime() + 180_000
