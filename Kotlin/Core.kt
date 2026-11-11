@@ -118,6 +118,17 @@ object Core {
      * ImageReader görüntüsünün donanım tamponunu `Image.getPlanes()` çağırmadan iter (AHardwareBuffer_lockPlanes).
      * Tampon CPU'ya açılamıyorsa çökmeden -14 (desteklenmiyor) döner.
      */
+    /**
+     * Annex B H.264 (`codec` 0) / HEVC (1) verisindeki SPS VUI'sini yeniden yazar: SAR ve renk açıklaması.
+     * `sarWidth <= 0` → SAR'a, `primaries < 0` → renge dokunulmaz. Dönüş: `dst`'ye yazılan uzunluk (> 0),
+     * değişiklik yoksa 0, hata ise negatif kod. `src` ve `dst` doğrudan tampon olmalıdır.
+     */
+    @JvmStatic
+    external fun nativeRewriteVui(
+        codec: Int, src: ByteBuffer, offset: Int, length: Int, dst: ByteBuffer,
+        sarWidth: Int, sarHeight: Int, primaries: Int, transfer: Int, matrix: Int, fullRange: Int,
+    ): Int
+
     @JvmStatic external fun nativePushHardwareBuffer(handle: Long, buffer: HardwareBuffer, cropLeft: Int, cropTop: Int, ptsUs: Long, flags: Int): Long
     @JvmStatic external fun nativeFinish(handle: Long): Int
     @JvmStatic external fun nativeSetHint(handle: Long, seq: Long, hint: Int): Int
@@ -943,6 +954,8 @@ data class JobResult(
     val remuxed: Boolean = false,
     /** Çıktıdan atılan ayrı altyazı izlerinin türleri. */
     val removedSubtitleTracks: List<String> = emptyList(),
+    /** Video, sesin AAC ön dolgusu kadar bu süre (µs) kaydırıldı (yeniden kodlanan seste; kopyada 0). */
+    val audioDelayUs: Long = 0L,
 ) {
     /** Kare kaybı ve sıra hatası yok mu? (çözülen = çekirdekten çıkan = kodlayıcıya verilen = kodlanan) */
     val intact: Boolean
@@ -983,6 +996,13 @@ private interface AudioPath {
     val finished: Boolean
     fun pump(muxer: MediaMuxer, track: Int, untilUs: Long)
     fun release()
+
+    /**
+     * Sesin çıktıda içerikten ne kadar geç duyulacağı (µs): AAC kodlayıcının ön dolgusu (priming).
+     * MediaMuxer düzenleme listesi (edit list) yazmadığından oynatıcılar bu dolguyu çalar; video aynı süre
+     * kaydırılarak dudak senkronu korunur. Kopyalanan seste 0.
+     */
+    val delayUs: Long get() = 0L
 }
 
 /**
@@ -1038,15 +1058,198 @@ private class AudioCopy(private val extractor: MediaExtractor, override val trac
 }
 
 /**
+ * AAC kodlayıcının ön dolgusunu (encoder delay / priming) bu cihazda ölçer: bilinen bir gürültü dizisi
+ * kodlanır, platform AAC çözücüsüyle çözülür ve çapraz ilinti ile gecikme örnek hassasiyetinde bulunur.
+ * Ölçülemezse AAC-LC için yaygın değer (2048 örnek) kullanılır ve bu not edilir. Sonuç kodlayıcı adı, hız
+ * ve kanal sayısına göre önbelleğe alınır.
+ */
+internal object AacDelayProbe {
+    const val FALLBACK_SAMPLES = 2048
+    private val cache = HashMap<String, Int>()
+
+    /** (gecikme örnek sayısı, ölçüldü mü) */
+    @Synchronized
+    fun samples(encoderName: String, format: MediaFormat): Pair<Int, Boolean> {
+        val rate = format.getInteger(MediaFormat.KEY_SAMPLE_RATE)
+        val channels = format.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
+        val key = "$encoderName/$rate/$channels"
+        cache[key]?.let { return it to true }
+        val measured = runCatching { measure(encoderName, format, rate, channels) }.getOrNull()
+        if (measured != null) cache[key] = measured
+        return (measured ?: FALLBACK_SAMPLES) to (measured != null)
+    }
+
+    private fun measure(encoderName: String, format: MediaFormat, rate: Int, channels: Int): Int? {
+        // 0,25 s sessizlik + 0,5 s sabit tohumlu gürültü + 0,25 s sessizlik (tek kanal içerik, tüm kanallara).
+        val lead = rate / 4
+        val noise = rate / 2
+        val total = lead + noise + rate / 4
+        val signal = ShortArray(total)
+        var seed = 0x2545F491
+        for (i in lead until lead + noise) {
+            seed = seed * 1103515245 + 12345
+            signal[i] = ((seed ushr 16) and 0x7FFF).minus(0x4000).toShort()
+        }
+        val encoded = ArrayList<Pair<ByteArray, Long>>()
+        var outFormat: MediaFormat? = null
+        val enc = MediaCodec.createByCodecName(encoderName)
+        try {
+            enc.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+            enc.start()
+            val info = MediaCodec.BufferInfo()
+            var fed = 0
+            var eos = false
+            var done = false
+            var guard = 0
+            while (!done && ++guard < 20_000) {
+                if (!eos) {
+                    val index = enc.dequeueInputBuffer(1_000)
+                    if (index >= 0) {
+                        val buf = enc.getInputBuffer(index)!!
+                        val frames = minOf(buf.remaining() / (2 * channels), total - fed)
+                        if (frames <= 0) {
+                            enc.queueInputBuffer(index, 0, 0, fed * 1_000_000L / rate, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                            eos = true
+                        } else {
+                            buf.order(java.nio.ByteOrder.nativeOrder())
+                            for (f in 0 until frames) repeat(channels) { buf.putShort(signal[fed + f]) }
+                            enc.queueInputBuffer(index, 0, frames * 2 * channels, fed * 1_000_000L / rate, 0)
+                            fed += frames
+                        }
+                    }
+                }
+                val index = enc.dequeueOutputBuffer(info, 1_000)
+                if (index == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                    outFormat = enc.outputFormat
+                } else if (index >= 0) {
+                    if (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG == 0 && info.size > 0) {
+                        val data = enc.getOutputBuffer(index)!!
+                        data.position(info.offset)
+                        data.limit(info.offset + info.size)
+                        encoded += ByteArray(info.size).also { data.get(it) } to info.presentationTimeUs
+                    }
+                    done = info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0
+                    enc.releaseOutputBuffer(index, false)
+                }
+            }
+        } finally {
+            runCatching { enc.stop() }
+            enc.release()
+        }
+        val decFormat = outFormat ?: return null
+        if (encoded.isEmpty()) return null
+        val decoded = ArrayList<Short>(total + 8192)
+        val dec = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_AUDIO_AAC)
+        try {
+            dec.configure(decFormat, null, null, 0)
+            dec.start()
+            val info = MediaCodec.BufferInfo()
+            var next = 0
+            var eos = false
+            var done = false
+            var guard = 0
+            while (!done && ++guard < 20_000) {
+                if (!eos) {
+                    val index = dec.dequeueInputBuffer(1_000)
+                    if (index >= 0) {
+                        if (next < encoded.size) {
+                            val (bytes, pts) = encoded[next++]
+                            dec.getInputBuffer(index)!!.put(bytes)
+                            dec.queueInputBuffer(index, 0, bytes.size, pts, 0)
+                        } else {
+                            dec.queueInputBuffer(index, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                            eos = true
+                        }
+                    }
+                }
+                val index = dec.dequeueOutputBuffer(info, 1_000)
+                if (index >= 0) {
+                    val outChannels = dec.outputFormat.intOr(MediaFormat.KEY_CHANNEL_COUNT, channels).coerceAtLeast(1)
+                    val data = dec.getOutputBuffer(index)!!.order(java.nio.ByteOrder.nativeOrder())
+                    var at = info.offset
+                    while (at + 2 * outChannels <= info.offset + info.size) {
+                        decoded += data.getShort(at)
+                        at += 2 * outChannels
+                    }
+                    done = info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0
+                    dec.releaseOutputBuffer(index, false)
+                }
+            }
+        } finally {
+            runCatching { dec.stop() }
+            dec.release()
+        }
+        // Gecikme: kodlanmış-çözülmüş akışın kaynağa en iyi oturduğu kayma (0..4096 örnek); gürültünün
+        // ortasındaki 8192 örneklik pencere, ikişer adımla.
+        val maxLag = 4096
+        val from = lead + 2048
+        val end = from + 8192
+        if (decoded.size < end + maxLag) return null
+        val out = ShortArray(decoded.size) { decoded[it] }
+        var energy = 0.0
+        for (i in from until end step 2) energy += signal[i].toDouble() * signal[i]
+        var bestLag = -1
+        var best = 0L
+        for (lag in 0..maxLag) {
+            var acc = 0L
+            var i = from
+            while (i < end) {
+                acc += signal[i].toLong() * out[i + lag]
+                i += 2
+            }
+            if (acc > best) {
+                best = acc
+                bestLag = lag
+            }
+        }
+        // Güvenilirlik: ilinti, sinyal enerjisinin anlamlı bir kesri olmalı (kodlama kayıplı).
+        return if (bestLag >= 0 && best > 0.3 * energy) bestLag else null
+    }
+}
+
+/** Opus paketindeki 48 kHz örnek sayısı (RFC 6716 §3.1, TOC baytı); çözülemezse 0. */
+internal fun opusPacketSamples(packet: ByteBuffer, offset: Int, size: Int): Int {
+    if (size < 1) return 0
+    val toc = packet.get(offset).toInt() and 0xFF
+    val config = toc ushr 3
+    val frame = when {
+        config < 12 -> intArrayOf(480, 960, 1920, 2880)[config and 3]          // SILK: 10/20/40/60 ms
+        config < 16 -> intArrayOf(480, 960)[config and 1]                     // Hybrid: 10/20 ms
+        else -> intArrayOf(120, 240, 480, 960)[config and 3]                  // CELT: 2,5/5/10/20 ms
+    }
+    val count = when (toc and 3) {
+        0 -> 1
+        1, 2 -> 2
+        else -> if (size >= 2) packet.get(offset + 1).toInt() and 0x3F else 0
+    }
+    return frame * count
+}
+
+/**
  * MP4'e doğrudan yazılamayan ses (Opus, Vorbis, MP3, FLAC, AC-3…): çözülür ve AAC-LC'ye kodlanır.
  * Çoklayıcı, AAC kodlayıcının çıkış biçimi bilinmeden başlatılamadığı için [prepare] ilk
  * paketleri üretip biçimi öğrenir; bu arada çıkan paketler kuyrukta bekler.
+ *
+ * Zamanlama (dudak senkronu):
+ *  - Opus ön atlaması (pre-skip, csd-1): bazı çözücüler ilk örnekleri atmıyor, bazıları atıyor; ilk çıkış
+ *    tamponunun örnek sayısı ilk paketinkiyle karşılaştırılarak anlaşılır ve gerekirse burada atılır.
+ *  - Duyulur ilk örneğin zamanı [audibleStartUs] ile kaptan bağımsız bulunur; PCM zaman damgaları çözücünün
+ *    tampon damgalarından değil örnek sayacından türetilir (tampon damgası sıçramaları içeriği kaydırmaz).
+ *  - AAC ön dolgusu [AacDelayProbe] ile ölçülür ve [delayUs] olarak bildirilir; video o kadar kaydırılır.
  */
 private class AudioTranscode(private val extractor: MediaExtractor, source: MediaFormat, private val offsetUs: Long) : AudioPath {
-    override val label = "AAC'ye dönüştürüldü (kaynak: ${source.getString(MediaFormat.KEY_MIME)})"
+    private val baseLabel = "AAC'ye dönüştürüldü (kaynak: ${source.getString(MediaFormat.KEY_MIME)})"
+    override val label: String
+        get() = if (timingNote.isEmpty()) baseLabel else "$baseLabel; $timingNote"
     override var finished = false
         private set
     override lateinit var trackFormat: MediaFormat
+        private set
+    override var delayUs = 0L
+        private set
+
+    /** Zamanlama düzeltmeleri hakkında okunur not (rapor ve günlük için). */
+    var timingNote = ""
         private set
 
     private val decoder: MediaCodec
@@ -1058,9 +1261,20 @@ private class AudioTranscode(private val extractor: MediaExtractor, source: Medi
     private var eosQueued = false
     private var pcm: ByteBuffer? = null
     private var pcmIndex = -1
-    private var pcmPtsUs = 0L
-    private var bytesPerSecond = 1L
+    private var sampleRate = 48_000
+    private var frameBytes = 4
     private var lastPtsUs = Long.MIN_VALUE
+
+    private val isOpus = source.getString(MediaFormat.KEY_MIME) == MediaFormat.MIMETYPE_AUDIO_OPUS
+    private val preSkipNs = if (isOpus) opusPreSkipNs(source) else 0L
+    private val firstSampleUs = extractor.sampleTime
+    private var firstPacketSamples48k = 0
+
+    /** İlk duyulur örneğin çıktı zaman çizelgesindeki yeri (µs) ve ondan bu yana kodlayıcıya verilen kare sayısı. */
+    private var baseUs = audibleStartUs(source, firstSampleUs) + offsetUs
+    private var framesSent = 0L
+    private var firstOutputSeen = false
+    private var trimFrames = 0L
 
     init {
         source.setInteger(MediaFormat.KEY_PCM_ENCODING, android.media.AudioFormat.ENCODING_PCM_16BIT)
@@ -1094,14 +1308,31 @@ private class AudioTranscode(private val extractor: MediaExtractor, source: Medi
         if (pcmFormat.intOr(MediaFormat.KEY_PCM_ENCODING, android.media.AudioFormat.ENCODING_PCM_16BIT) != android.media.AudioFormat.ENCODING_PCM_16BIT) {
             throw JobException("16 bit olmayan PCM çıkışı desteklenmiyor")
         }
-        bytesPerSecond = rate.toLong() * channels * 2
+        sampleRate = rate
+        frameBytes = channels * 2
         val format = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_AAC, rate, channels)
         format.setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC)
         format.setInteger(MediaFormat.KEY_BIT_RATE, (64_000 * channels).coerceIn(64_000, 320_000))
         val enc = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC)
+        val (delay, measured) = AacDelayProbe.samples(enc.name, format)
+        delayUs = delay * 1_000_000L / rate
         enc.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
         enc.start()
         encoder = enc
+        timingNote = "AAC ön dolgusu ${delay} örnek (${if (measured) "cihazda ölçüldü" else "ölçülemedi, varsayılan"}, ${enc.name})"
+    }
+
+    /** İlk dolu çözücü çıkışı: Opus ön atlamasını çözücü attı mı? Atmadıysa burada atılır. */
+    private fun onFirstOutput(frames: Int, ptsUs: Long) {
+        firstOutputSeen = true
+        timingNote += "; ilk paket ${firstSampleUs} µs, duyulur başlangıç ${baseUs - offsetUs} µs, çözücü ilk çıkış ${ptsUs - offsetUs} µs/${frames} örnek"
+        if (preSkipNs <= 0 || firstPacketSamples48k <= 0) return
+        val preSkip = preSkipNs * sampleRate / 1_000_000_000L
+        val expected = firstPacketSamples48k.toLong() * sampleRate / 48_000
+        if (expected <= preSkip) return        // ilk paket ön atlamadan kısa: karar verilemez, çözücüye güvenilir
+        val kept = frames >= expected - 1
+        trimFrames = if (kept) preSkip else 0L
+        timingNote += "; Opus ön atlaması ${preSkip} örnek: çözücü ${if (kept) "atmadı, burada atıldı" else "attı"}"
     }
 
     private fun step(muxer: MediaMuxer?, track: Int) {
@@ -1115,6 +1346,7 @@ private class AudioTranscode(private val extractor: MediaExtractor, source: Medi
                     decoder.queueInputBuffer(index, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
                     inputDone = true
                 } else {
+                    if (isOpus && firstPacketSamples48k == 0) firstPacketSamples48k = opusPacketSamples(buffer, 0, size).takeIf { it > 0 } ?: -1
                     // Zaman çizelgesi kaydırması (bkz. AudioCopy) sonrası damga ≥ 0 olur; yine de negatif kalırsa 0'a çekilir.
                     decoder.queueInputBuffer(index, 0, size, max(extractor.sampleTime + offsetUs, 0L), 0)
                     extractor.advance()
@@ -1133,16 +1365,33 @@ private class AudioTranscode(private val extractor: MediaExtractor, source: Medi
                     val data = decoder.getOutputBuffer(index) ?: throw JobException("Ses çözücü çıkışı alınamadı")
                     data.position(info.offset)
                     data.limit(info.offset + info.size)
-                    pcm = data
-                    pcmIndex = index
-                    pcmPtsUs = info.presentationTimeUs
+                    if (!firstOutputSeen) {
+                        onFirstOutput(info.size / frameBytes, info.presentationTimeUs)
+                    } else {
+                        // Kaynakta gerçek boşluk (≥ 100 ms) varsa örnek sayacı yeniden çapalanır.
+                        val expectedUs = baseUs + (framesSent + trimFrames) * 1_000_000L / sampleRate
+                        val gap = info.presentationTimeUs - expectedUs
+                        if (gap >= 100_000L) baseUs += gap
+                    }
+                    // Atılacak ön atlama örnekleri (birden çok tampona yayılabilir).
+                    if (trimFrames > 0) {
+                        val drop = minOf(trimFrames, (data.remaining() / frameBytes).toLong()).toInt()
+                        data.position(data.position() + drop * frameBytes)
+                        trimFrames -= drop
+                    }
+                    if (data.remaining() >= frameBytes) {
+                        pcm = data
+                        pcmIndex = index
+                    } else {
+                        decoder.releaseOutputBuffer(index, false)
+                    }
                 } else {
                     decoder.releaseOutputBuffer(index, false)
                 }
                 if (end) decoderDone = true
             }
         }
-        // 3) PCM → AAC kodlayıcı (kodlayıcının giriş tamponu kadar parça parça)
+        // 3) PCM → AAC kodlayıcı (kodlayıcının giriş tamponu kadar parça parça; zaman = örnek sayacı)
         val enc = encoder
         if (enc != null) {
             val data = pcm
@@ -1150,14 +1399,14 @@ private class AudioTranscode(private val extractor: MediaExtractor, source: Medi
                 val index = enc.dequeueInputBuffer(0)
                 if (index >= 0) {
                     val target = enc.getInputBuffer(index) ?: throw JobException("Ses kodlayıcı girişi alınamadı")
-                    val count = minOf(target.remaining(), data.remaining()) and 1.inv()
+                    val count = minOf(target.remaining(), data.remaining()) / frameBytes * frameBytes
                     val slice = data.duplicate()
                     slice.limit(slice.position() + count)
                     target.put(slice)
                     data.position(data.position() + count)
-                    enc.queueInputBuffer(index, 0, count, pcmPtsUs, 0)
-                    pcmPtsUs += count * 1_000_000L / bytesPerSecond
-                    if (data.remaining() < 2) {
+                    enc.queueInputBuffer(index, 0, count, baseUs + framesSent * 1_000_000L / sampleRate, 0)
+                    framesSent += count / frameBytes
+                    if (data.remaining() < frameBytes) {
                         decoder.releaseOutputBuffer(pcmIndex, false)
                         pcmIndex = -1
                         pcm = null
@@ -1166,7 +1415,7 @@ private class AudioTranscode(private val extractor: MediaExtractor, source: Medi
             } else if (decoderDone && !eosQueued) {
                 val index = enc.dequeueInputBuffer(0)
                 if (index >= 0) {
-                    enc.queueInputBuffer(index, 0, 0, pcmPtsUs, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                    enc.queueInputBuffer(index, 0, 0, baseUs + framesSent * 1_000_000L / sampleRate, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
                     eosQueued = true
                 }
             }
@@ -1207,6 +1456,134 @@ private class AudioTranscode(private val extractor: MediaExtractor, source: Medi
         runCatching { decoder.release() }
         runCatching { encoder?.stop() }
         runCatching { encoder?.release() }
+    }
+
+    companion object {
+        /** Opus ön atlaması (ns): csd-1 (8 bayt, küçük sonlu ns) veya "encoder-delay" (örnek, 48 kHz). */
+        fun opusPreSkipNs(format: MediaFormat): Long {
+            runCatching {
+                val csd = format.getByteBuffer("csd-1")
+                if (csd != null && csd.remaining() == 8) return csd.duplicate().order(java.nio.ByteOrder.LITTLE_ENDIAN).getLong(csd.position())
+            }
+            val samples = format.intOr("encoder-delay", 0)
+            return samples * 1_000_000_000L / 48_000
+        }
+
+        /**
+         * Duyulur ilk örneğin kaynak zaman çizelgesindeki yeri (µs). Opus'ta ilk paketin ilk örneği ön atlama
+         * kadar önce başlar: çıkarıcı ön atlamayı negatif zaman olarak verdiyse (ör. MP4 düzenleme listesi,
+         * API 30) duyulur başlangıç ilk damga + ön atlamadır; vermediyse (Matroska blok zamanı) ilk damganın kendisidir.
+         */
+        fun audibleStartUs(format: MediaFormat, firstSampleUs: Long): Long {
+            if (format.getString(MediaFormat.KEY_MIME) != MediaFormat.MIMETYPE_AUDIO_OPUS) return firstSampleUs
+            val preSkipUs = opusPreSkipNs(format) / 1_000
+            return if (preSkipUs > 0 && firstSampleUs <= -preSkipUs / 2) firstSampleUs + preSkipUs else firstSampleUs
+        }
+    }
+}
+
+/**
+ * Kodlayıcı çıkışındaki H.264/HEVC SPS VUI'sini istenen renk açıklaması ve piksel en-boy oranına (SAR) göre
+ * yeniden yazar (Rust `vui` modülü; yalnızca VUI başlık alanları değişir, kare verisine dokunulmaz).
+ * Gerçek cihazlarda görülen kodlayıcı hataları: c2.qti 480p'de BT.601 isteğine BT.709 yazıyor; OMX.qcom
+ * (Android 11) SAR'ı atıyor. Düzeltme hem parametre kümelerine (csd-0) hem anahtar karelerdeki bant içi SPS'e uygulanır.
+ */
+internal class VuiFixer(mime: String, private val target: Target) {
+    /** ISO/IEC 23091-2 kodları; -1 / 0 = o alana dokunma. Android sabitleri MP4 'colr' kutusu için tutulur. */
+    data class Target(
+        val sarWidth: Int, val sarHeight: Int, val primaries: Int, val transfer: Int, val matrix: Int, val fullRange: Int,
+        val standard: Int, val androidTransfer: Int, val range: Int,
+    )
+
+    private val codec = when (mime) {
+        CodecNegotiator.AVC -> 0
+        CodecNegotiator.HEVC -> 1
+        else -> -1
+    }
+    private var scratch: ByteBuffer? = null
+    private var configChanged = false
+    private var failure: String? = null
+    var samplesChanged = 0
+        private set
+
+    private fun rewrite(src: ByteBuffer, offset: Int, length: Int): ByteBuffer? {
+        if (codec < 0 || failure != null || length <= 0) return null
+        val dst = scratch?.takeIf { it.capacity() >= length + 1024 } ?: ByteBuffer.allocateDirect(length + 1024).also { scratch = it }
+        val n = try {
+            Core.nativeRewriteVui(
+                codec, src, offset, length, dst,
+                target.sarWidth, target.sarHeight, target.primaries, target.transfer, target.matrix, target.fullRange,
+            )
+        } catch (e: Throwable) {
+            failure = "VUI düzeltici yüklenemedi (${e.javaClass.simpleName})"
+            return null
+        }
+        if (n < 0) {
+            failure = "SPS çözümlenemedi (${CoreException.describe(n)}); VUI kodlayıcının yazdığı gibi kaldı"
+            return null
+        }
+        if (n == 0) return null
+        dst.position(0)
+        dst.limit(n)
+        return dst
+    }
+
+    /** Parça biçimi: csd-0 SPS'i düzeltilir, renk anahtarları istenen değerlere çekilir. */
+    fun fixFormat(format: MediaFormat) {
+        if (target.standard != 0) format.setInteger(MediaFormat.KEY_COLOR_STANDARD, target.standard)
+        if (target.androidTransfer != 0) format.setInteger(MediaFormat.KEY_COLOR_TRANSFER, target.androidTransfer)
+        if (target.range != 0) format.setInteger(MediaFormat.KEY_COLOR_RANGE, target.range)
+        val csd = runCatching { format.getByteBuffer("csd-0") }.getOrNull() ?: return
+        val src = ByteBuffer.allocateDirect(csd.remaining())
+        src.put(csd.duplicate())
+        src.flip()
+        val fixed = rewrite(src, 0, src.remaining()) ?: return
+        val copy = ByteBuffer.allocate(fixed.remaining())
+        copy.put(fixed)
+        copy.flip()
+        format.setByteBuffer("csd-0", copy)
+        configChanged = true
+    }
+
+    /** Anahtar kare: bant içi SPS varsa düzeltilmiş kopya (sonraki çağrıya kadar geçerli), yoksa null. */
+    fun fixSample(data: ByteBuffer, offset: Int, size: Int): ByteBuffer? {
+        if (!data.isDirect) return null
+        return rewrite(data, offset, size)?.also { samplesChanged++ }
+    }
+
+    fun status(): String? = when {
+        failure != null -> failure
+        configChanged -> "Kodlayıcının VUI'si düzeltildi (renk ${target.primaries}/${target.transfer}/${target.matrix}" +
+            "${if (target.fullRange == 1) " tam aralık" else " sınırlı aralık"}${if (target.sarWidth > 0) ", SAR ${target.sarWidth}:${target.sarHeight}" else ""})"
+        else -> null
+    }
+
+    companion object {
+        /** MediaFormat renk istekleri → ISO/IEC 23091-2 (H.273) kodları. */
+        fun target(standard: Int, transfer: Int, range: Int, sar: Pair<Int, Int>?): Target {
+            val (primaries, matrix) = when (standard) {
+                MediaFormat.COLOR_STANDARD_BT709 -> 1 to 1
+                MediaFormat.COLOR_STANDARD_BT601_PAL -> 5 to 5
+                MediaFormat.COLOR_STANDARD_BT601_NTSC -> 6 to 6
+                MediaFormat.COLOR_STANDARD_BT2020 -> 9 to 9
+                else -> -1 to -1
+            }
+            val iso = when (transfer) {
+                MediaFormat.COLOR_TRANSFER_SDR_VIDEO -> when (standard) {
+                    MediaFormat.COLOR_STANDARD_BT709 -> 1
+                    MediaFormat.COLOR_STANDARD_BT2020 -> 14
+                    else -> 6
+                }
+                MediaFormat.COLOR_TRANSFER_LINEAR -> 8
+                MediaFormat.COLOR_TRANSFER_ST2084 -> 16
+                MediaFormat.COLOR_TRANSFER_HLG -> 18
+                else -> 2
+            }
+            return Target(
+                sar?.first ?: 0, sar?.second ?: 0, primaries, iso, matrix, if (range == MediaFormat.COLOR_RANGE_FULL) 1 else 0,
+                standard, transfer, range,
+            )
+        }
     }
 }
 
@@ -1275,7 +1652,7 @@ class VideoJob(
         }
     }
 
-    private class Encoder(val codec: MediaCodec, val mime: String, val name: String, val settings: EncoderSettings)
+    private class Encoder(val codec: MediaCodec, val mime: String, val name: String, val settings: EncoderSettings, val vui: VuiFixer.Target)
 
     /** Verilen boyutu destekleyen bir kodlayıcı seçip yapılandırır; tercih edilen tür olmazsa diğerini dener. */
     private fun startEncoder(
@@ -1345,12 +1722,15 @@ class VideoJob(
                 var transfer = color?.intOr(MediaFormat.KEY_COLOR_TRANSFER, 0) ?: 0
                 // 8 bit çıktı HDR aktarım eğrisi taşıyamaz.
                 if (transfer == MediaFormat.COLOR_TRANSFER_ST2084 || transfer == MediaFormat.COLOR_TRANSFER_HLG) transfer = MediaFormat.COLOR_TRANSFER_SDR_VIDEO
-                format.setInteger(
-                    MediaFormat.KEY_COLOR_STANDARD,
-                    if (standard != 0) standard else if (width >= 1280 || height > 576) MediaFormat.COLOR_STANDARD_BT709 else MediaFormat.COLOR_STANDARD_BT601_NTSC,
-                )
-                format.setInteger(MediaFormat.KEY_COLOR_RANGE, if (range != 0) range else MediaFormat.COLOR_RANGE_LIMITED)
-                format.setInteger(MediaFormat.KEY_COLOR_TRANSFER, if (transfer != 0) transfer else MediaFormat.COLOR_TRANSFER_SDR_VIDEO)
+                val outStandard = if (standard != 0) standard else if (width >= 1280 || height > 576) MediaFormat.COLOR_STANDARD_BT709 else MediaFormat.COLOR_STANDARD_BT601_NTSC
+                val outRange = if (range != 0) range else MediaFormat.COLOR_RANGE_LIMITED
+                val outTransfer = if (transfer != 0) transfer else MediaFormat.COLOR_TRANSFER_SDR_VIDEO
+                format.setInteger(MediaFormat.KEY_COLOR_STANDARD, outStandard)
+                format.setInteger(MediaFormat.KEY_COLOR_RANGE, outRange)
+                format.setInteger(MediaFormat.KEY_COLOR_TRANSFER, outTransfer)
+                // Kodlayıcı bu istekleri bit akışına yanlış yazabilir (ör. c2.qti 480p'de BT.709, OMX.qcom SAR'ı
+                // atar); çıkış SPS'i [VuiFixer] ile istenen değerlere göre yeniden yazılır.
+                val vui = VuiFixer.target(outStandard, outTransfer, outRange, sar)
                 // Kare olmayan piksel (anamorfik) kaynakta piksel en-boy oranı korunur; kodlayıcı VUI'ye yazar.
                 if (sar != null) {
                     format.setInteger(MediaFormat.KEY_PIXEL_ASPECT_RATIO_WIDTH, sar.first)
@@ -1361,7 +1741,7 @@ class VideoJob(
                     try {
                         codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
                         codec.start()
-                        return Encoder(codec, mime, candidate.name, settings)
+                        return Encoder(codec, mime, candidate.name, settings, vui)
                     } catch (e: Exception) {
                         codec.release()
                         lastError = e
@@ -1627,6 +2007,7 @@ class VideoJob(
 
             // ---- ses -----------------------------------------------------------
             var timelineOffsetUs = 0L
+            var videoOffsetUs = 0L
             var audioTrackOut = -1
             var audioLabel = "ses akışı yok"
             val audioSource = MediaExtractor().also { it.setDataSource(context, input, null) }
@@ -1634,10 +2015,12 @@ class VideoJob(
             findTrack(audioSource, "audio/")?.let { track ->
                 val format = audioSource.getTrackFormat(track)
                 audioSource.selectTrack(track)
-                // Ön dolgu: ilk ses paketi negatif damgalıysa bütün çıktı o kadar ileri kaydırılır (bkz. AudioCopy).
-                timelineOffsetUs = max(0L, -audioSource.sampleTime).coerceAtMost(MAX_TIMELINE_OFFSET_US)
+                // Ön dolgu: ilk duyulur ses örneği negatif zamandaysa bütün çıktı o kadar ileri kaydırılır (bkz. AudioCopy).
+                val copy = format.getString(MediaFormat.KEY_MIME) in MP4_AUDIO_TYPES
+                val audibleUs = if (copy) audioSource.sampleTime else AudioTranscode.audibleStartUs(format, audioSource.sampleTime)
+                timelineOffsetUs = max(0L, -audibleUs).coerceAtMost(MAX_TIMELINE_OFFSET_US)
                 try {
-                    val path: AudioPath = if (format.getString(MediaFormat.KEY_MIME) in MP4_AUDIO_TYPES) {
+                    val path: AudioPath = if (copy) {
                         AudioCopy(audioSource, format, timelineOffsetUs)
                     } else {
                         AudioTranscode(audioSource, format, timelineOffsetUs).also {
@@ -1648,10 +2031,13 @@ class VideoJob(
                     audio = path
                     audioTrackOut = mux.addTrack(path.trackFormat)
                     audioLabel = path.label
+                    // AAC ön dolgusu kadar video da kaydırılır: ses içeriği ile görüntü aynı anda başlar.
+                    videoOffsetUs = timelineOffsetUs + path.delayUs
                 } catch (e: Exception) {
                     audio?.release()
                     audio = null
                     audioTrackOut = -1
+                    videoOffsetUs = timelineOffsetUs
                     audioLabel = "ses atlandı (${format.getString(MediaFormat.KEY_MIME)}: ${e.message ?: e.javaClass.simpleName})"
                     notes += "Ses akışı çıktıya alınamadı."
                 }
@@ -1665,6 +2051,7 @@ class VideoJob(
             var eosQueued = false
             var encoderDone = false
             var videoTrackOut = -1
+            var vuiFixer: VuiFixer? = null
             var framesDecoded = 0L
             var framesQueued = 0L
             var framesEncoded = 0L
@@ -1685,6 +2072,12 @@ class VideoJob(
                                 trackFormat.setInteger(MediaFormat.KEY_PIXEL_ASPECT_RATIO_WIDTH, w)
                                 trackFormat.setInteger(MediaFormat.KEY_PIXEL_ASPECT_RATIO_HEIGHT, h)
                             }
+                            // Parametre kümelerindeki (csd-0) VUI istenen renk/SAR'a göre düzeltilir; MP4 'colr'
+                            // kutusu da aynı değerleri alır.
+                            vuiFixer = VuiFixer(encoder!!.mime, encoder!!.vui).also { fixer ->
+                                fixer.fixFormat(trackFormat)
+                                fixer.status()?.let { notes += it }
+                            }
                             videoTrackOut = mux.addTrack(trackFormat)
                             mux.start()
                             muxerStarted = true
@@ -1694,9 +2087,12 @@ class VideoJob(
                             val config = info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0
                             if (!config && info.size > 0) {
                                 check(muxerStarted) { "çoklayıcı başlamadan veri geldi" }
-                                if (timelineOffsetUs != 0L) info.presentationTimeUs += timelineOffsetUs
-                                mux.writeSampleData(videoTrackOut, data, info)
-                                info.presentationTimeUs -= timelineOffsetUs
+                                // Anahtar karelerde bant içi SPS varsa o da düzeltilir (parametre kümeleriyle tutarlı kalsın).
+                                val fixed = if (info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME != 0) vuiFixer?.fixSample(data, info.offset, info.size) else null
+                                val sample = MediaCodec.BufferInfo().apply {
+                                    set(if (fixed != null) 0 else info.offset, fixed?.remaining() ?: info.size, info.presentationTimeUs + videoOffsetUs, info.flags)
+                                }
+                                mux.writeSampleData(videoTrackOut, fixed ?: data, sample)
                                 framesEncoded++
                                 lastPtsOut = info.presentationTimeUs
                             }
@@ -1855,7 +2251,7 @@ class VideoJob(
                     }
                 }
                 drainEncoder(if (eosQueued) CODEC_TIMEOUT_US else 0)
-                if (muxerStarted && audioTrackOut >= 0) audio?.pump(mux, audioTrackOut, lastPtsOut + timelineOffsetUs)
+                if (muxerStarted && audioTrackOut >= 0) audio?.pump(mux, audioTrackOut, lastPtsOut + videoOffsetUs)
 
                 val now = SystemClock.elapsedRealtime()
                 if (now - lastReport >= PROGRESS_INTERVAL_MS) {
@@ -1874,6 +2270,7 @@ class VideoJob(
             val finalSession = session ?: throw JobException("Videoda çözülebilir kare yok")
             val finalEncoder = encoder ?: throw JobException("Kodlayıcı başlatılmadı")
             val stats = finalSession.stats()
+            vuiFixer?.samplesChanged?.takeIf { it > 0 }?.let { notes += "Anahtar karelerdeki bant içi SPS de düzeltildi ($it kare)." }
             // Kare sayıları burada denetlenip hata fırlatılmaz: bazı donanım kodlayıcıları bit hızı
             // baskısında kare düşürebilir. Dosya korunur; uyumsuzluk JobResult.intact = false olarak
             // arayüze "bütünlük uyarısı" şeklinde yansır.
@@ -1885,6 +2282,7 @@ class VideoJob(
                 restorer != null, notes, stats,
                 encoderSettings = finalEncoder.settings, sourceVideo = sourceVideo,
                 sourceDeclaredBitrate = sourceBitrate, sourceFrameRate = frameRate,
+                audioDelayUs = videoOffsetUs - timelineOffsetUs,
             )
         } finally {
             session?.close()

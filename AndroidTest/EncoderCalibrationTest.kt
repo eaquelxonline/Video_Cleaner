@@ -233,14 +233,16 @@ class EncoderCalibrationTest {
                 if (copied && sMime != oMime) problems += "ses kodeki değişti $sMime→$oMime"
                 if (sa.format.int(MediaFormat.KEY_SAMPLE_RATE) != oa.format.int(MediaFormat.KEY_SAMPLE_RATE)) problems += "örnekleme hızı değişti"
                 if (sa.format.int(MediaFormat.KEY_CHANNEL_COUNT) != oa.format.int(MediaFormat.KEY_CHANNEL_COUNT)) problems += "kanal sayısı değişti"
-                // A/V senkron: sesin görüntüye göre başlangıç ofseti kaynakla aynı olmalı. Kopyada ≤ 1 ms (MP4 zaman
-                // tabanı yuvarlaması); yeniden kodlamada çözücü ön dolguyu kendisi düştüğü için ≤ 1 paket (25 ms).
+                // A/V senkron (paket düzeyi tutarlılık): sesin görüntüye göre başlangıç ofseti kaynakla aynı olmalı.
+                // Kopyada ≤ 1 ms (MP4 zaman tabanı yuvarlaması). Yeniden kodlamada video, AAC ön dolgusu kadar
+                // bilerek kaydırılır (result.audioDelayUs); kalan fark ≤ 1 Opus ön atlaması + yuvarlama (10 ms).
+                // İçerik tabanlı asıl senkron ölçümü ffmpeg ile calibration_metrics.py içinde yapılır.
                 val sOff = sa.firstPts - sv.firstPts
-                val oOff = oa.firstPts - ov.firstPts
-                val syncTol = if (result.audio.contains("kopyalandı")) 1_000L else 25_000L
+                val oOff = oa.firstPts - ov.firstPts + if (copied) 0L else result.audioDelayUs
+                val syncTol = if (copied) 1_000L else 10_000L
                 if (kotlin.math.abs(oOff - sOff) > syncTol) problems += "A/V ofseti ${sOff}µs→${oOff}µs"
                 val sDur = sa.endUs - sa.firstPts
-                val oDur = oa.endUs - oa.firstPts
+                val oDur = oa.endUs - oa.firstPts - if (copied) 0L else result.audioDelayUs
                 if (kotlin.math.abs(oDur - sDur) > 50_000L) problems += "ses süresi ${sDur / 1000}ms→${oDur / 1000}ms"
                 audio = "src=$sMime/${sa.format.int(MediaFormat.KEY_SAMPLE_RATE)}Hz/${sa.format.int(MediaFormat.KEY_CHANNEL_COUNT)}ch/${sa.hashes.size}pk " +
                     "out=$oMime/${oa.format.int(MediaFormat.KEY_SAMPLE_RATE)}Hz/${oa.format.int(MediaFormat.KEY_CHANNEL_COUNT)}ch/${oa.hashes.size}pk " +

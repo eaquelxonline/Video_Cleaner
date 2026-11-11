@@ -3596,6 +3596,669 @@ impl Engine {
 }
 
 // ============================================================================
+// 9c. SPS/VUI yeniden yazıcı (H.264 + HEVC) — renk ve piksel en-boy oranı
+// ============================================================================
+
+/// Kodlayıcının bit akışına yazdığı SPS VUI'sini, pikselleri değiştirmeden düzeltir.
+///
+/// Neden: gerçek cihazlarda (Galaxy Z Flip8 / Qualcomm c2.qti) kodlayıcı istenen BT.601'i yok sayıp
+/// VUI'ye BT.709 yazıyor; Android 11 OMX kodlayıcıları piksel en-boy oranını (SAR) hiç yazmıyor.
+/// Bu modül SPS'i Exp-Golomb ile VUI'ye kadar ayrıştırır, yalnızca `aspect_ratio_info` ve
+/// `video_signal_type` (renk) bölümlerini yeniden yazar; SPS'in geri kalan bütün bitleri (zamanlama,
+/// HRD, bitstream_restriction, HEVC uzantıları) bit bit aynen kopyalanır. Öykünme önleme baytları
+/// (0x000003) kaldırılıp yeniden eklenir. Hedef zaten yazılı değerlerle aynıysa çıktı girdiyle bayt
+/// bayt aynıdır (birim testleriyle doğrulanır).
+pub mod vui {
+    use std::fmt;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Codec {
+        Avc,
+        Hevc,
+    }
+
+    /// ISO/IEC 23091-2 renk kodları (H.264/HEVC VUI ile aynı numaralar).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Colour {
+        pub primaries: u8,
+        pub transfer: u8,
+        pub matrix: u8,
+        pub full_range: bool,
+    }
+
+    /// Yazılacak hedef. `None` olan bölüm olduğu gibi bırakılır.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct Target {
+        pub sar: Option<(u16, u16)>,
+        pub colour: Option<Colour>,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum VuiError {
+        Truncated,
+        Unsupported(&'static str),
+    }
+
+    impl fmt::Display for VuiError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                VuiError::Truncated => write!(f, "SPS beklenenden kısa"),
+                VuiError::Unsupported(what) => write!(f, "desteklenmeyen SPS: {what}"),
+            }
+        }
+    }
+
+    /// SPS'ten okunan VUI değerleri (testler ve tanılama için).
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct Parsed {
+        pub vui_present: bool,
+        pub sar: Option<(u16, u16)>,
+        pub aspect_idc: Option<u8>,
+        pub colour: Option<Colour>,
+        pub video_format: Option<u8>,
+    }
+
+    // ---- öykünme önleme --------------------------------------------------------
+
+    /// NAL yükünden 0x000003 öykünme önleme baytlarını kaldırır (RBSP).
+    pub fn unescape(data: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(data.len());
+        let mut zeros = 0usize;
+        for &b in data {
+            if zeros >= 2 && b == 3 {
+                zeros = 0;
+                continue;
+            }
+            zeros = if b == 0 { zeros + 1 } else { 0 };
+            out.push(b);
+        }
+        out
+    }
+
+    /// RBSP'ye öykünme önleme baytlarını ekler (00 00 0x, x ≤ 3 → 00 00 03 0x).
+    pub fn escape(rbsp: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(rbsp.len() + rbsp.len() / 64 + 4);
+        let mut zeros = 0usize;
+        for &b in rbsp {
+            if zeros >= 2 && b <= 3 {
+                out.push(3);
+                zeros = 0;
+            }
+            zeros = if b == 0 { zeros + 1 } else { 0 };
+            out.push(b);
+        }
+        out
+    }
+
+    // ---- bit okuyucu / yazıcı ---------------------------------------------------
+
+    struct Reader<'a> {
+        data: &'a [u8],
+        pos: usize,
+        end: usize,
+    }
+
+    impl<'a> Reader<'a> {
+        fn new(data: &'a [u8], end: usize) -> Self {
+            Reader { data, pos: 0, end }
+        }
+        fn bit(&mut self) -> Result<u32, VuiError> {
+            if self.pos >= self.end {
+                return Err(VuiError::Truncated);
+            }
+            let b = (self.data[self.pos >> 3] >> (7 - (self.pos & 7))) & 1;
+            self.pos += 1;
+            Ok(b as u32)
+        }
+        fn u(&mut self, n: u32) -> Result<u32, VuiError> {
+            let mut v = 0u32;
+            for _ in 0..n {
+                v = (v << 1) | self.bit()?;
+            }
+            Ok(v)
+        }
+        fn skip(&mut self, n: usize) -> Result<(), VuiError> {
+            if self.pos + n > self.end {
+                return Err(VuiError::Truncated);
+            }
+            self.pos += n;
+            Ok(())
+        }
+        fn ue(&mut self) -> Result<u32, VuiError> {
+            let mut zeros = 0u32;
+            while self.bit()? == 0 {
+                zeros += 1;
+                if zeros > 31 {
+                    return Err(VuiError::Unsupported("Exp-Golomb taşması"));
+                }
+            }
+            if zeros == 0 {
+                return Ok(0);
+            }
+            Ok(((1u64 << zeros) - 1 + self.u(zeros)? as u64) as u32)
+        }
+        fn se(&mut self) -> Result<i32, VuiError> {
+            let k = self.ue()? as i64;
+            Ok(if k & 1 == 1 {
+                ((k + 1) / 2) as i32
+            } else {
+                -(k / 2) as i32
+            })
+        }
+    }
+
+    struct Writer {
+        out: Vec<u8>,
+        bits: usize,
+    }
+
+    impl Writer {
+        fn new() -> Self {
+            Writer {
+                out: Vec::new(),
+                bits: 0,
+            }
+        }
+        fn put(&mut self, v: u32, n: u32) {
+            for i in (0..n).rev() {
+                if self.bits.is_multiple_of(8) {
+                    self.out.push(0);
+                }
+                if (v >> i) & 1 == 1 {
+                    let last = self.out.len() - 1;
+                    self.out[last] |= 1 << (7 - (self.bits % 8));
+                }
+                self.bits += 1;
+            }
+        }
+        /// `data` içindeki [from, to) bit aralığını aynen kopyalar.
+        fn copy(&mut self, data: &[u8], from: usize, to: usize) {
+            for p in from..to {
+                self.put(((data[p >> 3] >> (7 - (p & 7))) & 1) as u32, 1);
+            }
+        }
+        /// rbsp_trailing_bits: durak biti ve bayt hizası.
+        fn finish(mut self) -> Vec<u8> {
+            self.put(1, 1);
+            while !self.bits.is_multiple_of(8) {
+                self.put(0, 1);
+            }
+            self.out
+        }
+    }
+
+    /// RBSP'deki rbsp_stop_one_bit'in bit konumu (veri bu konumdan önce biter).
+    fn stop_bit(rbsp: &[u8]) -> Result<usize, VuiError> {
+        let last = rbsp
+            .iter()
+            .rposition(|&b| b != 0)
+            .ok_or(VuiError::Truncated)?;
+        let tz = rbsp[last].trailing_zeros() as usize;
+        Ok(last * 8 + 7 - tz)
+    }
+
+    // ---- SPS ayrıştırma: VUI'ye kadar ----------------------------------------
+
+    /// VUI bayrağının ve (varsa) VUI içindeki bölümlerin bit konumları.
+    struct Layout {
+        vui_flag: usize,
+        vui_present: bool,
+        aspect_start: usize,
+        aspect_end: usize,
+        overscan_end: usize,
+        signal_end: usize,
+        parsed: Parsed,
+    }
+
+    fn avc_scaling_list(r: &mut Reader, size: usize) -> Result<(), VuiError> {
+        let (mut last, mut next) = (8i32, 8i32);
+        for _ in 0..size {
+            if next != 0 {
+                let delta = r.se()?;
+                next = (last + delta + 256).rem_euclid(256);
+            }
+            if next != 0 {
+                last = next;
+            }
+        }
+        Ok(())
+    }
+
+    fn avc_to_vui(r: &mut Reader) -> Result<(), VuiError> {
+        let profile = r.u(8)?;
+        r.skip(16)?; // constraint bayrakları + level_idc
+        r.ue()?; // seq_parameter_set_id
+        if matches!(
+            profile,
+            100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 139 | 134 | 135
+        ) {
+            let chroma = r.ue()?;
+            if chroma == 3 {
+                r.skip(1)?;
+            }
+            r.ue()?;
+            r.ue()?;
+            r.skip(1)?;
+            if r.bit()? == 1 {
+                let lists = if chroma == 3 { 12 } else { 8 };
+                for i in 0..lists {
+                    if r.bit()? == 1 {
+                        avc_scaling_list(r, if i < 6 { 16 } else { 64 })?;
+                    }
+                }
+            }
+        }
+        r.ue()?; // log2_max_frame_num_minus4
+        match r.ue()? {
+            0 => {
+                r.ue()?;
+            }
+            1 => {
+                r.skip(1)?;
+                r.se()?;
+                r.se()?;
+                let n = r.ue()?;
+                if n > 255 {
+                    return Err(VuiError::Unsupported("POC döngüsü"));
+                }
+                for _ in 0..n {
+                    r.se()?;
+                }
+            }
+            _ => {}
+        }
+        r.ue()?; // max_num_ref_frames
+        r.skip(1)?;
+        r.ue()?;
+        r.ue()?;
+        if r.bit()? == 0 {
+            r.skip(1)?; // mb_adaptive_frame_field_flag
+        }
+        r.skip(1)?; // direct_8x8_inference_flag
+        if r.bit()? == 1 {
+            for _ in 0..4 {
+                r.ue()?;
+            }
+        }
+        Ok(())
+    }
+
+    fn hevc_profile_tier_level(r: &mut Reader, max_sub_layers_minus1: u32) -> Result<(), VuiError> {
+        r.skip(88)?; // general_profile_space … general_inbld/reserved
+        r.skip(8)?; // general_level_idc
+        let mut prof = [false; 8];
+        let mut lvl = [false; 8];
+        for i in 0..max_sub_layers_minus1 as usize {
+            prof[i] = r.bit()? == 1;
+            lvl[i] = r.bit()? == 1;
+        }
+        if max_sub_layers_minus1 > 0 {
+            for _ in max_sub_layers_minus1..8 {
+                r.skip(2)?;
+            }
+        }
+        for i in 0..max_sub_layers_minus1 as usize {
+            if prof[i] {
+                r.skip(88)?;
+            }
+            if lvl[i] {
+                r.skip(8)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn hevc_scaling_list_data(r: &mut Reader) -> Result<(), VuiError> {
+        for size_id in 0..4u32 {
+            let step = if size_id == 3 { 3 } else { 1 };
+            let mut matrix = 0;
+            while matrix < 6 {
+                if r.bit()? == 0 {
+                    r.ue()?; // scaling_list_pred_matrix_id_delta
+                } else {
+                    let coefs = 64.min(1 << (4 + (size_id << 1)));
+                    if size_id > 1 {
+                        r.se()?;
+                    }
+                    for _ in 0..coefs {
+                        r.se()?;
+                    }
+                }
+                matrix += step;
+            }
+        }
+        Ok(())
+    }
+
+    fn hevc_to_vui(r: &mut Reader) -> Result<(), VuiError> {
+        r.skip(4)?; // sps_video_parameter_set_id
+        let max_sub = r.u(3)?;
+        r.skip(1)?;
+        hevc_profile_tier_level(r, max_sub)?;
+        r.ue()?; // sps_seq_parameter_set_id
+        if r.ue()? == 3 {
+            r.skip(1)?;
+        }
+        r.ue()?;
+        r.ue()?;
+        if r.bit()? == 1 {
+            for _ in 0..4 {
+                r.ue()?;
+            }
+        }
+        r.ue()?;
+        r.ue()?;
+        let log2_max_poc_lsb = r.ue()? + 4;
+        let ordering_all = r.bit()? == 1;
+        let first = if ordering_all { 0 } else { max_sub };
+        for _ in first..=max_sub {
+            r.ue()?;
+            r.ue()?;
+            r.ue()?;
+        }
+        for _ in 0..6 {
+            r.ue()?;
+        }
+        if r.bit()? == 1 && r.bit()? == 1 {
+            hevc_scaling_list_data(r)?;
+        }
+        r.skip(2)?; // amp_enabled, sample_adaptive_offset_enabled
+        if r.bit()? == 1 {
+            r.skip(8)?;
+            r.ue()?;
+            r.ue()?;
+            r.skip(1)?;
+        }
+        let num_sets = r.ue()? as usize;
+        if num_sets > 64 {
+            return Err(VuiError::Unsupported("st_ref_pic_set sayısı"));
+        }
+        let mut deltas: Vec<u32> = Vec::with_capacity(num_sets);
+        for idx in 0..num_sets {
+            let inter = idx != 0 && r.bit()? == 1;
+            if inter {
+                r.skip(1)?; // delta_rps_sign
+                r.ue()?; // abs_delta_rps_minus1
+                let reference = deltas[idx - 1];
+                let mut count = 0;
+                for _ in 0..=reference {
+                    let used = r.bit()? == 1;
+                    let use_delta = if used { true } else { r.bit()? == 1 };
+                    if use_delta {
+                        count += 1;
+                    }
+                }
+                deltas.push(count);
+            } else {
+                let neg = r.ue()?;
+                let pos = r.ue()?;
+                if neg + pos > 32 {
+                    return Err(VuiError::Unsupported("st_ref_pic_set boyutu"));
+                }
+                for _ in 0..neg + pos {
+                    r.ue()?;
+                    r.skip(1)?;
+                }
+                deltas.push(neg + pos);
+            }
+        }
+        if r.bit()? == 1 {
+            let n = r.ue()?;
+            if n > 32 {
+                return Err(VuiError::Unsupported("uzun dönem referans"));
+            }
+            for _ in 0..n {
+                r.skip(log2_max_poc_lsb as usize + 1)?;
+            }
+        }
+        r.skip(2)?; // sps_temporal_mvp_enabled, strong_intra_smoothing_enabled
+        Ok(())
+    }
+
+    fn layout(codec: Codec, rbsp: &[u8], end: usize) -> Result<Layout, VuiError> {
+        let header_bits = match codec {
+            Codec::Avc => 8,
+            Codec::Hevc => 16,
+        };
+        let mut r = Reader::new(rbsp, end);
+        r.skip(header_bits)?;
+        match codec {
+            Codec::Avc => avc_to_vui(&mut r)?,
+            Codec::Hevc => hevc_to_vui(&mut r)?,
+        }
+        let vui_flag = r.pos;
+        let vui_present = r.bit()? == 1;
+        let mut parsed = Parsed {
+            vui_present,
+            ..Parsed::default()
+        };
+        let aspect_start = r.pos;
+        if !vui_present {
+            return Ok(Layout {
+                vui_flag,
+                vui_present,
+                aspect_start,
+                aspect_end: aspect_start,
+                overscan_end: aspect_start,
+                signal_end: aspect_start,
+                parsed,
+            });
+        }
+        if r.bit()? == 1 {
+            let idc = r.u(8)? as u8;
+            parsed.aspect_idc = Some(idc);
+            if idc == 255 {
+                parsed.sar = Some((r.u(16)? as u16, r.u(16)? as u16));
+            } else {
+                parsed.sar = sar_from_idc(idc);
+            }
+        }
+        let aspect_end = r.pos;
+        if r.bit()? == 1 {
+            r.skip(1)?;
+        }
+        let overscan_end = r.pos;
+        if r.bit()? == 1 {
+            parsed.video_format = Some(r.u(3)? as u8);
+            let full = r.bit()? == 1;
+            if r.bit()? == 1 {
+                parsed.colour = Some(Colour {
+                    primaries: r.u(8)? as u8,
+                    transfer: r.u(8)? as u8,
+                    matrix: r.u(8)? as u8,
+                    full_range: full,
+                });
+            }
+        }
+        let signal_end = r.pos;
+        Ok(Layout {
+            vui_flag,
+            vui_present,
+            aspect_start,
+            aspect_end,
+            overscan_end,
+            signal_end,
+            parsed,
+        })
+    }
+
+    /// Tablo 2-1 (H.264 Tablo E-1 / HEVC Tablo E.1) SAR değerleri.
+    const SAR_TABLE: [(u16, u16); 17] = [
+        (0, 0),
+        (1, 1),
+        (12, 11),
+        (10, 11),
+        (16, 11),
+        (40, 33),
+        (24, 11),
+        (20, 11),
+        (32, 11),
+        (80, 33),
+        (18, 11),
+        (15, 11),
+        (64, 33),
+        (160, 99),
+        (4, 3),
+        (3, 2),
+        (2, 1),
+    ];
+
+    fn sar_from_idc(idc: u8) -> Option<(u16, u16)> {
+        SAR_TABLE.get(idc as usize).copied().filter(|s| s.0 != 0)
+    }
+
+    fn nal_type(codec: Codec, nal: &[u8]) -> Option<u8> {
+        let b = *nal.first()?;
+        Some(match codec {
+            Codec::Avc => b & 0x1f,
+            Codec::Hevc => (b >> 1) & 0x3f,
+        })
+    }
+
+    fn is_sps(codec: Codec, nal: &[u8]) -> bool {
+        match codec {
+            Codec::Avc => nal_type(codec, nal) == Some(7),
+            Codec::Hevc => nal_type(codec, nal) == Some(33) && nal.len() > 2,
+        }
+    }
+
+    /// Başlık baytları dahil SPS NAL'inin VUI değerlerini okur.
+    pub fn parse_sps(codec: Codec, nal: &[u8]) -> Result<Parsed, VuiError> {
+        let rbsp = unescape(nal);
+        let end = stop_bit(&rbsp)?;
+        Ok(layout(codec, &rbsp, end)?.parsed)
+    }
+
+    /// Başlık baytları dahil tek bir SPS NAL'ini yeniden yazar. Değişiklik gerekmiyorsa `None`.
+    pub fn rewrite_sps(
+        codec: Codec,
+        nal: &[u8],
+        target: Target,
+    ) -> Result<Option<Vec<u8>>, VuiError> {
+        if target.sar.is_none() && target.colour.is_none() {
+            return Ok(None);
+        }
+        let rbsp = unescape(nal);
+        let end = stop_bit(&rbsp)?;
+        let l = layout(codec, &rbsp, end)?;
+        let sar_ok = target
+            .sar
+            .is_none_or(|s| l.parsed.sar == Some(s) || (s == (1, 1) && l.parsed.sar.is_none()));
+        let colour_ok = target.colour.is_none_or(|c| l.parsed.colour == Some(c));
+        if sar_ok && colour_ok {
+            return Ok(None);
+        }
+        let mut w = Writer::new();
+        w.copy(&rbsp, 0, l.vui_flag);
+        w.put(1, 1); // vui_parameters_present_flag
+        // aspect_ratio_info
+        match target.sar {
+            Some(sar) if !sar_ok => {
+                w.put(1, 1);
+                match SAR_TABLE.iter().position(|&t| t == sar && t.0 != 0) {
+                    Some(idc) => w.put(idc as u32, 8),
+                    None => {
+                        w.put(255, 8);
+                        w.put(sar.0 as u32, 16);
+                        w.put(sar.1 as u32, 16);
+                    }
+                }
+            }
+            _ if l.vui_present => w.copy(&rbsp, l.aspect_start, l.aspect_end),
+            _ => w.put(0, 1),
+        }
+        // overscan_info
+        if l.vui_present {
+            w.copy(&rbsp, l.aspect_end, l.overscan_end);
+        } else {
+            w.put(0, 1);
+        }
+        // video_signal_type
+        match target.colour {
+            Some(c) if !colour_ok => {
+                w.put(1, 1);
+                w.put(l.parsed.video_format.unwrap_or(5) as u32, 3);
+                w.put(c.full_range as u32, 1);
+                w.put(1, 1);
+                w.put(c.primaries as u32, 8);
+                w.put(c.transfer as u32, 8);
+                w.put(c.matrix as u32, 8);
+            }
+            _ if l.vui_present => w.copy(&rbsp, l.overscan_end, l.signal_end),
+            _ => w.put(0, 1),
+        }
+        if l.vui_present {
+            // VUI'nin kalanı ve SPS'in VUI sonrası (HEVC uzantıları) aynen.
+            w.copy(&rbsp, l.signal_end, end);
+        } else {
+            match codec {
+                // chroma_loc, timing, nal_hrd, vcl_hrd, pic_struct, bitstream_restriction
+                Codec::Avc => w.put(0, 6),
+                // chroma_loc, neutral_chroma, field_seq, frame_field_info, default_display_window,
+                // timing, bitstream_restriction
+                Codec::Hevc => w.put(0, 7),
+            }
+            w.copy(&rbsp, l.aspect_start, end); // VUI'den sonraki SPS bitleri (HEVC uzantı bayrakları)
+        }
+        Ok(Some(escape(&w.finish())))
+    }
+
+    /// Annex B akışındaki (başlangıç kodlu) bütün SPS NAL'lerini yeniden yazar. Değişiklik yoksa `None`.
+    pub fn rewrite_annexb(
+        codec: Codec,
+        data: &[u8],
+        target: Target,
+    ) -> Result<Option<Vec<u8>>, VuiError> {
+        // Başlangıç kodu konumları: (kod başı, yük başı)
+        let mut starts = Vec::new();
+        let mut i = 0;
+        while i + 3 <= data.len() {
+            if data[i] == 0 && data[i + 1] == 0 {
+                if data[i + 2] == 1 {
+                    starts.push((i, i + 3));
+                    i += 3;
+                    continue;
+                }
+                if i + 4 <= data.len() && data[i + 2] == 0 && data[i + 3] == 1 {
+                    starts.push((i, i + 4));
+                    i += 4;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        if starts.is_empty() {
+            return Ok(None);
+        }
+        let mut out: Option<Vec<u8>> = None;
+        let mut copied = 0;
+        for (k, &(code, payload)) in starts.iter().enumerate() {
+            let next = starts.get(k + 1).map(|s| s.0).unwrap_or(data.len());
+            // NAL'in sonundaki sıfırlar bir sonraki başlangıç kodunun parçası sayılmaz; olduğu gibi kalır.
+            let mut nal_end = next;
+            while nal_end > payload && data[nal_end - 1] == 0 {
+                nal_end -= 1;
+            }
+            let nal = &data[payload..nal_end];
+            if !is_sps(codec, nal) {
+                continue;
+            }
+            if let Some(new_nal) = rewrite_sps(codec, nal, target)? {
+                let buf = out.get_or_insert_with(|| Vec::with_capacity(data.len() + 64));
+                buf.extend_from_slice(&data[copied..payload]);
+                buf.extend_from_slice(&new_nal);
+                copied = nal_end;
+            }
+            let _ = code;
+        }
+        Ok(out.map(|mut buf| {
+            buf.extend_from_slice(&data[copied..]);
+            buf
+        }))
+    }
+}
+
+// ============================================================================
 // 10. JNI köprüsü (Kotlin: com.video.cleaner.Core)
 // ============================================================================
 
@@ -4054,6 +4717,74 @@ pub mod jni {
         {
             let _ = (env, handle, buffer, crop_left, crop_top, pts_us, flags);
             CoreError::BadState.code() as i64
+        }
+    }
+
+    /// `external fun nativeRewriteVui(codec: Int, src: ByteBuffer, offset: Int, length: Int, dst: ByteBuffer,
+    /// sarWidth: Int, sarHeight: Int, primaries: Int, transfer: Int, matrix: Int, fullRange: Int): Int`
+    ///
+    /// Annex B (başlangıç kodlu) H.264 (`codec` 0) veya HEVC (1) verisindeki SPS'lerin VUI'sini yeniden yazar
+    /// ([`crate::vui`]). `sarWidth <= 0` → SAR'a dokunulmaz; `primaries < 0` → renge dokunulmaz.
+    /// Dönüş: `dst`'ye yazılan yeni uzunluk (> 0), değişiklik yoksa 0, hata ise negatif kod.
+    ///
+    /// # Safety
+    /// `env` geçerli olmalı; `src` ve `dst` doğrudan ByteBuffer olmalı ve örtüşmemelidir.
+    #[unsafe(no_mangle)]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe extern "system" fn Java_com_video_cleaner_Core_nativeRewriteVui(
+        env: *mut JniEnv,
+        _class: JObject,
+        codec: i32,
+        src: JObject,
+        offset: i32,
+        length: i32,
+        dst: JObject,
+        sar_width: i32,
+        sar_height: i32,
+        primaries: i32,
+        transfer: i32,
+        matrix: i32,
+        full_range: i32,
+    ) -> i32 {
+        use crate::vui::{Codec, Colour, Target, rewrite_annexb};
+        let codec = match codec {
+            0 => Codec::Avc,
+            1 => Codec::Hevc,
+            _ => return CoreError::BadArgument.code(),
+        };
+        // SAFETY: çağıranın sözleşmesi.
+        let (src_ptr, src_cap) = match unsafe { direct_buffer(env, src) } {
+            Ok(v) => v,
+            Err(e) => return e.code(),
+        };
+        if offset < 0 || length <= 0 || offset as usize + length as usize > src_cap {
+            return CoreError::BadArgument.code();
+        }
+        // SAFETY: aralık tampon içinde denetlendi; tampon çağrı boyunca yaşar.
+        let data =
+            unsafe { std::slice::from_raw_parts(src_ptr.add(offset as usize), length as usize) };
+        let target = Target {
+            sar: (sar_width > 0 && sar_height > 0 && sar_width <= 65535 && sar_height <= 65535)
+                .then_some((sar_width as u16, sar_height as u16)),
+            colour: (primaries >= 0).then_some(Colour {
+                primaries: primaries.clamp(0, 255) as u8,
+                transfer: transfer.clamp(0, 255) as u8,
+                matrix: matrix.clamp(0, 255) as u8,
+                full_range: full_range == 1,
+            }),
+        };
+        match rewrite_annexb(codec, data, target) {
+            Ok(None) => 0,
+            Ok(Some(out)) => {
+                // SAFETY: çağıranın sözleşmesi.
+                let dst = match unsafe { buffer_mut(env, dst, out.len()) } {
+                    Ok(b) => b,
+                    Err(e) => return e.code(),
+                };
+                dst[..out.len()].copy_from_slice(&out);
+                out.len() as i32
+            }
+            Err(_) => CoreError::Unsupported.code(),
         }
     }
 
@@ -6936,5 +7667,214 @@ mod tests {
             "{json}"
         );
         unsafe { Java_com_video_cleaner_Core_vcDestroy(env, null, ctx) };
+    }
+}
+
+#[cfg(test)]
+mod vui_tests {
+    use super::vui::*;
+
+    fn hex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    // x264 / x265 ile üretilmiş gerçek SPS'ler (başlık baytları dahil, öykünme önleme baytlarıyla).
+    const AVC: &[&str] = &[
+        "6742c00dd90141fb0110000003001000000303c0f142a480", // Constrained Baseline, VUI var
+        "6764000dacd94141fb0110000003001000000303c0f1429960", // High
+        "6764000dacd94141fbff0020001b6a02020280000003008000001e078a14cb", // High, SAR 32:27, BT.709
+        "6764000dacd94141fb0110000003001000000303c604000927c00124fa4c30078a14cb", // High + NAL HRD
+        "67f4000d919b28283f6022000003000200000300781e28532c", // High 4:4:4
+    ];
+    const HEVC: &[&str] = &[
+        "42010101600000030090000003000003003ca00a080f165959a4932bc05a020000030002000003003c10", // Main
+        "42010102200000030090000003000003003ca00a080f1365959a4932bc05a848804820000003002000000303cc0292cdc00124f800249f10", // Main10 HDR + HRD
+        "42010101600000030090000003000003003ca00a080f165959a49395e02d010000030001000003001e08", // ölçekleme listesi, B-piramit
+    ];
+
+    fn all() -> Vec<(Codec, Vec<u8>)> {
+        AVC.iter()
+            .map(|h| (Codec::Avc, hex(h)))
+            .chain(HEVC.iter().map(|h| (Codec::Hevc, hex(h))))
+            .collect()
+    }
+
+    const BT601: Colour = Colour {
+        primaries: 6,
+        transfer: 6,
+        matrix: 6,
+        full_range: false,
+    };
+
+    #[test]
+    fn parses_every_fixture() {
+        for (codec, sps) in all() {
+            let p =
+                parse_sps(codec, &sps).unwrap_or_else(|e| panic!("{codec:?} {}: {e}", sps.len()));
+            assert!(p.vui_present || codec == Codec::Avc, "{p:?}");
+        }
+        let p = parse_sps(Codec::Avc, &hex(AVC[2])).unwrap();
+        assert_eq!(p.sar, Some((32, 27)));
+        assert_eq!(
+            p.colour,
+            Some(Colour {
+                primaries: 1,
+                transfer: 1,
+                matrix: 1,
+                full_range: false
+            })
+        );
+        let p = parse_sps(Codec::Hevc, &hex(HEVC[1])).unwrap();
+        assert_eq!(
+            p.colour,
+            Some(Colour {
+                primaries: 9,
+                transfer: 16,
+                matrix: 9,
+                full_range: false
+            })
+        );
+    }
+
+    #[test]
+    fn same_values_leave_sps_untouched() {
+        for (codec, sps) in all() {
+            let p = parse_sps(codec, &sps).unwrap();
+            let t = Target {
+                sar: p.sar,
+                colour: p.colour,
+            };
+            assert_eq!(rewrite_sps(codec, &sps, t).unwrap(), None, "{codec:?}");
+        }
+    }
+
+    #[test]
+    fn rewrite_sets_values_and_round_trips_bit_exactly() {
+        for (codec, sps) in all() {
+            let before = parse_sps(codec, &sps).unwrap();
+            let t = Target {
+                sar: Some((40, 33)),
+                colour: Some(BT601),
+            };
+            let new = rewrite_sps(codec, &sps, t).unwrap().expect("değişmeli");
+            let after = parse_sps(codec, &new).unwrap();
+            assert_eq!(after.sar, Some((40, 33)), "{codec:?}");
+            assert_eq!(after.colour, Some(BT601), "{codec:?}");
+            assert!(after.vui_present);
+            // Tablo dışı SAR: 255 + açık değerler
+            let odd = rewrite_sps(
+                codec,
+                &sps,
+                Target {
+                    sar: Some((853, 854)),
+                    colour: None,
+                },
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(parse_sps(codec, &odd).unwrap().sar, Some((853, 854)));
+            assert_eq!(
+                parse_sps(codec, &odd).unwrap().colour,
+                before.colour,
+                "renk korunmalı"
+            );
+            // Asıl SPS'te iki bölüm de varsa eski değerlere dönünce bayt bayt aynı SPS çıkmalı.
+            if before.colour.is_some() && before.aspect_idc.is_some() {
+                let back = rewrite_sps(
+                    codec,
+                    &new,
+                    Target {
+                        sar: before.sar,
+                        colour: before.colour,
+                    },
+                )
+                .unwrap()
+                .unwrap();
+                if before.aspect_idc == Some(255) || before.sar.is_none() {
+                    // tablo dışı ya da belirsiz SAR yeniden üretilemeyebilir: değerleri karşılaştır
+                    assert_eq!(parse_sps(codec, &back).unwrap().colour, before.colour);
+                } else {
+                    assert_eq!(back, sps, "{codec:?}: A→B→A bit bit aynı olmalı");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn escape_round_trip() {
+        let mut seed = 0x1234_5678u32;
+        for len in [0usize, 1, 2, 3, 4, 17, 300] {
+            let data: Vec<u8> = (0..len)
+                .map(|_| {
+                    seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    // bol sıfır ve küçük değer: öykünme koşullarını zorla
+                    [0u8, 0, 0, 1, 2, 3, 0xff][(seed >> 24) as usize % 7]
+                })
+                .collect();
+            let esc = escape(&data);
+            assert_eq!(unescape(&esc), data);
+            for w in esc.windows(3) {
+                assert!(
+                    !(w[0] == 0 && w[1] == 0 && w[2] <= 2),
+                    "kaçışsız 00 00 0x kalmamalı: {esc:02x?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn annexb_only_sps_changes() {
+        let sps = hex(AVC[1]);
+        let pps = hex("68ebe3cb22c0");
+        let idr = hex("6588840021ffd6bf");
+        let mut stream = vec![0, 0, 0, 1];
+        stream.extend(&sps);
+        stream.extend([0, 0, 1]);
+        stream.extend(&pps);
+        stream.extend([0, 0, 0, 1]);
+        stream.extend(&idr);
+        let t = Target {
+            sar: Some((32, 27)),
+            colour: Some(BT601),
+        };
+        let out = rewrite_annexb(Codec::Avc, &stream, t).unwrap().unwrap();
+        let expected_sps = rewrite_sps(Codec::Avc, &sps, t).unwrap().unwrap();
+        let mut expected = vec![0, 0, 0, 1];
+        expected.extend(&expected_sps);
+        expected.extend([0, 0, 1]);
+        expected.extend(&pps);
+        expected.extend([0, 0, 0, 1]);
+        expected.extend(&idr);
+        assert_eq!(out, expected);
+        // SPS'siz akış (P karesi) değişmez
+        assert_eq!(
+            rewrite_annexb(Codec::Avc, &[0, 0, 1, 0x41, 0x9a, 0x02], t).unwrap(),
+            None
+        );
+        // Zaten doğruysa değişmez
+        assert_eq!(rewrite_annexb(Codec::Avc, &out, t).unwrap(), None);
+    }
+
+    /// Yerel uçtan uca denetim: VUI_IN (Annex B) → VUI_OUT, ardından ffprobe ve framemd5 ile karşılaştırılır.
+    #[test]
+    #[ignore = "yerel dosya gerekir: VUI_IN, VUI_OUT, VUI_CODEC=avc|hevc"]
+    fn rewrite_file() {
+        let input = std::env::var("VUI_IN").unwrap();
+        let output = std::env::var("VUI_OUT").unwrap();
+        let codec = if std::env::var("VUI_CODEC").unwrap() == "hevc" {
+            Codec::Hevc
+        } else {
+            Codec::Avc
+        };
+        let data = std::fs::read(input).unwrap();
+        let t = Target {
+            sar: Some((40, 33)),
+            colour: Some(BT601),
+        };
+        let out = rewrite_annexb(codec, &data, t).unwrap().unwrap_or(data);
+        std::fs::write(output, out).unwrap();
     }
 }

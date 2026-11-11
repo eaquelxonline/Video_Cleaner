@@ -86,6 +86,41 @@ def stream_stats(path, sel):
     return {"times": times, "count": len(pk), "bps": int(total * 8 / span) if span > 0 else 0, "start": times[0], "span": span}
 
 
+def audio_onset(path, rate=48000):
+    """Sesin içerik başlangıcı (sn, ilk çözülmüş örneğe göre): ilk 2 sn tek kanal çözülür; ilk saniyenin
+    99. yüzdelik genliğinin %25'ini aşan ilk örnek. ffmpeg kaynakta Opus ön atlamasını ve MP4 düzenleme
+    listesini uygular; çıktıda (düzenleme listesi yok) AAC ön dolgusu da çözülmüş akışta kalır."""
+    raw = subprocess.run(["ffmpeg", "-v", "error", "-i", path, "-map", "0:a:0", "-ac", "1", "-ar", str(rate), "-t", "2",
+                          "-f", "s16le", "-"], capture_output=True).stdout
+    import array
+    x = array.array("h")
+    x.frombytes(raw[: len(raw) // 2 * 2])
+    if sys.byteorder == "big":
+        x.byteswap()
+    if not x:
+        return None
+    a = [abs(v) for v in x]
+    head = sorted(a[:rate])
+    p99 = head[int(len(head) * 0.99) - 1] if head else 0
+    if p99 <= 0:
+        return None
+    thr = 0.25 * p99
+    i = next((k for k, v in enumerate(a) if v > thr), None)
+    return None if i is None else i / rate
+
+
+def audible_start(path):
+    """Sesin duyulduğu ilk anın zamanı (sn): ilk çözülmüş ses karesinin zamanı (ffmpeg ön atlamayı/düzenleme
+    listesini uygulayarak düzeltir) + o andan içerik başlangıcına kadar geçen süre."""
+    out = run(["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_frames", "-read_intervals", "%+#4",
+               "-show_entries", "frame=pts_time", "-of", "csv=p=0"]  + [path]).stdout
+    first = next((line.split(",")[0] for line in out.splitlines() if line.strip() and line.split(",")[0] not in ("", "N/A")), None)
+    onset = audio_onset(path)
+    if first is None or onset is None:
+        return None
+    return float(first) + onset
+
+
 def audio_hashes(path):
     """Ses paketlerinin MD5 listesi (yeniden kodlamadan, paket verisi)."""
     out = run(["ffmpeg", "-v", "error", "-i", path, "-map", "0:a:0", "-c", "copy", "-f", "framemd5", "-"]).stdout
@@ -276,11 +311,21 @@ def main():
                 av_src = sas["start"] - st0
                 av_out = oas["start"] - ot0
                 dur_src, dur_out = sas["span"], oas["span"]
-                # Senkron: sesin görüntüye göre başlangıç ofseti kaynakla aynı olmalı (≤ 1 ms; MP4 zaman tabanı yuvarlaması).
-                if abs(av_out - av_src) > (0.001 if copied else 0.025):
-                    problems.append(f"A/V ofseti {av_src * 1000:.1f}→{av_out * 1000:.1f} ms")
-                if abs(dur_out - dur_src) > 0.05:
-                    problems.append(f"ses süresi {dur_src:.3f}→{dur_out:.3f} sn")
+                # Senkron İÇERİKTEN ölçülür (paket zamanı yanıltıcıdır: AAC ön dolgusu, Opus ön atlaması, düzenleme
+                # listesi): sesin duyulduğu ilk anın görüntünün ilk karesine göre yeri kaynakla aynı olmalı.
+                a_s, a_o = audible_start(src), audible_start(out)
+                if a_s is None or a_o is None:
+                    problems.append("ses senkronu ölçülemedi")
+                else:
+                    sync_ms = ((a_o - ot0) - (a_s - st0)) * 1000
+                    av_src, av_out = a_s - st0, a_o - ot0
+                    if abs(sync_ms) > 10:
+                        problems.append(f"ses senkronu {sync_ms:+.1f} ms")
+                    # Süre: duyulur başlangıçtan son paketin sonuna (ön dolgu/ön atlama sayılmaz).
+                    dur_src = sas["start"] + sas["span"] - a_s
+                    dur_out = oas["start"] + oas["span"] - a_o
+                    if abs(dur_out - dur_src) > 0.05:
+                        problems.append(f"ses süresi {dur_src:.3f}→{dur_out:.3f} sn")
         # Renk
         s_colr, o_colr = colr_box(src) if src.endswith(".mp4") else None, colr_box(out)
         s_vui, o_vui = vui(src), vui(out)
