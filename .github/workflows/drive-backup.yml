@@ -1,18 +1,14 @@
 # Video Cleaner — her push'tan sonra Google Drive yedeği.
 #
-# GitHub hesabının kapanma riskine karşı Video_Cleaner_Beta dalına yapılan HER push'ta:
-#   1. Kaynak kodu paketlenir:      Video_Cleaner_Beta_<sha>_<UTC tarih>.zip     (git archive: izlenen dosyalar)
-#   2. Tam git geçmişi paketlenir:  Video_Cleaner_Beta_<sha>_<UTC tarih>.bundle  (git clone ile geri yüklenebilir)
-#   3. İkisi Google Drive'da "Video_Cleaner_Yedek" klasörüne yüklenir.
-#   4. Klasördeki ESKİ Video_Cleaner_Beta_* yedekleri silinir (Drive çöp kutusuna gider, 30 gün geri alınabilir).
-# Önce yeni yedek yüklenir, sonra eskiler silinir: hiçbir an yedeksiz kalınmaz.
+# GitHub hesabının kapanma riskine karşı Video_Cleaner_Beta dalına yapılan HER push'ta, kullanıcının kendi
+# Drive hesabında çalışan Google Apps Script betiği (.github/scripts/drive_backup.gs) tetiklenir. Betik:
+#   1. Son commit'in kaynak zip'ini GitHub'dan indirir,
+#   2. Drive'da "Video_Cleaner_Yedek" klasörüne Video_Cleaner_Beta_<sha>_<UTC tarih>.zip olarak koyar,
+#   3. Yeni yedek yerindeyse eski Video_Cleaner_Beta_* yedeklerini çöp kutusuna taşır (30 gün geri alınabilir).
+# Betik ayrıca saatte bir kendisi de denetler; GitHub'dan tetikleme gelmese bile son commit yedeklenir.
 #
-# Gereken (bir kez): Secrets → RCLONE_CONF — kullanıcının kendi bilgisayarında `rclone config` ile oluşturduğu
-# "gdrive" adlı Google Drive bağlantısının ayar metni (kapsam: drive.file — rclone yalnızca kendi
-# yüklediği dosyaları görür). Sır yoksa iş "atlandı" olarak biter.
-#
-# Geri yükleme:  unzip Video_Cleaner_Beta_*.zip        (yalnızca kaynak)
-#                git clone Video_Cleaner_Beta_*.bundle Video_Cleaner -b Video_Cleaner_Beta   (tüm geçmiş)
+# Gereken (bir kez): Secrets → DRIVE_HOOK_URL = <Apps Script web uygulaması URL'si>?key=<HOOK_KEY>
+# Sır yoksa iş "atlandı" olarak biter.
 
 name: Video Cleaner Drive Backup
 
@@ -23,79 +19,37 @@ on:
 
 concurrency:
   group: drive-backup
-  cancel-in-progress: false      # sıradaki push'un yedeği iptal edilmez, sırayla yüklenir
+  cancel-in-progress: false
 
 jobs:
   backup:
     name: Kaynak kodu → Google Drive
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 15
     env:
-      HAS_CONF: ${{ secrets.RCLONE_CONF != '' }}
-      RCLONE_VERSION: v1.69.1
-      FOLDER: Video_Cleaner_Yedek
+      HAS_HOOK: ${{ secrets.DRIVE_HOOK_URL != '' }}
     steps:
-      - name: Check credentials
-        id: creds
-        run: |
-          if [ "$HAS_CONF" != "true" ]; then
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "## Drive yedeği atlandı" >> "$GITHUB_STEP_SUMMARY"
-            echo "RCLONE_CONF depo sırrı tanımlı değil (kurulum: drive-backup.yml başı)." >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Checkout (tam geçmiş)
-        if: steps.creds.outputs.skip == 'false'
-        uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-
-      - name: Install rclone (sabit sürüm, GitHub sürüm dosyasından)
-        if: steps.creds.outputs.skip == 'false'
-        run: |
-          for attempt in 1 2 3; do
-            curl -fsSL -o rclone.zip "https://github.com/rclone/rclone/releases/download/${RCLONE_VERSION}/rclone-${RCLONE_VERSION}-linux-amd64.zip" && break
-            sleep 10
-          done
-          unzip -q rclone.zip
-          sudo install -m 0755 "rclone-${RCLONE_VERSION}-linux-amd64/rclone" /usr/local/bin/rclone
-          rclone version | head -1
-
-      - name: Write rclone config
-        if: steps.creds.outputs.skip == 'false'
+      - name: Trigger Drive backup (Apps Script)
         env:
-          RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
+          DRIVE_HOOK_URL: ${{ secrets.DRIVE_HOOK_URL }}
         run: |
-          mkdir -p ~/.config/rclone
-          printf '%s\n' "$RCLONE_CONF" > ~/.config/rclone/rclone.conf
-          chmod 600 ~/.config/rclone/rclone.conf
-          rclone listremotes | grep -qx 'gdrive:' || { echo "::error::rclone ayarında 'gdrive' adlı bağlantı yok"; exit 1; }
-
-      - name: Package source and history
-        if: steps.creds.outputs.skip == 'false'
-        run: |
-          base="Video_Cleaner_Beta_$(git rev-parse --short HEAD)_$(date -u +%Y%m%d-%H%M)"
-          git archive --format=zip -o "$base.zip" HEAD
-          git bundle create "$base.bundle" --all
-          git bundle verify "$base.bundle" > /dev/null
-          unzip -tq "$base.zip"
-          echo "BASE=$base" >> "$GITHUB_ENV"
-          ls -l "$base.zip" "$base.bundle"
-
-      - name: Upload new backup, then remove old ones
-        if: steps.creds.outputs.skip == 'false'
-        run: |
-          rclone copy "$BASE.zip" "gdrive:$FOLDER" --retries 5 --low-level-retries 20
-          rclone copy "$BASE.bundle" "gdrive:$FOLDER" --retries 5 --low-level-retries 20
-          # Yeni yedek gerçekten orada mı? (boyut karşılaştırması)
-          rclone check . "gdrive:$FOLDER" --one-way --include "$BASE.*" --size-only
-          # Eski yedekler: yeni yüklenenler hariç, yalnızca Video_Cleaner_Beta_* dosyaları.
-          rclone delete "gdrive:$FOLDER" --filter "- $BASE.*" --filter "+ Video_Cleaner_Beta_*" --filter "- *" -v
-          {
-            echo "## Drive yedeği"
-            echo '```'
-            rclone lsl "gdrive:$FOLDER"
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$HAS_HOOK" != "true" ]; then
+            echo "## Drive yedeği atlandı" >> "$GITHUB_STEP_SUMMARY"
+            echo "DRIVE_HOOK_URL depo sırrı tanımlı değil (kurulum: .github/scripts/drive_backup.gs başı)." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          # Apps Script yanıtı yönlendirmeyle gelir (-L). Commit API'ye yansısın diye kısa bekleme ve 3 deneme.
+          sleep 15
+          for attempt in 1 2 3; do
+            reply=$(curl -fsSL --max-time 360 "$DRIVE_HOOK_URL" || true)
+            echo "deneme $attempt: ${reply:0:300}"
+            case "$reply" in
+              OK*) break ;;
+            esac
+            sleep 30
+          done
+          { echo "## Drive yedeği"; echo '```'; echo "${reply:0:500}"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          case "$reply" in
+            OK*) exit 0 ;;
+            *) echo "::error::Drive yedeği başarısız: ${reply:0:300}"; exit 1 ;;
+          esac

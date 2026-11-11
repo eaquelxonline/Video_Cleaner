@@ -7,10 +7,10 @@
 ## Her push'tan sonra Google Drive yedeği (kullanıcının isteği)
 
 GitHub hesabının kapatılma riskine karşı `.github/workflows/drive-backup.yml`, `Video_Cleaner_Beta` dalına
-yapılan HER push'ta otomatik çalışır:
-
-1. Kaynak kodu `Video_Cleaner_Beta_<kısa-sha>_<YYYYMMDD-HHMM>.zip` (git archive) ve tüm geçmiş aynı adla `.bundle` olarak paketlenir.
-2. Google Drive'da `Video_Cleaner_Yedek` klasörüne rclone ile yüklenir (`RCLONE_CONF` sırrı, "gdrive" bağlantısı, kapsam drive.file).
-3. Yükleme doğrulandıktan sonra klasördeki eski `Video_Cleaner_Beta_*` yedekleri silinir (Drive çöp kutusu).
+yapılan HER push'ta kullanıcının Drive hesabındaki Google Apps Script betiğini (`.github/scripts/drive_backup.gs`)
+tetikler (`DRIVE_HOOK_URL` sırrı). Betik son commit'in kaynak zip'ini `Video_Cleaner_Yedek` klasörüne koyar ve eski
+`Video_Cleaner_Beta_*` yedeklerini çöp kutusuna taşır; ayrıca saatte bir kendisi de denetler.
+(rclone yolu denendi: rclone'un ortak client_id'si 2026'da kapanıyor ve kişisel OAuth uygulamasında "Publish app"
+düğmesi Google tarafında kapalı kalıyor; Testing durumunda izin 7 günde bir düştüğü için kullanılmadı.)
 
 Claude oturumları bu iş akışını bozmamalı; push sonrası iş akışının yeşil olduğunu kontrol etmeli.
