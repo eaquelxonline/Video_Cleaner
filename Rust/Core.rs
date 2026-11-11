@@ -125,6 +125,9 @@ pub enum CoreError {
     InvalidHandle = -12,
     /// Beklenmeyen iç hata (yakalanan panik).
     Internal = -13,
+    /// Bu cihazda/biçimde desteklenmiyor (ör. donanım tamponu CPU için kilitlenemiyor); çağıran
+    /// başka bir yola (CPU düzlemleri) düşmelidir.
+    Unsupported = -14,
 }
 
 impl CoreError {
@@ -150,6 +153,7 @@ impl fmt::Display for CoreError {
             CoreError::StreamFinished => "akış sonlandı",
             CoreError::InvalidHandle => "geçersiz tutamak",
             CoreError::Internal => "iç hata",
+            CoreError::Unsupported => "bu cihazda desteklenmiyor",
         };
         write!(f, "{text} ({})", self.code())
     }
@@ -445,6 +449,15 @@ impl FrameRing {
         self.storage.kind()
     }
 
+    /// Donanım tamponu GPU tarafından da (Vulkan dış bellek) kullanılabilir mi?
+    pub fn gpu_importable(&self) -> bool {
+        match &self.storage {
+            #[cfg(target_os = "android")]
+            RingStorage::Hardware(slots) => slots.usage & hwbuf::USAGE_GPU_DATA_BUFFER != 0,
+            _ => false,
+        }
+    }
+
     /// `[en eski kare, bir sonraki kare)` sıra numarası aralığı.
     pub fn bounds(&self) -> (u64, u64) {
         let t = lock(&self.table);
@@ -730,6 +743,8 @@ pub mod hwbuf {
     /// Halkanın 30 yuvası: her biri ayrı BLOB donanım tamponu, ömür boyu CPU için kilitli.
     pub struct SlotBuffers {
         slots: Vec<(*mut AHardwareBuffer, *mut u8)>,
+        /// Ayırmada kullanılan kullanım bayrakları (GPU veri tamponu dahil mi?).
+        pub usage: u64,
     }
 
     // SAFETY: tamponlar bu yapıya aittir; içeriğe erişim FrameRing'in kira durum makinesiyle eşzamanlanır.
@@ -740,8 +755,16 @@ pub mod hwbuf {
         /// `count` adet `bytes` boyutlu BLOB tamponu ayırıp kilitler. Herhangi biri başarısız olursa
         /// (sürücü BLOB+GPU kullanımını desteklemiyor, bellek yok, adres 64 bayta hizalı değil) `None`.
         pub fn allocate(bytes: usize, count: usize) -> Option<Self> {
+            // Önce Vulkan'ın içe aktarabileceği biçimde (GPU veri tamponu), olmazsa yalnızca CPU.
+            let cpu = USAGE_CPU_READ_OFTEN | USAGE_CPU_WRITE_OFTEN;
+            Self::allocate_with(bytes, count, cpu | USAGE_GPU_DATA_BUFFER)
+                .or_else(|| Self::allocate_with(bytes, count, cpu))
+        }
+
+        fn allocate_with(bytes: usize, count: usize, usage_flags: u64) -> Option<Self> {
             let mut out = Self {
                 slots: Vec::with_capacity(count),
+                usage: usage_flags,
             };
             for _ in 0..count {
                 let desc = Desc {
@@ -749,7 +772,7 @@ pub mod hwbuf {
                     height: 1,
                     layers: 1,
                     format: FORMAT_BLOB,
-                    usage: USAGE_CPU_READ_OFTEN | USAGE_CPU_WRITE_OFTEN | USAGE_GPU_DATA_BUFFER,
+                    usage: usage_flags,
                     ..Desc::default()
                 };
                 let mut buffer = std::ptr::null_mut();
@@ -855,6 +878,24 @@ pub mod kernels {
                 row1: *mut u8,
                 blocks: usize,
             );
+            #[link_name = "vc_max5_u8_avx2"]
+            pub fn max5_u8(
+                dst: *mut u8,
+                r0: *const u8,
+                r1: *const u8,
+                r2: *const u8,
+                r3: *const u8,
+                r4: *const u8,
+                blocks: usize,
+            );
+            #[link_name = "vc_unblend_u16_avx2"]
+            pub fn unblend_u16(
+                dst: *mut u16,
+                img: *const u16,
+                fg: *const u16,
+                alpha: *const u8,
+                blocks: usize,
+            );
         }
     }
 
@@ -904,6 +945,24 @@ pub mod kernels {
                 row1: *mut u8,
                 blocks: usize,
             );
+            #[link_name = "vc_max5_u8_neon"]
+            pub fn max5_u8(
+                dst: *mut u8,
+                r0: *const u8,
+                r1: *const u8,
+                r2: *const u8,
+                r3: *const u8,
+                r4: *const u8,
+                blocks: usize,
+            );
+            #[link_name = "vc_unblend_u16_neon"]
+            pub fn unblend_u16(
+                dst: *mut u16,
+                img: *const u16,
+                fg: *const u16,
+                alpha: *const u8,
+                blocks: usize,
+            );
         }
     }
 
@@ -949,6 +1008,26 @@ pub mod kernels {
             _: *const i16,
             _: *mut u8,
             _: *mut u8,
+            _: usize,
+        ) {
+            unreachable!()
+        }
+        pub unsafe fn max5_u8(
+            _: *mut u8,
+            _: *const u8,
+            _: *const u8,
+            _: *const u8,
+            _: *const u8,
+            _: *const u8,
+            _: usize,
+        ) {
+            unreachable!()
+        }
+        pub unsafe fn unblend_u16(
+            _: *mut u16,
+            _: *const u16,
+            _: *const u16,
+            _: *const u8,
             _: usize,
         ) {
             unreachable!()
@@ -1152,6 +1231,67 @@ pub mod kernels {
         );
     }
 
+    /// `dst[i] = max(r[0][i], …, r[4][i])` — 5×5 maske genişletmenin yapı taşı.
+    pub fn max5_u8(dst: &mut [u8], rows: [&[u8]; 5]) {
+        let n = dst.len();
+        assert!(rows.iter().all(|r| r.len() == n));
+        let mut done = 0;
+        if use_native() {
+            let blocks = n / 32;
+            if blocks > 0 {
+                // SAFETY: altı dilim de en az blocks*32 bayttır; dst diğerleriyle çakışmaz (&mut).
+                unsafe {
+                    native::max5_u8(
+                        dst.as_mut_ptr(),
+                        rows[0].as_ptr(),
+                        rows[1].as_ptr(),
+                        rows[2].as_ptr(),
+                        rows[3].as_ptr(),
+                        rows[4].as_ptr(),
+                        blocks,
+                    )
+                };
+                done = blocks * 32;
+            }
+        }
+        portable::max5_u8(
+            &mut dst[done..],
+            [
+                &rows[0][done..],
+                &rows[1][done..],
+                &rows[2][done..],
+                &rows[3][done..],
+                &rows[4][done..],
+            ],
+        );
+    }
+
+    /// Analitik ters karışım (doğrusal ışık, Q16): `B = round_even((255·I − α·F) / (255 − α))`,
+    /// [0, 65535]. Ara değerler < 2^24 olduğundan f32'de tamdır; yalnızca bölme yuvarlanır. `alpha` değerleri ≤ 254 olmalıdır (çağıran eşik üstünü 0 yapar veya hiç vermez).
+    pub fn unblend_u16(dst: &mut [u16], img: &[u16], fg: &[u16], alpha: &[u8]) {
+        let n = dst.len();
+        assert!(img.len() == n && fg.len() == n && alpha.len() == n);
+        assert!(alpha.iter().all(|&a| a < 255), "α = 255 ters çevrilemez");
+        let mut done = 0;
+        if use_native() {
+            let blocks = n / 16;
+            if blocks > 0 {
+                // SAFETY: dilimler en az blocks*16 öğedir; dst diğerleriyle çakışmaz (&mut).
+                unsafe {
+                    native::unblend_u16(
+                        dst.as_mut_ptr(),
+                        img.as_ptr(),
+                        fg.as_ptr(),
+                        alpha.as_ptr(),
+                        blocks,
+                    )
+                };
+                done = blocks * 16;
+            }
+        }
+        portable::unblend_u16(&mut dst[done..], &img[done..], &fg[done..], &alpha[done..]);
+    }
+
     /// Düz Rust başvuru gerçeklemesi. Assembly çekirdeklerinin doğruluk ölçütü ve
     /// assembly bulunmayan hedeflerdeki çalışma yoludur.
     pub mod portable {
@@ -1168,6 +1308,27 @@ pub mod kernels {
                 } else {
                     original[i]
                 };
+            }
+        }
+
+        /// Beş satırın bayt bazında en büyüğü.
+        pub fn max5_u8(dst: &mut [u8], rows: [&[u8]; 5]) {
+            for i in 0..dst.len() {
+                dst[i] = rows[0][i]
+                    .max(rows[1][i])
+                    .max(rows[2][i])
+                    .max(rows[3][i])
+                    .max(rows[4][i]);
+            }
+        }
+
+        /// Ters karışım; assembly ile aynı işlem sırası (FMA yok, en yakın çifte yuvarlama).
+        pub fn unblend_u16(dst: &mut [u16], img: &[u16], fg: &[u16], alpha: &[u8]) {
+            for i in 0..dst.len() {
+                let a = alpha[i] as f32;
+                let num = 255.0f32 * img[i] as f32 - a * fg[i] as f32;
+                let q = (num / (255.0f32 - a)).round_ties_even();
+                dst[i] = q.clamp(0.0, 65535.0) as u16;
             }
         }
 
@@ -1309,6 +1470,137 @@ impl HaarBands {
             })
             .sum();
         sum as f64 / n as f64
+    }
+}
+
+// ============================================================================
+// 4b. Maske genişletme ve analitik alfa çözümü (deterministik kurtarma)
+// ============================================================================
+
+/// 5×5 kare yapı elemanıyla ikili/gri maske genişletme (dilation). Kenar dışı 0 sayılır.
+/// Ayrılabilir: önce yatay 5'li en büyük, sonra dikey 5'li en büyük ([`kernels::max5_u8`]).
+pub fn dilate5x5(mask: &[u8], width: usize, height: usize, out: &mut [u8]) {
+    assert!(mask.len() >= width * height && out.len() >= width * height);
+    if width == 0 || height == 0 {
+        return;
+    }
+    let mut horiz = vec![0u8; width * height];
+    let mut padded = vec![0u8; width + 4];
+    for y in 0..height {
+        padded[2..2 + width].copy_from_slice(&mask[y * width..(y + 1) * width]);
+        let rows = [
+            &padded[0..width],
+            &padded[1..1 + width],
+            &padded[2..2 + width],
+            &padded[3..3 + width],
+            &padded[4..4 + width],
+        ];
+        kernels::max5_u8(&mut horiz[y * width..(y + 1) * width], rows);
+    }
+    let zero = vec![0u8; width];
+    for y in 0..height {
+        let row = |dy: isize| -> &[u8] {
+            let yy = y as isize + dy;
+            if yy < 0 || yy >= height as isize {
+                &zero
+            } else {
+                &horiz[yy as usize * width..(yy as usize + 1) * width]
+            }
+        };
+        let rows = [row(-2), row(-1), row(0), row(1), row(2)];
+        kernels::max5_u8(&mut out[y * width..(y + 1) * width], rows);
+    }
+}
+
+/// Yarı saydam yazının analitik olarak geri alınması: `I = α·F + (1 − α)·B` karışımı doğrusal
+/// ışıkta tersine çevrilir: `B = (I − α·F) / (1 − α)`. Gama (BT.1886, γ = 2,4) tabloyla kaldırılır,
+/// hesap [`kernels::unblend_u16`] ile Q16 doğrusal değerlerde yapılır, sonra tekrar gama uygulanır.
+///
+/// Y düzlemine uygulanır; renk farkı (U, V) düzlemleri için `linear = false` ile sinyal düzleminde
+/// doğrusal karışım varsayılır.
+pub struct AlphaUnblend {
+    to_linear: [u16; 256],
+    from_linear: Vec<u8>,
+}
+
+impl Default for AlphaUnblend {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AlphaUnblend {
+    /// En yüksek güvenle çözülecek alfa (≈ 0,85 · 255). Üstü modele bırakılır.
+    pub const MAX_ALPHA: u8 = 216;
+
+    pub fn new() -> Self {
+        let mut to_linear = [0u16; 256];
+        for (v, slot) in to_linear.iter_mut().enumerate() {
+            *slot = ((v as f64 / 255.0).powf(2.4) * 65535.0).round() as u16;
+        }
+        let from_linear = (0..65536u32)
+            .map(|l| ((l as f64 / 65535.0).powf(1.0 / 2.4) * 255.0).round() as u8)
+            .collect();
+        Self {
+            to_linear,
+            from_linear,
+        }
+    }
+
+    /// `plane` yerinde çözülür. `alpha` (0..255) sıfırsa veya [`Self::MAX_ALPHA`] üstündeyse piksel
+    /// değişmez. Döner: (çözülen piksel, modele bırakılan piksel).
+    pub fn unblend_plane(
+        &self,
+        plane: &mut [u8],
+        alpha: &[u8],
+        overlay: u8,
+        linear: bool,
+        max_alpha: u8,
+    ) -> (usize, usize) {
+        assert_eq!(plane.len(), alpha.len());
+        let lin = |v: u8| {
+            if linear {
+                self.to_linear[v as usize]
+            } else {
+                (v as u16) * 257
+            }
+        };
+        let back = |l: u16| {
+            if linear {
+                self.from_linear[l as usize]
+            } else {
+                ((l as u32 + 128) / 257) as u8
+            }
+        };
+        let max_alpha = max_alpha.min(254);
+        let mut resolved = 0;
+        let mut deferred = 0;
+        let a: Vec<u8> = alpha
+            .iter()
+            .map(|&x| {
+                if x > max_alpha {
+                    if x > 0 {
+                        deferred += 1;
+                    }
+                    0
+                } else {
+                    if x > 0 {
+                        resolved += 1;
+                    }
+                    x
+                }
+            })
+            .collect();
+        let img: Vec<u16> = plane.iter().map(|&v| lin(v)).collect();
+        let fg = vec![lin(overlay); plane.len()];
+        let mut out = vec![0u16; plane.len()];
+        kernels::unblend_u16(&mut out, &img, &fg, &a);
+        for i in 0..plane.len() {
+            if a[i] != 0 {
+                plane[i] = back(out[i]);
+            }
+        }
+        (resolved, deferred)
     }
 }
 
@@ -3224,9 +3516,14 @@ impl Engine {
             .as_ref()
             .map(|p| p.ring().pool_bytes())
             .unwrap_or(0);
-        let storage = match self.pipeline.as_ref().map(|p| p.ring().storage_kind()) {
-            Some(StorageKind::HardwareBuffer) => "hardware_buffer",
-            Some(StorageKind::Heap) => "heap",
+        let storage = match self
+            .pipeline
+            .as_ref()
+            .map(|p| (p.ring().storage_kind(), p.ring().gpu_importable()))
+        {
+            Some((StorageKind::HardwareBuffer, true)) => "hardware_buffer_gpu",
+            Some((StorageKind::HardwareBuffer, false)) => "hardware_buffer_cpu",
+            Some((StorageKind::Heap, _)) => "heap",
             None => "none",
         };
         let (w, h) = self
@@ -4094,6 +4391,8 @@ pub mod jni {
                             row_stride: 0,
                         }; 4],
                     };
+                    // Üreticiye özel (IMPLEMENTATION_DEFINED) biçimler CPU için düzlemlere ayrılamayabilir;
+                    // çağıran bu durumda Image düzlemlerinden (CPU yolu) iter.
                     if AHardwareBuffer_lockPlanes(
                         ahb,
                         USAGE_CPU_READ_OFTEN,
@@ -4101,9 +4400,12 @@ pub mod jni {
                         std::ptr::null(),
                         &mut planes,
                     ) != 0
-                        || planes.plane_count < 3
                     {
-                        return Err(CoreError::BadArgument);
+                        return Err(CoreError::Unsupported);
+                    }
+                    if planes.plane_count < 3 {
+                        AHardwareBuffer_unlock(ahb, std::ptr::null_mut());
+                        return Err(CoreError::Unsupported);
                     }
                     let (w, h) = (desc.width as usize, desc.height as usize);
                     let mk = |p: Plane, rows: usize| RawPlane {
@@ -4531,6 +4833,168 @@ mod tests {
         // En kötü durum: 0 ile 255 arasındaki fark taşmadan toplanmalı.
         let (zeros, full) = (vec![0u8; 1 << 16], vec![255u8; 1 << 16]);
         assert_eq!(kernels::sad_u8(&zeros, &full), 255 << 16);
+    }
+
+    #[test]
+    fn max5_and_unblend_match_portable_reference() {
+        let mut rng = Rng::new(99);
+        for trial in 0..300 {
+            let n = match trial {
+                0 => 0,
+                1 => 15,
+                2 => 16,
+                3 => 31,
+                4 => 32,
+                5 => 33,
+                _ => rng.below(900) as usize,
+            };
+            let mut rows: Vec<Vec<u8>> = (0..5).map(|_| vec![0u8; n]).collect();
+            for r in rows.iter_mut() {
+                rng.fill(r);
+            }
+            let refs = [
+                &rows[0][..],
+                &rows[1][..],
+                &rows[2][..],
+                &rows[3][..],
+                &rows[4][..],
+            ];
+            let (mut got, mut want) = (vec![0u8; n], vec![0u8; n]);
+            kernels::max5_u8(&mut got, refs);
+            kernels::portable::max5_u8(&mut want, refs);
+            assert_eq!(got, want, "max5 n={n}");
+
+            let mut raw = vec![0u8; 4 * n];
+            rng.fill(&mut raw);
+            let img: Vec<u16> = (0..n)
+                .map(|i| u16::from_le_bytes([raw[2 * i], raw[2 * i + 1]]) & 0x0fff)
+                .collect();
+            let fg: Vec<u16> = (0..n)
+                .map(|i| u16::from_le_bytes([raw[2 * n + 2 * i], raw[2 * n + 2 * i + 1]]) & 0x0fff)
+                .collect();
+            let mut alpha = vec![0u8; n];
+            rng.fill(&mut alpha);
+            for a in alpha.iter_mut() {
+                *a = (*a).min(254);
+            }
+            let (mut got, mut want) = (vec![0u16; n], vec![0u16; n]);
+            kernels::unblend_u16(&mut got, &img, &fg, &alpha);
+            kernels::portable::unblend_u16(&mut want, &img, &fg, &alpha);
+            assert_eq!(got, want, "unblend n={n}");
+        }
+        // Uç değerler: α = 0 → B = I; α = 254 ve F = 0 → kırpma 65535'e dayanır.
+        let img = vec![65535u16; 32];
+        let fg = vec![0u16; 32];
+        let (mut got, mut want) = (vec![0u16; 32], vec![0u16; 32]);
+        for a in [0u8, 1, 128, 254] {
+            let alpha = vec![a; 32];
+            kernels::unblend_u16(&mut got, &img, &fg, &alpha);
+            kernels::portable::unblend_u16(&mut want, &img, &fg, &alpha);
+            assert_eq!(got, want, "uç α={a}");
+        }
+        assert!(got.iter().all(|&v| v == 65535));
+    }
+
+    #[test]
+    fn dilate5x5_matches_naive_window_max() {
+        let mut rng = Rng::new(5);
+        for &(w, h) in &[(1usize, 1usize), (7, 3), (33, 17), (64, 40), (130, 9)] {
+            let mut mask = vec![0u8; w * h];
+            rng.fill(&mut mask);
+            for v in mask.iter_mut() {
+                *v = if *v > 240 { *v } else { 0 };
+            }
+            let mut got = vec![0u8; w * h];
+            dilate5x5(&mask, w, h, &mut got);
+            for y in 0..h {
+                for x in 0..w {
+                    let mut m = 0u8;
+                    for yy in y.saturating_sub(2)..(y + 3).min(h) {
+                        for xx in x.saturating_sub(2)..(x + 3).min(w) {
+                            m = m.max(mask[yy * w + xx]);
+                        }
+                    }
+                    assert_eq!(got[y * w + x], m, "({x},{y}) {w}x{h}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn alpha_unblend_recovers_background() {
+        let u = AlphaUnblend::new();
+        let n = 4096;
+        let lin = |v: u8| (v as f64 / 255.0).powf(2.4);
+        let gam = |l: f64| (l.clamp(0.0, 1.0).powf(1.0 / 2.4) * 255.0).round() as u8;
+        let background: Vec<u8> = (0..n).map(|i| (16 + (i * 7) % 220) as u8).collect();
+        let overlay = 235u8;
+        let alpha: Vec<u8> = (0..n).map(|i| (i % 240) as u8).collect();
+        // Yarı saydam altyazı: doğrusal ışıkta karışım, sonra 8 bit gama.
+        let mut plane: Vec<u8> = (0..n)
+            .map(|i| {
+                let a = alpha[i] as f64 / 255.0;
+                gam(a * lin(overlay) + (1.0 - a) * lin(background[i]))
+            })
+            .collect();
+        let (resolved, deferred) =
+            u.unblend_plane(&mut plane, &alpha, overlay, true, AlphaUnblend::MAX_ALPHA);
+        assert_eq!(
+            deferred,
+            alpha
+                .iter()
+                .filter(|&&a| a > AlphaUnblend::MAX_ALPHA)
+                .count()
+        );
+        assert_eq!(
+            resolved,
+            alpha
+                .iter()
+                .filter(|&&a| a > 0 && a <= AlphaUnblend::MAX_ALPHA)
+                .count()
+        );
+        // Hata doğrusal ışıkta ölçülür: 8 bit gama nicemleme adımı (q) 1/(1−α) ile büyür; koyu arka
+        // planda gama değerindeki büyük fark fiziksel bilgi kaybıdır, yöntemin hatası değildir.
+        let step = |v: u8| lin(v.saturating_add(1)) - lin(v);
+        let mut total = 0f64;
+        let mut count = 0f64;
+        for i in 0..n {
+            let a = alpha[i];
+            if a == 0 || a > AlphaUnblend::MAX_ALPHA {
+                continue;
+            }
+            let observed = {
+                let af = a as f64 / 255.0;
+                gam(af * lin(overlay) + (1.0 - af) * lin(background[i]))
+            };
+            let bound =
+                (step(observed) / (1.0 - a as f64 / 255.0) + step(plane[i]) + step(background[i]))
+                    * 1.01
+                    + 2.0 / 65535.0;
+            let err = (lin(plane[i]) - lin(background[i])).abs();
+            assert!(
+                err <= bound,
+                "i={i} α={a} B={} bulunan={} hata={err:.5} sınır={bound:.5}",
+                background[i],
+                plane[i]
+            );
+            total += err;
+            count += 1.0;
+        }
+        assert!(
+            total / count < 0.01,
+            "ortalama doğrusal hata {}",
+            total / count
+        );
+        // α > eşik pikselleri değişmemeli (modele bırakılır).
+        for i in 0..n {
+            if alpha[i] > AlphaUnblend::MAX_ALPHA {
+                let a = alpha[i] as f64 / 255.0;
+                assert_eq!(
+                    plane[i],
+                    gam(a * lin(overlay) + (1.0 - a) * lin(background[i]))
+                );
+            }
+        }
     }
 
     #[test]

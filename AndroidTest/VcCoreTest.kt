@@ -104,6 +104,7 @@ class VcCoreTest {
         var inputDone = false
         var outputDone = false
         var pushed = 0
+        var cpuFallback = false
         try {
             while (!outputDone) {
                 if (!inputDone) {
@@ -136,10 +137,22 @@ class VcCoreTest {
                         val pts = img.timestamp / 1000
                         expected.addLast(nv12(img, w and 1.inv(), h and 1.inv()) to pts)
                         val hb = img.hardwareBuffer!!
-                        var seq = Core.vcPushHardwareFrame(ctx, hb, pts, 0)
+                        fun push(): Int {
+                            if (!cpuFallback) {
+                                val r = Core.vcPushHardwareFrame(ctx, hb, pts, 0)
+                                if (r != UNSUPPORTED) return r
+                                // Bu cihazın ImageReader tamponu CPU düzlemlerine ayrılamıyor: CPU yoluna düş.
+                                cpuFallback = true
+                                Log.i(TAG, "VCCORE hardware_buffer lockPlanes desteklenmiyor; CPU düzlem yoluna düşüldü")
+                            }
+                            val nv = expected.last().first
+                            val buf = direct(nv.size).apply { put(nv); flip() }
+                            return Core.vcPushNv12(ctx, w and 1.inv(), h and 1.inv(), buf, pts, 0)
+                        }
+                        var seq = push()
                         if (seq == -3) { // halka dolu: boşaltıp yeniden dene
                             drain(ctx, info, out, meta, sink)
-                            seq = Core.vcPushHardwareFrame(ctx, hb, pts, 0)
+                            seq = push()
                         }
                         hb.close()
                         assertEquals("vcPushHardwareFrame sıra numarası", pushed, seq)
@@ -156,10 +169,10 @@ class VcCoreTest {
             assertTrue("kare itilmedi", pushed > 0)
             val audit = Core.vcRunTesterAudit(ctx)
             Log.i(TAG, "VCAUDIT hardware=$audit")
-            assertTrue(audit, audit.contains("\"frames_hw\":$pushed"))
+            assertTrue(audit, audit.contains(if (cpuFallback) "\"frames_cpu\":$pushed" else "\"frames_hw\":$pushed"))
             assertTrue(audit, audit.contains("\"bit_exact\":true"))
             assertTrue(audit, audit.contains("\"violations\":0"))
-            Log.i(TAG, "VCCORE status=PASS path=hardware_buffer frames=$pushed storage=${Regex("\"storage\":\"(\\w+)\"").find(audit)?.groupValues?.get(1)}")
+            Log.i(TAG, "VCCORE status=PASS path=${if (cpuFallback) "cpu_fallback" else "hardware_buffer"} frames=$pushed storage=${Regex("\"storage\":\"(\\w+)\"").find(audit)?.groupValues?.get(1)}")
         } finally {
             Core.vcDestroy(ctx)
             decoder.stop()
@@ -214,5 +227,6 @@ class VcCoreTest {
 
     private companion object {
         const val TAG = "VCTEST"
+        const val UNSUPPORTED = -14
     }
 }

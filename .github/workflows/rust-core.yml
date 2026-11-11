@@ -1,0 +1,54 @@
+# Video Cleaner — Rust çekirdeği (VC-Core) ve Assembly çekirdekleri.
+#
+# x86_64 (AVX2) testleri koşucuda yerel, ARM64 (NEON) testleri QEMU kullanıcı kipinde çalışır.
+# Her assembly çekirdeği (SAD, seçim kapısı, Haar, 5×5 genişletme, ters alfa karışımı) Rust
+# başvurusuyla bit-bit karşılaştırılır. Ayrıca rustfmt ve clippy (masaüstü + Android hedefleri).
+
+name: Video Cleaner Rust Core
+
+on:
+  workflow_dispatch:
+  pull_request:
+
+concurrency:
+  group: rust-core-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  core:
+    name: VC-Core (x86_64 + ARM64/QEMU)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup default stable
+          rustup target add aarch64-unknown-linux-gnu aarch64-linux-android x86_64-linux-android
+          rustc --version
+
+      - name: Install QEMU and ARM64 cross linker
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-user gcc-aarch64-linux-gnu libc6-dev-arm64-cross > /dev/null
+
+      - name: rustfmt
+        run: cargo fmt --check
+
+      - name: clippy (x86_64, Android arm64, Android x86_64)
+        run: |
+          cargo clippy --release --all-targets -- -D warnings
+          cargo clippy --release --all-targets --target aarch64-linux-android -- -D warnings
+          cargo clippy --release --all-targets --target x86_64-linux-android -- -D warnings
+
+      - name: Tests x86_64 (AVX2)
+        run: cargo test --release
+
+      - name: Tests ARM64 (NEON, QEMU)
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER: qemu-aarch64 -L /usr/aarch64-linux-gnu
+        run: cargo test --release --target aarch64-unknown-linux-gnu

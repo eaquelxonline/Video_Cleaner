@@ -170,3 +170,132 @@ vc_haar_inv_i16_neon:
 .Lvc_hi_done:
         ret
         .size   vc_haar_inv_i16_neon, . - vc_haar_inv_i16_neon
+
+// -----------------------------------------------------------------------------
+//  void vc_max5_u8_neon(u8 *dst, const u8 *r0, const u8 *r1, const u8 *r2,
+//                       const u8 *r3, const u8 *r4, usize blocks)
+//      x0 = dst, x1..x5 = r0..r4, x6 = blocks (×32 bayt)
+//  dst[i] = max(r0..r4)[i] — 5×5 ayrılabilir maske genişletme (umax).
+// -----------------------------------------------------------------------------
+        .globl  vc_max5_u8_neon
+        .hidden vc_max5_u8_neon
+        .type   vc_max5_u8_neon, %function
+        .p2align 4
+vc_max5_u8_neon:
+        cbz     x6, .Lvc_max5_done
+.Lvc_max5_loop:
+        ldp     q0, q1, [x1], #32
+        ldp     q2, q3, [x2], #32
+        umax    v0.16b, v0.16b, v2.16b
+        umax    v1.16b, v1.16b, v3.16b
+        ldp     q2, q3, [x3], #32
+        umax    v0.16b, v0.16b, v2.16b
+        umax    v1.16b, v1.16b, v3.16b
+        ldp     q2, q3, [x4], #32
+        umax    v0.16b, v0.16b, v2.16b
+        umax    v1.16b, v1.16b, v3.16b
+        ldp     q2, q3, [x5], #32
+        umax    v0.16b, v0.16b, v2.16b
+        umax    v1.16b, v1.16b, v3.16b
+        stp     q0, q1, [x0], #32
+        subs    x6, x6, #1
+        b.ne    .Lvc_max5_loop
+.Lvc_max5_done:
+        ret
+        .size   vc_max5_u8_neon, . - vc_max5_u8_neon
+
+// -----------------------------------------------------------------------------
+//  void vc_unblend_u16_neon(u16 *dst, const u16 *img, const u16 *fg,
+//                           const u8 *alpha, usize blocks)
+//      x0 = dst, x1 = img, x2 = fg, x3 = alpha, x4 = blocks (×16 piksel)
+//  B = round_even((255·I − α·F) / (255 − α)), [0, 65535] (Q16); x86_64.asm ile aynı.
+//  fcvtns: en yakına, eşitlikte çifte (FPCR'den bağımsız). FMA kullanılmaz.
+// -----------------------------------------------------------------------------
+        .globl  vc_unblend_u16_neon
+        .hidden vc_unblend_u16_neon
+        .type   vc_unblend_u16_neon, %function
+        .p2align 4
+vc_unblend_u16_neon:
+        cbz     x4, .Lvc_unb_done
+        movz    w5, #0x437f, lsl #16            // 255.0f
+        dup     v20.4s, w5
+        mov     w6, #65535
+        dup     v21.4s, w6
+        movi    v30.4s, #0
+.Lvc_unb_loop:
+        ldp     q0, q1, [x1], #32               // I: 16 × u16
+        ldp     q2, q3, [x2], #32               // F
+        ldr     q4, [x3], #16                   // α: 16 × u8
+        uxtl    v5.8h, v4.8b
+        uxtl2   v6.8h, v4.16b
+        uxtl    v16.4s, v0.4h
+        uxtl2   v17.4s, v0.8h
+        uxtl    v18.4s, v1.4h
+        uxtl2   v19.4s, v1.8h
+        uxtl    v22.4s, v2.4h
+        uxtl2   v23.4s, v2.8h
+        uxtl    v24.4s, v3.4h
+        uxtl2   v25.4s, v3.8h
+        uxtl    v26.4s, v5.4h
+        uxtl2   v27.4s, v5.8h
+        uxtl    v28.4s, v6.4h
+        uxtl2   v29.4s, v6.8h
+        ucvtf   v16.4s, v16.4s
+        ucvtf   v17.4s, v17.4s
+        ucvtf   v18.4s, v18.4s
+        ucvtf   v19.4s, v19.4s
+        ucvtf   v22.4s, v22.4s
+        ucvtf   v23.4s, v23.4s
+        ucvtf   v24.4s, v24.4s
+        ucvtf   v25.4s, v25.4s
+        ucvtf   v26.4s, v26.4s
+        ucvtf   v27.4s, v27.4s
+        ucvtf   v28.4s, v28.4s
+        ucvtf   v29.4s, v29.4s
+        // grup 0
+        fmul    v16.4s, v16.4s, v20.4s
+        fmul    v31.4s, v22.4s, v26.4s
+        fsub    v16.4s, v16.4s, v31.4s
+        fsub    v7.4s, v20.4s, v26.4s
+        fdiv    v16.4s, v16.4s, v7.4s
+        fcvtns  v16.4s, v16.4s
+        // grup 1
+        fmul    v17.4s, v17.4s, v20.4s
+        fmul    v31.4s, v23.4s, v27.4s
+        fsub    v17.4s, v17.4s, v31.4s
+        fsub    v7.4s, v20.4s, v27.4s
+        fdiv    v17.4s, v17.4s, v7.4s
+        fcvtns  v17.4s, v17.4s
+        // grup 2
+        fmul    v18.4s, v18.4s, v20.4s
+        fmul    v31.4s, v24.4s, v28.4s
+        fsub    v18.4s, v18.4s, v31.4s
+        fsub    v7.4s, v20.4s, v28.4s
+        fdiv    v18.4s, v18.4s, v7.4s
+        fcvtns  v18.4s, v18.4s
+        // grup 3
+        fmul    v19.4s, v19.4s, v20.4s
+        fmul    v31.4s, v25.4s, v29.4s
+        fsub    v19.4s, v19.4s, v31.4s
+        fsub    v7.4s, v20.4s, v29.4s
+        fdiv    v19.4s, v19.4s, v7.4s
+        fcvtns  v19.4s, v19.4s
+        // [0, 65535] aralığına kırp ve u16'ya daralt
+        smax    v16.4s, v16.4s, v30.4s
+        smax    v17.4s, v17.4s, v30.4s
+        smax    v18.4s, v18.4s, v30.4s
+        smax    v19.4s, v19.4s, v30.4s
+        smin    v16.4s, v16.4s, v21.4s
+        smin    v17.4s, v17.4s, v21.4s
+        smin    v18.4s, v18.4s, v21.4s
+        smin    v19.4s, v19.4s, v21.4s
+        xtn     v0.4h, v16.4s
+        xtn2    v0.8h, v17.4s
+        xtn     v1.4h, v18.4s
+        xtn2    v1.8h, v19.4s
+        stp     q0, q1, [x0], #32
+        subs    x4, x4, #1
+        b.ne    .Lvc_unb_loop
+.Lvc_unb_done:
+        ret
+        .size   vc_unblend_u16_neon, . - vc_unblend_u16_neon

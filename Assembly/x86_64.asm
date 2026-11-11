@@ -205,3 +205,111 @@ vc_haar_inv_i16_avx2:
         vzeroupper
         ret
         .size   vc_haar_inv_i16_avx2, . - vc_haar_inv_i16_avx2
+
+# ------------------------------------------------------------------------------
+#  void vc_max5_u8_avx2(u8 *dst, const u8 *r0, const u8 *r1, const u8 *r2,
+#                       const u8 *r3, const u8 *r4, usize blocks)
+#      rdi = dst, rsi = r0, rdx = r1, rcx = r2, r8 = r3, r9 = r4,
+#      [rsp+8] = blocks (×32 bayt)
+#  dst[i] = max(r0[i], r1[i], r2[i], r3[i], r4[i])
+#  5×5 maske genişletme (dilation) ayrılabilir: yatayda kaydırılmış işaretçilerle,
+#  dikeyde komşu satırlarla aynı çekirdek çağrılır. Türkçe harf uzantıları (Ç Ğ İ Ö Ş Ü
+#  noktaları/çengelleri), kontur ve düşen gölge onarım maskesine böyle katılır.
+# ------------------------------------------------------------------------------
+        .globl  vc_max5_u8_avx2
+        .hidden vc_max5_u8_avx2
+        .type   vc_max5_u8_avx2, @function
+        .p2align 4
+vc_max5_u8_avx2:
+        mov     rax, qword ptr [rsp + 8]
+        test    rax, rax
+        jz      .Lvc_max5_done
+        xor     r10, r10
+.Lvc_max5_loop:
+        vmovdqu ymm0, ymmword ptr [rsi + r10]
+        vpmaxub ymm0, ymm0, ymmword ptr [rdx + r10]
+        vpmaxub ymm0, ymm0, ymmword ptr [rcx + r10]
+        vpmaxub ymm0, ymm0, ymmword ptr [r8 + r10]
+        vpmaxub ymm0, ymm0, ymmword ptr [r9 + r10]
+        vmovdqu ymmword ptr [rdi + r10], ymm0
+        add     r10, 32
+        dec     rax
+        jnz     .Lvc_max5_loop
+.Lvc_max5_done:
+        vzeroupper
+        ret
+        .size   vc_max5_u8_avx2, . - vc_max5_u8_avx2
+
+        .pushsection .rodata.cst4, "aM", @progbits, 4
+        .p2align 2
+.Lvc_f255:
+        .long   0x437f0000                      # 255.0f
+.Lvc_d65535:
+        .long   65535
+        .popsection
+
+# ------------------------------------------------------------------------------
+#  void vc_unblend_u16_avx2(u16 *dst, const u16 *img, const u16 *fg,
+#                           const u8 *alpha, usize blocks)
+#      rdi = dst, rsi = img, rdx = fg, rcx = alpha, r8 = blocks (×16 piksel)
+#
+#  Analitik ters karışım (doğrusal ışık, Q16: 0..65535):
+#      B = round_even( (255·I − α·F) / (255 − α) ),  [0, 65535] aralığına kırpılır.
+#  Çağıran α ≤ 254 garanti eder (α > eşik pikselleri modele bırakılır, α = 0 → B = I).
+#  Ara değerler f32'de tam sayıdır (|pay| < 2^24); yalnızca bölme yuvarlanır. FMA
+#  KULLANILMAZ: Rust başvurusu ve NEON çekirdeğiyle bit-bit aynı sonuç.
+# ------------------------------------------------------------------------------
+        .globl  vc_unblend_u16_avx2
+        .hidden vc_unblend_u16_avx2
+        .type   vc_unblend_u16_avx2, @function
+        .p2align 4
+vc_unblend_u16_avx2:
+        test    r8, r8
+        jz      .Lvc_unb_done
+        vbroadcastss ymm6, dword ptr [rip + .Lvc_f255]
+        vpbroadcastd ymm7, dword ptr [rip + .Lvc_d65535]
+        vpxor   xmm8, xmm8, xmm8
+.Lvc_unb_loop:
+        # piksel 0..7
+        vpmovzxwd ymm0, xmmword ptr [rsi]
+        vpmovzxwd ymm1, xmmword ptr [rdx]
+        vpmovzxbd ymm2, qword ptr [rcx]
+        vcvtdq2ps ymm0, ymm0
+        vcvtdq2ps ymm1, ymm1
+        vcvtdq2ps ymm2, ymm2
+        vmulps  ymm0, ymm0, ymm6                        # 255·I
+        vmulps  ymm1, ymm1, ymm2                        # α·F
+        vsubps  ymm0, ymm0, ymm1                        # pay
+        vsubps  ymm2, ymm6, ymm2                        # 255 − α
+        vdivps  ymm0, ymm0, ymm2
+        vcvtps2dq ymm0, ymm0                            # en yakın, eşitlikte çift
+        vpmaxsd ymm0, ymm0, ymm8
+        vpminsd ymm0, ymm0, ymm7
+        # piksel 8..15
+        vpmovzxwd ymm3, xmmword ptr [rsi + 16]
+        vpmovzxwd ymm4, xmmword ptr [rdx + 16]
+        vpmovzxbd ymm5, qword ptr [rcx + 8]
+        vcvtdq2ps ymm3, ymm3
+        vcvtdq2ps ymm4, ymm4
+        vcvtdq2ps ymm5, ymm5
+        vmulps  ymm3, ymm3, ymm6
+        vmulps  ymm4, ymm4, ymm5
+        vsubps  ymm3, ymm3, ymm4
+        vsubps  ymm5, ymm6, ymm5
+        vdivps  ymm3, ymm3, ymm5
+        vcvtps2dq ymm3, ymm3
+        vpmaxsd ymm3, ymm3, ymm8
+        vpminsd ymm3, ymm3, ymm7
+        vpackusdw ymm0, ymm0, ymm3                      # şerit içi: [0-3, 8-11 | 4-7, 12-15]
+        vpermq  ymm0, ymm0, 0xD8                        # → [0-3, 4-7, 8-11, 12-15]
+        vmovdqu ymmword ptr [rdi], ymm0
+        add     rsi, 32
+        add     rdx, 32
+        add     rcx, 16
+        add     rdi, 32
+        dec     r8
+        jnz     .Lvc_unb_loop
+.Lvc_unb_done:
+        vzeroupper
+        ret
+        .size   vc_unblend_u16_avx2, . - vc_unblend_u16_avx2
