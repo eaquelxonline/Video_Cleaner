@@ -22,6 +22,10 @@ on:
         description: "Elle cihaz listesi (boşsa otomatik seçilir). Örnek: model=tokay,version=35;model=a51,version=30"
         required: false
         default: ""
+      reuse_results:
+        description: "Önceki koşunun sonuçları (gs://…/video-cleaner/<run>-<attempt>). Verilirse cihazda test KOŞULMAZ (kota harcanmaz), yalnızca indirilip ölçülür."
+        required: false
+        default: ""
       max_devices:
         description: "Otomatik seçimde en fazla cihaz (Spark planı: günde 5 fiziksel test)"
         required: false
@@ -70,21 +74,21 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Set up Java 21
-        if: steps.creds.outputs.skip == 'false'
+        if: steps.creds.outputs.skip == 'false' && inputs.reuse_results == ''
         uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: '21'
 
       - name: Set up Rust
-        if: steps.creds.outputs.skip == 'false'
+        if: steps.creds.outputs.skip == 'false' && inputs.reuse_results == ''
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
           rustup target add aarch64-linux-android x86_64-linux-android
 
       - name: Cache cargo-ndk
-        if: steps.creds.outputs.skip == 'false'
+        if: steps.creds.outputs.skip == 'false' && inputs.reuse_results == ''
         id: cargo-ndk
         uses: actions/cache@v6
         with:
@@ -92,21 +96,21 @@ jobs:
           key: cargo-ndk-4.1.2-${{ runner.os }}
 
       - name: Install cargo-ndk
-        if: steps.creds.outputs.skip == 'false' && steps.cargo-ndk.outputs.cache-hit != 'true'
+        if: steps.creds.outputs.skip == 'false' && inputs.reuse_results == '' && steps.cargo-ndk.outputs.cache-hit != 'true'
         run: cargo install cargo-ndk --version 4.1.2 --locked
 
       - name: Set up Gradle
-        if: steps.creds.outputs.skip == 'false'
+        if: steps.creds.outputs.skip == 'false' && inputs.reuse_results == ''
         uses: gradle/actions/setup-gradle@v6
 
       - name: Install Android SDK components
-        if: steps.creds.outputs.skip == 'false'
+        if: steps.creds.outputs.skip == 'false' && inputs.reuse_results == ''
         run: |
           yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-37.0" "build-tools;37.0.0" "ndk;30.0.16248370"
 
       - name: Build APKs
-        if: steps.creds.outputs.skip == 'false'
+        if: steps.creds.outputs.skip == 'false' && inputs.reuse_results == ''
         run: |
           ./gradlew assembleDebug assembleDebugAndroidTest verifyDebugApkAlignment --stacktrace
           echo "APP_APK=$(find build/outputs/apk/debug -name '*.apk' | head -1)" >> "$GITHUB_ENV"
@@ -124,7 +128,7 @@ jobs:
         uses: google-github-actions/setup-gcloud@v2
 
       - name: Pick physical devices
-        if: steps.creds.outputs.skip == 'false'
+        if: steps.creds.outputs.skip == 'false' && inputs.reuse_results == ''
         run: |
           project="${{ vars.GCP_PROJECT_ID }}"
           [ -n "$project" ] || project="${{ secrets.GCP_PROJECT_ID }}"
@@ -141,7 +145,7 @@ jobs:
           { echo "## Seçilen cihazlar"; echo '```'; cat devices-human.txt 2>/dev/null || cat devices.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Run on Firebase Test Lab
-        if: steps.creds.outputs.skip == 'false'
+        if: steps.creds.outputs.skip == 'false' && inputs.reuse_results == ''
         run: |
           set +e
           gcloud firebase test android run \
@@ -159,9 +163,18 @@ jobs:
       - name: Download results
         if: steps.creds.outputs.skip == 'false'
         run: |
+          if [ -n "${{ inputs.reuse_results }}" ]; then
+            gcloud config set project "${{ vars.GCP_PROJECT_ID || secrets.GCP_PROJECT_ID || steps.auth.outputs.project_id }}" > /dev/null 2>&1 || true
+            RESULTS_GS="${{ inputs.reuse_results }}"
+            echo "RESULTS_GS=$RESULTS_GS" >> "$GITHUB_ENV"
+            echo "FTL_EXIT=reuse" >> "$GITHUB_ENV"
+            echo "Önceki sonuçlar yeniden kullanılıyor: $RESULTS_GS (cihaz kotası harcanmadı)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          [ -n "$RESULTS_GS" ] || { echo "::error::Sonuç klasörü (gs://) bulunamadı"; exit 1; }
           mkdir -p ftl-results
-          gsutil -m cp -r "$RESULTS_GS/*" ftl-results/ || true
-          find ftl-results -maxdepth 2 -type d | head -50
+          gsutil -m -q cp -r "$RESULTS_GS/*" ftl-results/ || echo "::warning::gsutil indirmesi tam değil"
+          echo "İndirilen klasörler:"; find ftl-results -maxdepth 2 -type d | sort
+          echo "Dosya sayısı: $(find ftl-results -type f | wc -l)"
 
       - name: Build libvmaf (Netflix v3.2.1, sabit)
         timeout-minutes: 40
@@ -184,26 +197,48 @@ jobs:
       - name: Measure each device
         if: steps.creds.outputs.skip == 'false'
         run: |
+          set +e
+          mkdir -p device-raw device-outputs
           for dev in ftl-results/*/; do
             name=$(basename "$dev")
-            log=$(find "$dev" -name 'logcat' -o -name '*logcat*.txt' | head -1)
+            echo "=== $name"
+            # Ham kanıt: ana logcat, sonuç XML'i, enstrümantasyon çıktısı, çökme ve tombstone dosyaları
+            mkdir -p "device-raw/$name"
+            find "$dev" -maxdepth 1 -type f \( -name 'logcat' -o -name 'test_result_*.xml' -o -name 'instrumentation.results' \
+              -o -iname '*crash*' -o -iname '*tombstone*' -o -iname '*anr*' \) -exec cp {} "device-raw/$name/" \;
+            ls -l "device-raw/$name"
+            log="$dev/logcat"
+            [ -f "$log" ] || log=$(find "$dev" -name 'logcat' | head -1)
+            if [ -z "$log" ] || [ ! -f "$log" ]; then
+              echo "$name: logcat yok" | tee -a "$GITHUB_STEP_SUMMARY"
+              continue
+            fi
+            grep -aE 'VCCAL|VCCAPS|VCTEST|VCDIAG|AndroidRuntime|DEBUG   :|libc    :' "$log" > "device-$name.log"
+            echo "$name: $(wc -l < "device-$name.log") ilgili logcat satırı"
             out=$(find "$dev" -type d -name VideoCleanerCalib | head -1)
-            [ -z "$log" ] && { echo "$name: logcat yok" >> "$GITHUB_STEP_SUMMARY"; continue; }
-            [ -z "$out" ] && echo "$name: kalibrasyon çıktısı çekilemedi (yalnızca test özeti)" >> "$GITHUB_STEP_SUMMARY"
-            grep -E 'VCCAL|VCCAPS|VCTEST|VCDIAG' "$log" > "device-$name.log" || true
             if [ -n "$out" ]; then
+              cp -r "$out" "device-outputs/$name"
               python3 .github/scripts/calibration_metrics.py \
                 --logcat "device-$name.log" --outputs "$out" --sources AndroidTest/assets/calib \
                 --vmaf "$RUNNER_TEMP/vmaf/libvmaf/build/tools/vmaf" --label "$name (gerçek cihaz)" \
-                --csv "device-$name.csv" --markdown "device-$name.md" || echo "$name: ölçüm betiği hata verdi" >> "$GITHUB_STEP_SUMMARY"
+                --csv "device-$name.csv" --markdown "device-$name.md"
+              echo "$name: ölçüm betiği çıkış kodu $?"
+            else
+              echo "$name: kalibrasyon çıktısı yok (yalnızca test özeti)" | tee -a "$GITHUB_STEP_SUMMARY"
             fi
             {
+              echo "## $name"
               cat "device-$name.md" 2>/dev/null
-              echo; echo "### Kodlayıcılar ve test özeti ($name)"; echo '```'
-              grep -E 'VCCAPS|VCDIAG|VCTEST.*(DEVICE|SUMMARY|VIDEO|BITRATE|SERVICE|PIXELS|VCCORE|VCAUDIT|REMUX|HBDECODE|CODECS|AV1ENCODE|RUNTIME|CHECKPOINT|AUDIOPROBE)' "device-$name.log" | sed -E 's/^.*(VCCAPS|VCDIAG|VCTEST) *: //'
+              echo; echo "### Test sonuçları ve özet satırları ($name)"; echo '```'
+              for x in "$dev"/test_result_*.xml; do
+                [ -f "$x" ] && grep -oE '<testsuite [^>]*' "$x" | head -1
+                [ -f "$x" ] && grep -oE '<testcase [^>]*name="[^"]*"[^>]*>(<failure|<error)?' "$x" | grep -E '<failure|<error' | sed -E 's/.*name="([^"]*)".*classname="([^"]*)".*/KALDI: \2.\1/'
+              done
+              grep -aE 'VCCAPS|VCDIAG|VCTEST.*(DEVICE|SUMMARY|VIDEO|BITRATE|SERVICE|PIXELS|VCCORE|VCAUDIT|REMUX|HBDECODE|CODECS|AV1ENCODE|RUNTIME|CHECKPOINT|AUDIOPROBE)' "device-$name.log" | sed -E 's/^.*(VCCAPS|VCDIAG|VCTEST) *: //'
               echo '```'
             } >> "$GITHUB_STEP_SUMMARY"
           done
+          exit 0
 
       - name: Upload device results
         if: always() && steps.creds.outputs.skip == 'false'
@@ -218,7 +253,16 @@ jobs:
             device-*.csv
             device-*.md
             device-*.log
+            device-raw/
+
+      - name: Upload device outputs (encoded videos)
+        if: always() && steps.creds.outputs.skip == 'false'
+        uses: actions/upload-artifact@v7
+        with:
+          name: real-device-outputs
+          if-no-files-found: ignore
+          path: device-outputs/
 
       - name: Fail if tests failed on a device
-        if: steps.creds.outputs.skip == 'false'
+        if: steps.creds.outputs.skip == 'false' && inputs.reuse_results == ''
         run: test "${FTL_EXIT:-1}" = "0"

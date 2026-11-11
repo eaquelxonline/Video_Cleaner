@@ -45,10 +45,14 @@ def main():
         tags = [str(t).lower() for t in (m.get("tags") or [])]
         if any("deprecated" in t for t in tags):
             continue
+        # Uygulama yalnızca 64 bit (arm64-v8a / x86_64): 32 bit cihazlar "Incompatible Architecture" olur.
+        abis = [str(a) for a in (m.get("supportedAbis") or [])]
+        if abis and "arm64-v8a" not in abis:
+            continue
         versions = as_versions(m.get("supportedVersionIds"))
         if versions:
             phones.append({"id": m["id"], "maker": m.get("manufacturer") or "?", "name": m.get("name") or m["id"], "versions": versions})
-    print(f"biçim dağılımı: {forms}; API ≥ 30 fiziksel telefon: {len(phones)}")
+    print(f"biçim dağılımı: {forms}; API ≥ 30, arm64 fiziksel telefon: {len(phones)}")
 
     picked, used = [], set()
 
