@@ -1,0 +1,193 @@
+# Video Cleaner — gerçek Android telefonlarda doğrulama (Firebase Test Lab).
+#
+# Uygulama ve cihaz testleri Test Lab'deki fiziksel telefonlarda, telefonun kendi (donanım) kodlayıcılarıyla
+# koşar. Kalibrasyon klipleri Standart ve Yüksek profillerle kodlanır; çıktılar ve logcat geri çekilir ve
+# emülatördeki ile aynı betikle ölçülür: istenen/gerçek bit hızı, kare kare PTS, SAR/yön, ses paketleri,
+# renk (colr ve VUI ayrı), VMAF (libvmaf v3.2.1; v0.6.1 + v0.6.1neg; ort/min/%5/%10), PSNR, SSIM.
+#
+# Gerekenler (bir kez, depo ayarlarında):
+#   Secrets → GCP_SA_KEY      : Test Lab yetkili hizmet hesabının JSON anahtarı
+#   Variables → GCP_PROJECT_ID: Firebase/Google Cloud proje kimliği
+# Sır yoksa iş "atlandı" olarak biter; diğer iş akışlarını etkilemez.
+
+name: Video Cleaner Real Device Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      devices:
+        description: "Elle cihaz listesi (boşsa otomatik seçilir). Örnek: model=tokay,version=35;model=a51,version=30"
+        required: false
+        default: ""
+      max_devices:
+        description: "Otomatik seçimde en fazla cihaz (Spark planı: günde 5 fiziksel test)"
+        required: false
+        default: "3"
+  pull_request:
+    paths:
+      - 'Kotlin/**'
+      - 'AndroidTest/**'
+      - '.github/workflows/firebase-device-test.yml'
+      - '.github/scripts/**'
+
+concurrency:
+  group: firebase-device-test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  devices:
+    name: Gerçek cihazlar (Firebase Test Lab)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      HAS_KEY: ${{ secrets.GCP_SA_KEY != '' }}
+    steps:
+      - name: Check credentials
+        id: creds
+        run: |
+          if [ "$HAS_KEY" != "true" ] || [ -z "${{ vars.GCP_PROJECT_ID }}" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "## Gerçek cihaz testi atlandı" >> "$GITHUB_STEP_SUMMARY"
+            echo "GCP_SA_KEY sırrı veya GCP_PROJECT_ID değişkeni tanımlı değil (README: firebase-device-test.yml başı)." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout
+        if: steps.creds.outputs.skip == 'false'
+        uses: actions/checkout@v7
+
+      - name: Set up Java 21
+        if: steps.creds.outputs.skip == 'false'
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Rust
+        if: steps.creds.outputs.skip == 'false'
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add aarch64-linux-android x86_64-linux-android
+
+      - name: Cache cargo-ndk
+        if: steps.creds.outputs.skip == 'false'
+        id: cargo-ndk
+        uses: actions/cache@v6
+        with:
+          path: ~/.cargo/bin/cargo-ndk
+          key: cargo-ndk-4.1.2-${{ runner.os }}
+
+      - name: Install cargo-ndk
+        if: steps.creds.outputs.skip == 'false' && steps.cargo-ndk.outputs.cache-hit != 'true'
+        run: cargo install cargo-ndk --version 4.1.2 --locked
+
+      - name: Set up Gradle
+        if: steps.creds.outputs.skip == 'false'
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Install Android SDK components
+        if: steps.creds.outputs.skip == 'false'
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-37.0" "build-tools;37.0.0" "ndk;30.0.16248370"
+
+      - name: Build APKs
+        if: steps.creds.outputs.skip == 'false'
+        run: |
+          ./gradlew assembleDebug assembleDebugAndroidTest verifyDebugApkAlignment --stacktrace
+          echo "APP_APK=$(find build/outputs/apk/debug -name '*.apk' | head -1)" >> "$GITHUB_ENV"
+          echo "TEST_APK=$(find build/outputs/apk/androidTest -name '*.apk' | head -1)" >> "$GITHUB_ENV"
+
+      - name: Authenticate to Google Cloud
+        if: steps.creds.outputs.skip == 'false'
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Set up gcloud
+        if: steps.creds.outputs.skip == 'false'
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Pick physical devices
+        if: steps.creds.outputs.skip == 'false'
+        run: |
+          gcloud config set project "${{ vars.GCP_PROJECT_ID }}"
+          if [ -n "${{ inputs.devices }}" ]; then
+            echo "${{ inputs.devices }}" | tr ';' '\n' | sed 's/^/--device=/' > devices.txt
+          else
+            gcloud firebase test android models list --format=json > models.json
+            python3 .github/scripts/ftl_pick_devices.py models.json "${{ inputs.max_devices || '3' }}" > devices.txt 2> devices-human.txt
+          fi
+          { echo "## Seçilen cihazlar"; echo '```'; cat devices-human.txt 2>/dev/null || cat devices.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Run on Firebase Test Lab
+        if: steps.creds.outputs.skip == 'false'
+        run: |
+          set +e
+          gcloud firebase test android run \
+            --type instrumentation \
+            --app "$APP_APK" --test "$TEST_APK" \
+            $(cat devices.txt) \
+            --environment-variables calibrate=true,calibrateCandidates=policy_std+policy_high+policy_std_hevc \
+            --directories-to-pull /sdcard/Movies \
+            --results-dir "video-cleaner/${{ github.run_id }}-${{ github.run_attempt }}" \
+            --timeout 45m --no-record-video --no-performance-metrics 2>&1 | tee ftl.log
+          echo "FTL_EXIT=${PIPESTATUS[0]}" >> "$GITHUB_ENV"
+          bucket=$(grep -oE 'gs://[^] ]+|storage/browser/[^] ]+' ftl.log | head -1 | sed 's#storage/browser/#gs://#; s#/$##')
+          echo "RESULTS_GS=$bucket" >> "$GITHUB_ENV"
+
+      - name: Download results
+        if: steps.creds.outputs.skip == 'false'
+        run: |
+          mkdir -p ftl-results
+          gsutil -m cp -r "$RESULTS_GS/*" ftl-results/ || true
+          find ftl-results -maxdepth 2 -type d | head -50
+
+      - name: Build libvmaf (Netflix v3.2.1, sabit)
+        if: steps.creds.outputs.skip == 'false'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg meson ninja-build nasm xxd > /dev/null
+          git clone --depth 1 --branch v3.2.1 https://github.com/Netflix/vmaf.git "$RUNNER_TEMP/vmaf"
+          meson setup "$RUNNER_TEMP/vmaf/libvmaf/build" "$RUNNER_TEMP/vmaf/libvmaf" --buildtype release -Denable_float=true > /dev/null
+          ninja -C "$RUNNER_TEMP/vmaf/libvmaf/build" > /dev/null
+
+      - name: Measure each device
+        if: steps.creds.outputs.skip == 'false'
+        run: |
+          for dev in ftl-results/*/; do
+            name=$(basename "$dev")
+            log=$(find "$dev" -name 'logcat' -o -name '*logcat*.txt' | head -1)
+            out=$(find "$dev" -type d -name VideoCleanerCalib | head -1)
+            [ -z "$log" ] || [ -z "$out" ] && { echo "$name: logcat veya çıktı yok" >> "$GITHUB_STEP_SUMMARY"; continue; }
+            grep -E 'VCCAL|VCCAPS|VCTEST' "$log" > "device-$name.log" || true
+            python3 .github/scripts/calibration_metrics.py \
+              --logcat "device-$name.log" --outputs "$out" --sources AndroidTest/assets/calib \
+              --vmaf "$RUNNER_TEMP/vmaf/libvmaf/build/tools/vmaf" --label "$name (gerçek cihaz)" \
+              --csv "device-$name.csv" --markdown "device-$name.md"
+            {
+              cat "device-$name.md"
+              echo; echo "### Kodlayıcılar ve test özeti ($name)"; echo '```'
+              grep -E 'VCCAPS|VCTEST.*(DEVICE|SUMMARY|VIDEO|BITRATE|SERVICE|PIXELS)' "device-$name.log" | sed -E 's/^.*(VCCAPS|VCTEST) *: //'
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          done
+
+      - name: Upload device results
+        if: always() && steps.creds.outputs.skip == 'false'
+        uses: actions/upload-artifact@v7
+        with:
+          name: real-device-results
+          if-no-files-found: warn
+          path: |
+            ftl.log
+            devices*.txt
+            device-*.csv
+            device-*.md
+            device-*.log
+
+      - name: Fail if tests failed on a device
+        if: steps.creds.outputs.skip == 'false'
+        run: test "${FTL_EXIT:-1}" = "0"

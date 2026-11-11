@@ -637,7 +637,12 @@ internal fun monotonicAudioPts(timeUs: Long, lastPtsUs: Long): Long {
 }
 
 /** MP4'ün doğrudan taşıyabildiği ses (AAC, AMR): örnekler yeniden kodlanmadan kopyalanır. */
-private class AudioCopy(private val extractor: MediaExtractor, override val trackFormat: MediaFormat) : AudioPath {
+/**
+ * [offsetUs]: zaman çizelgesi kaydırması. MP4'te AAC/Opus ön dolgu paketleri negatif damgalıdır (ör. −21 333 µs) ve
+ * MP4 çoklayıcı negatif damga yazamaz. Paketleri değiştirmeden veya atmadan senkronu korumak için bütün çıktı
+ * (ses ve görüntü) aynı miktarda ileri kaydırılır; böylece ses paketleri birebir korunur ve A/V ofseti kaynakla aynı kalır.
+ */
+private class AudioCopy(private val extractor: MediaExtractor, override val trackFormat: MediaFormat, private val offsetUs: Long) : AudioPath {
     override val label = "yeniden kodlanmadan kopyalandı"
     override var finished = false
         private set
@@ -653,7 +658,7 @@ private class AudioCopy(private val extractor: MediaExtractor, override val trac
                 finished = true
                 break
             }
-            val time = extractor.sampleTime
+            val time = extractor.sampleTime + offsetUs
             if (time > untilUs) break
             val size = extractor.readSampleData(buffer, 0)
             if (size < 0) {
@@ -679,7 +684,7 @@ private class AudioCopy(private val extractor: MediaExtractor, override val trac
  * Çoklayıcı, AAC kodlayıcının çıkış biçimi bilinmeden başlatılamadığı için [prepare] ilk
  * paketleri üretip biçimi öğrenir; bu arada çıkan paketler kuyrukta bekler.
  */
-private class AudioTranscode(private val extractor: MediaExtractor, source: MediaFormat) : AudioPath {
+private class AudioTranscode(private val extractor: MediaExtractor, source: MediaFormat, private val offsetUs: Long) : AudioPath {
     override val label = "AAC'ye dönüştürüldü (kaynak: ${source.getString(MediaFormat.KEY_MIME)})"
     override var finished = false
         private set
@@ -752,8 +757,8 @@ private class AudioTranscode(private val extractor: MediaExtractor, source: Medi
                     decoder.queueInputBuffer(index, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
                     inputDone = true
                 } else {
-                    // Ön dolgu paketlerinin negatif damgası çözücüye 0 olarak verilir.
-                    decoder.queueInputBuffer(index, 0, size, max(extractor.sampleTime, 0L), 0)
+                    // Zaman çizelgesi kaydırması (bkz. AudioCopy) sonrası damga ≥ 0 olur; yine de negatif kalırsa 0'a çekilir.
+                    decoder.queueInputBuffer(index, 0, size, max(extractor.sampleTime + offsetUs, 0L), 0)
                     extractor.advance()
                 }
             }
@@ -903,7 +908,9 @@ class VideoJob(
     private class Encoder(val codec: MediaCodec, val mime: String, val name: String, val settings: EncoderSettings)
 
     /** Verilen boyutu destekleyen bir kodlayıcı seçip yapılandırır; tercih edilen tür olmazsa diğerini dener. */
-    private fun startEncoder(width: Int, height: Int, frameRate: Float, source: SourceVideoStats?, sourceMime: String, color: MediaFormat?): Encoder {
+    private fun startEncoder(
+        width: Int, height: Int, frameRate: Float, source: SourceVideoStats?, sourceMime: String, color: MediaFormat?, sar: Pair<Int, Int>?,
+    ): Encoder {
         val order = if (options.preferHevc) listOf(MediaFormat.MIMETYPE_VIDEO_HEVC, MediaFormat.MIMETYPE_VIDEO_AVC)
         else listOf(MediaFormat.MIMETYPE_VIDEO_AVC, MediaFormat.MIMETYPE_VIDEO_HEVC)
         val codecs = MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.filter { it.isEncoder }
@@ -975,6 +982,11 @@ class VideoJob(
                 )
                 format.setInteger(MediaFormat.KEY_COLOR_RANGE, if (range != 0) range else MediaFormat.COLOR_RANGE_LIMITED)
                 format.setInteger(MediaFormat.KEY_COLOR_TRANSFER, if (transfer != 0) transfer else MediaFormat.COLOR_TRANSFER_SDR_VIDEO)
+                // Kare olmayan piksel (anamorfik) kaynakta piksel en-boy oranı korunur; kodlayıcı VUI'ye yazar.
+                if (sar != null) {
+                    format.setInteger(MediaFormat.KEY_PIXEL_ASPECT_RATIO_WIDTH, sar.first)
+                    format.setInteger(MediaFormat.KEY_PIXEL_ASPECT_RATIO_HEIGHT, sar.second)
+                }
                 try {
                     val codec = MediaCodec.createByCodecName(candidate.name)
                     try {
@@ -1061,6 +1073,12 @@ class VideoJob(
             val durationUs = if (sourceFormat.containsKey(MediaFormat.KEY_DURATION)) sourceFormat.getLong(MediaFormat.KEY_DURATION) else 0L
             val rotation = sourceFormat.intOr(MediaFormat.KEY_ROTATION, 0)
             val sourceBitrate = sourceFormat.intOr(MediaFormat.KEY_BIT_RATE, 0)
+            // Piksel en-boy oranı (SAR): 1:1 değilse çıktıya taşınır (VUI + MP4 'pasp').
+            val sourceSar = run {
+                val w = sourceFormat.intOr(MediaFormat.KEY_PIXEL_ASPECT_RATIO_WIDTH, 1)
+                val h = sourceFormat.intOr(MediaFormat.KEY_PIXEL_ASPECT_RATIO_HEIGHT, 1)
+                if (w > 0 && h > 0 && w != h) w to h else null
+            }
             val sourceVideo = runCatching { measureVideoTrack(videoTrack) }.getOrNull()
             // Kare hızı yalnızca kodlayıcının hız denetimi içindir; kare zaman damgaları kaynaktan aynen taşınır.
             // Beyan yoksa örnek tablosundan ölçülen ortalama kullanılır.
@@ -1094,6 +1112,7 @@ class VideoJob(
             mux.setOrientationHint(rotation)
 
             // ---- ses -----------------------------------------------------------
+            var timelineOffsetUs = 0L
             var audioTrackOut = -1
             var audioLabel = "ses akışı yok"
             val audioSource = MediaExtractor().also { it.setDataSource(context, input, null) }
@@ -1101,11 +1120,13 @@ class VideoJob(
             findTrack(audioSource, "audio/")?.let { track ->
                 val format = audioSource.getTrackFormat(track)
                 audioSource.selectTrack(track)
+                // Ön dolgu: ilk ses paketi negatif damgalıysa bütün çıktı o kadar ileri kaydırılır (bkz. AudioCopy).
+                timelineOffsetUs = max(0L, -audioSource.sampleTime).coerceAtMost(MAX_TIMELINE_OFFSET_US)
                 try {
                     val path: AudioPath = if (format.getString(MediaFormat.KEY_MIME) in MP4_AUDIO_TYPES) {
-                        AudioCopy(audioSource, format)
+                        AudioCopy(audioSource, format, timelineOffsetUs)
                     } else {
-                        AudioTranscode(audioSource, format).also {
+                        AudioTranscode(audioSource, format, timelineOffsetUs).also {
                             audio = it
                             it.prepare()
                         }
@@ -1144,7 +1165,13 @@ class VideoJob(
                     when {
                         index == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
                             check(!muxerStarted) { "kodlayıcı biçimi iki kez değişti" }
-                            videoTrackOut = mux.addTrack(enc.outputFormat)
+                            // Kodlayıcı SAR'ı çıkış biçimine koymayabilir; çoklayıcı 'pasp' kutusunu bu biçimden yazar.
+                            val trackFormat = enc.outputFormat
+                            sourceSar?.let { (w, h) ->
+                                trackFormat.setInteger(MediaFormat.KEY_PIXEL_ASPECT_RATIO_WIDTH, w)
+                                trackFormat.setInteger(MediaFormat.KEY_PIXEL_ASPECT_RATIO_HEIGHT, h)
+                            }
+                            videoTrackOut = mux.addTrack(trackFormat)
                             mux.start()
                             muxerStarted = true
                         }
@@ -1153,7 +1180,9 @@ class VideoJob(
                             val config = info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0
                             if (!config && info.size > 0) {
                                 check(muxerStarted) { "çoklayıcı başlamadan veri geldi" }
+                                if (timelineOffsetUs != 0L) info.presentationTimeUs += timelineOffsetUs
                                 mux.writeSampleData(videoTrackOut, data, info)
+                                info.presentationTimeUs -= timelineOffsetUs
                                 framesEncoded++
                                 lastPtsOut = info.presentationTimeUs
                             }
@@ -1204,7 +1233,7 @@ class VideoJob(
                                 notes += "Tek sayılı boyut (${crop.width()}×${crop.height()}) ${width}×$height olarak kırpıldı."
                             }
                             if (image.format == ImageFormat.YCBCR_P010) notes += "10 bit kaynak 8 bite indirildi (ton eşlemesi yok)."
-                            encoder = startEncoder(width, height, frameRate, sourceVideo, sourceMime, colorFormat)
+                            encoder = startEncoder(width, height, frameRate, sourceVideo, sourceMime, colorFormat, sourceSar)
                             CleanerSession(width, height).also { session = it }
                         }
                         if (width != active.width || height != active.height) {
@@ -1270,7 +1299,7 @@ class VideoJob(
                     }
                 }
                 drainEncoder(if (eosQueued) CODEC_TIMEOUT_US else 0)
-                if (muxerStarted && audioTrackOut >= 0) audio?.pump(mux, audioTrackOut, lastPtsOut)
+                if (muxerStarted && audioTrackOut >= 0) audio?.pump(mux, audioTrackOut, lastPtsOut + timelineOffsetUs)
 
                 val now = SystemClock.elapsedRealtime()
                 if (now - lastReport >= PROGRESS_INTERVAL_MS) {
@@ -1319,6 +1348,9 @@ class VideoJob(
     companion object {
         private const val CODEC_TIMEOUT_US = 10_000L
         private const val MAX_DECODER_ATTEMPTS = 4
+
+        /** Ön dolgu kaydırması için üst sınır: AAC/Opus/MP3 ön dolgusu bir iki paketi geçmez (≤ 100 ms). */
+        private const val MAX_TIMELINE_OFFSET_US = 100_000L
 
         /** MediaCodecInfo.CodecCapabilities.FEATURE_QpBounds ve MediaFormat.KEY_VIDEO_QP_MAX (API 31). */
         const val FEATURE_QP_BOUNDS = "qp-bounds"

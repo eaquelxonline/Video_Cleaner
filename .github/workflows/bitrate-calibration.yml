@@ -15,7 +15,7 @@ on:
   pull_request:
     paths:
       - 'Kotlin/Core.kt'
-      - 'AndroidTest/EncoderCalibrationTest.kt'
+      - 'AndroidTest/**'
       - 'AndroidTest/assets/calib/**'
       - '.github/workflows/bitrate-calibration.yml'
       - '.github/scripts/calibration_metrics.py'
@@ -99,11 +99,11 @@ jobs:
             mkdir -p calib-out && adb pull /sdcard/Movies/VideoCleanerCalib calib-out || true
             test ! -f test-failed
 
-      - name: Build libvmaf (Netflix, v3.0.0)
+      - name: Build libvmaf (Netflix v3.2.1, sabit)
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq ffmpeg meson ninja-build nasm xxd > /dev/null
-          git clone --depth 1 --branch v3.0.0 https://github.com/Netflix/vmaf.git "$RUNNER_TEMP/vmaf"
+          git clone --depth 1 --branch v3.2.1 https://github.com/Netflix/vmaf.git "$RUNNER_TEMP/vmaf"
           meson setup "$RUNNER_TEMP/vmaf/libvmaf/build" "$RUNNER_TEMP/vmaf/libvmaf" --buildtype release -Denable_float=true > /dev/null
           ninja -C "$RUNNER_TEMP/vmaf/libvmaf/build" > /dev/null
           "$RUNNER_TEMP/vmaf/libvmaf/build/tools/vmaf" --version
@@ -114,6 +114,7 @@ jobs:
           python3 .github/scripts/calibration_metrics.py \
             --logcat calib-logcat.txt --outputs "${out:-calib-out}" --sources AndroidTest/assets/calib \
             --vmaf "$RUNNER_TEMP/vmaf/libvmaf/build/tools/vmaf" \
+            --label "emülatör API ${{ matrix.api-level }} (yazılım kodlayıcı)" \
             --csv calibration-api${{ matrix.api-level }}.csv --markdown calibration-api${{ matrix.api-level }}.md
           {
             echo "# API ${{ matrix.api-level }}"

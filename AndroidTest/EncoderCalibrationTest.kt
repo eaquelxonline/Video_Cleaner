@@ -92,13 +92,16 @@ class EncoderCalibrationTest {
         val vbr = EncoderCapabilities.BITRATE_MODE_VBR
         // Doğrulama turu: nihai üretim politikası (Standart ×2.0, Yüksek ×3.0, kaynak GOP, VBR) eski kurala karşı.
         // Önceki turlar (kaynak katı 1.0–3.0, GOP, QP sınırı, CQ, HEVC) için commit geçmişine bakın.
-        val candidates = listOf(
+        val all = listOf(
             Candidate("avc_legacy", false, null) { c -> maxOf(c.declaredBps * 5L / 4, c.bpppf(0.14)) },
             Candidate("policy_std", false, null, policyQuality = 1f) { 0 },
             Candidate("policy_high", false, null, policyQuality = 2f) { 0 },
             Candidate("policy_std_hevc", true, null, policyQuality = 1f) { 0 },
         )
-        val only = InstrumentationRegistry.getArguments().getString("calibrateClips")?.split(',')?.toSet()
+        // Gerçek cihazda (Firebase Test Lab) yalnızca üretim profilleri koşturulur: calibrateCandidates=policy_std,policy_high,...
+        val wanted = InstrumentationRegistry.getArguments().getString("calibrateCandidates")?.split(',', '+')?.toSet()
+        val candidates = all.filter { wanted == null || it.id in wanted }
+        val only = InstrumentationRegistry.getArguments().getString("calibrateClips")?.split(',', '+')?.toSet()
         val names = testAssets.list("calib")!!.sorted().filter { only == null || it.substringBefore('.') in only }
         for (name in names) {
             val clip = loadClip(name)
@@ -138,6 +141,7 @@ class EncoderCalibrationTest {
                             "frames=${result.framesDecoded}/${result.framesEncoded} outSamples=${out?.samples ?: 0} outSync=${out?.syncSamples ?: 0} reason=\"${s.reason}\" " +
                             "ms=${result.elapsedMs} size=${result.width}x${result.height} audio=\"${result.audio}\"",
                     )
+                    Log.i(CAL, "CHECK clip=${clip.name} cand=${candidate.id} ${verify(clip.file, output, result)}")
                     publish(output, output.name)
                 } catch (e: Exception) {
                     Log.i(CAL, "RESULT clip=${clip.name} cand=${candidate.id} status=FAIL error=\"${e.javaClass.simpleName}: ${e.message}\"")
@@ -146,6 +150,168 @@ class EncoderCalibrationTest {
                 }
             }
             clip.file.delete()
+        }
+    }
+
+    // ---- 3. Çıktı doğrulaması (cihazda): kare kare PTS, ses paketleri, çözünürlük, en-boy, yön ----------
+
+    private class TrackDump(
+        val format: MediaFormat,
+        val times: List<Long>,
+        /** Her örneğin (paketin) MD5'i; yalnızca ses için doldurulur. */
+        val hashes: List<String>,
+        val firstPts: Long,
+        val endUs: Long,
+    )
+
+    private fun dump(file: File, prefix: String, withHashes: Boolean): TrackDump? {
+        val extractor = MediaExtractor()
+        try {
+            extractor.setDataSource(file.path)
+            val track = (0 until extractor.trackCount).firstOrNull { extractor.getTrackFormat(it).getString(MediaFormat.KEY_MIME)?.startsWith(prefix) == true } ?: return null
+            val format = extractor.getTrackFormat(track)
+            extractor.selectTrack(track)
+            val buffer = java.nio.ByteBuffer.allocate(4 shl 20)
+            val md = java.security.MessageDigest.getInstance("MD5")
+            val times = ArrayList<Long>()
+            val hashes = ArrayList<String>()
+            while (extractor.sampleTrackIndex >= 0) {
+                times += extractor.sampleTime
+                if (withHashes) {
+                    buffer.clear()
+                    val size = extractor.readSampleData(buffer, 0)
+                    md.reset()
+                    md.update(buffer.array(), 0, maxOf(size, 0))
+                    hashes += md.digest().joinToString("") { "%02x".format(it) }
+                }
+                if (!extractor.advance()) break
+            }
+            val sorted = times.sorted()
+            val frame = if (sorted.size > 1) (sorted.last() - sorted.first()) / (sorted.size - 1) else 0L
+            return TrackDump(format, sorted, hashes, sorted.firstOrNull() ?: 0L, (sorted.lastOrNull() ?: 0L) + frame)
+        } finally {
+            extractor.release()
+        }
+    }
+
+    private fun MediaFormat.int(key: String): Int? = if (containsKey(key)) getInteger(key) else null
+
+    /** Kaynak ile çıktıyı karşılaştırıp tek satırlık denetim sonucu üretir (PASS/FAIL + ölçümler). */
+    private fun verify(source: File, output: File, result: JobResult): String {
+        val problems = ArrayList<String>()
+        val sv = dump(source, "video/", false)!!
+        val ov = dump(output, "video/", false)!!
+        // Kare kare PTS: ilk kareye göre göreli zamanlar birebir karşılaştırılır (MP4 zaman tabanı yuvarlaması dahil).
+        var maxDiff = 0L
+        if (sv.times.size != ov.times.size) problems += "kare sayısı ${sv.times.size}→${ov.times.size}"
+        for (i in 0 until minOf(sv.times.size, ov.times.size)) {
+            maxDiff = maxOf(maxDiff, kotlin.math.abs((ov.times[i] - ov.firstPts) - (sv.times[i] - sv.firstPts)))
+        }
+        if (maxDiff > 1000) problems += "PTS sapması ${maxDiff}µs"
+        val sw = sv.format.int(MediaFormat.KEY_WIDTH)!!
+        val sh = sv.format.int(MediaFormat.KEY_HEIGHT)!!
+        if (result.width != (sw and 1.inv()) || result.height != (sh and 1.inv())) problems += "çözünürlük ${sw}x$sh→${result.width}x${result.height}"
+        val sSar = "${sv.format.int("sar-width") ?: 1}:${sv.format.int("sar-height") ?: 1}"
+        val oSar = "${ov.format.int("sar-width") ?: 1}:${ov.format.int("sar-height") ?: 1}"
+        if (sSar != oSar) problems += "piksel en-boy $sSar→$oSar"
+        val sRot = sv.format.int(MediaFormat.KEY_ROTATION) ?: 0
+        val oRot = ov.format.int(MediaFormat.KEY_ROTATION) ?: 0
+        if (sRot != oRot) problems += "yön $sRot→$oRot"
+        // Ses
+        val sa = dump(source, "audio/", true)
+        val oa = dump(output, "audio/", true)
+        var audio = "-"
+        if (sa != null) {
+            if (oa == null) {
+                problems += "ses yok"
+            } else {
+                val sMime = sa.format.getString(MediaFormat.KEY_MIME)
+                val oMime = oa.format.getString(MediaFormat.KEY_MIME)
+                val copied = result.audio.contains("kopyalandı")
+                val identical = sa.hashes == oa.hashes
+                if (copied && !identical) problems += "ses 'kopyalandı' diyor ama paketler farklı (${sa.hashes.size}→${oa.hashes.size})"
+                if (copied && sMime != oMime) problems += "ses kodeki değişti $sMime→$oMime"
+                if (sa.format.int(MediaFormat.KEY_SAMPLE_RATE) != oa.format.int(MediaFormat.KEY_SAMPLE_RATE)) problems += "örnekleme hızı değişti"
+                if (sa.format.int(MediaFormat.KEY_CHANNEL_COUNT) != oa.format.int(MediaFormat.KEY_CHANNEL_COUNT)) problems += "kanal sayısı değişti"
+                // A/V senkron: sesin görüntüye göre başlangıç ofseti kaynakla aynı olmalı. Kopyada ≤ 1 ms (MP4 zaman
+                // tabanı yuvarlaması); yeniden kodlamada çözücü ön dolguyu kendisi düştüğü için ≤ 1 paket (25 ms).
+                val sOff = sa.firstPts - sv.firstPts
+                val oOff = oa.firstPts - ov.firstPts
+                val syncTol = if (result.audio.contains("kopyalandı")) 1_000L else 25_000L
+                if (kotlin.math.abs(oOff - sOff) > syncTol) problems += "A/V ofseti ${sOff}µs→${oOff}µs"
+                val sDur = sa.endUs - sa.firstPts
+                val oDur = oa.endUs - oa.firstPts
+                if (kotlin.math.abs(oDur - sDur) > 50_000L) problems += "ses süresi ${sDur / 1000}ms→${oDur / 1000}ms"
+                audio = "src=$sMime/${sa.format.int(MediaFormat.KEY_SAMPLE_RATE)}Hz/${sa.format.int(MediaFormat.KEY_CHANNEL_COUNT)}ch/${sa.hashes.size}pk " +
+                    "out=$oMime/${oa.format.int(MediaFormat.KEY_SAMPLE_RATE)}Hz/${oa.format.int(MediaFormat.KEY_CHANNEL_COUNT)}ch/${oa.hashes.size}pk " +
+                    "packets=${if (identical) "identical" else "different"} mode=${if (copied) "copy" else "transcode"} avOffsetUs=$sOff→$oOff durMs=${sDur / 1000}→${oDur / 1000}"
+            }
+        }
+        val status = if (problems.isEmpty()) "PASS" else "FAIL"
+        return "status=$status frames=${sv.times.size}→${ov.times.size} ptsMaxDiffUs=$maxDiff size=${sw}x$sh→${result.width}x${result.height} sar=$sSar→$oSar rot=$sRot→$oRot " +
+            "audio=\"$audio\" problems=\"${problems.joinToString("; ")}\""
+    }
+
+    // ---- 4. Hangi ses kodekleri MP4'e yeniden kodlanmadan taşınabilir? -------------------------------
+
+    @Test
+    fun h_audioPassthroughProbe() {
+        // Kaynak ses paketleri MediaMuxer (MP4) ile aynen yazılır, sonra geri okunur; paket MD5'leri karşılaştırılır.
+        val sources = listOf("calib/c20_360p30_h264_opus.mp4", "calib/c14_360p30_vp9.webm", "videos/s4_h264_vorbis.mkv", "videos/s5_mpeg4_mp3.mp4", "videos/u1_360p.mp4")
+        for (asset in sources) {
+            val src = File(app.cacheDir, "probe_" + asset.substringAfterLast('/'))
+            val out = File(app.cacheDir, "probe_out.mp4")
+            testAssets.open(asset).use { input -> src.outputStream().use { input.copyTo(it) } }
+            out.delete()
+            var mime = "?"
+            val verdict = try {
+                val extractor = MediaExtractor()
+                extractor.setDataSource(src.path)
+                val track = (0 until extractor.trackCount).first { extractor.getTrackFormat(it).getString(MediaFormat.KEY_MIME)!!.startsWith("audio/") }
+                val format = extractor.getTrackFormat(track)
+                mime = format.getString(MediaFormat.KEY_MIME)!!
+                extractor.selectTrack(track)
+                val muxer = android.media.MediaMuxer(out.path, android.media.MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+                val index = try {
+                    muxer.addTrack(format)
+                } catch (e: Exception) {
+                    muxer.release()
+                    extractor.release()
+                    throw IllegalStateException("addTrack reddetti: ${e.message}")
+                }
+                muxer.start()
+                val buffer = java.nio.ByteBuffer.allocateDirect(1 shl 20)
+                val info = android.media.MediaCodec.BufferInfo()
+                var last = Long.MIN_VALUE
+                while (extractor.sampleTrackIndex >= 0) {
+                    val size = extractor.readSampleData(buffer, 0)
+                    if (size < 0) break
+                    val pts = maxOf(extractor.sampleTime, 0L).let { if (last == Long.MIN_VALUE) it else maxOf(it, last + 1) }
+                    last = pts
+                    buffer.position(0)
+                    buffer.limit(size)
+                    info.set(0, size, pts, android.media.MediaCodec.BUFFER_FLAG_KEY_FRAME)
+                    muxer.writeSampleData(index, buffer, info)
+                    extractor.advance()
+                }
+                muxer.stop()
+                muxer.release()
+                extractor.release()
+                val a = dump(src, "audio/", true)!!
+                val b = dump(out, "audio/", true)
+                when {
+                    b == null -> "BOZUK (çıktıda ses izi okunamadı)"
+                    b.format.getString(MediaFormat.KEY_MIME) != mime -> "BOZUK (tür ${b.format.getString(MediaFormat.KEY_MIME)})"
+                    a.hashes == b.hashes -> "OK (${a.hashes.size} paket birebir)"
+                    else -> "FARKLI (${a.hashes.size}→${b.hashes.size} paket)"
+                }
+            } catch (e: Exception) {
+                "DESTEKLENMİYOR (${e.javaClass.simpleName}: ${e.message})"
+            }
+            Log.i(CAL, "AUDIOPROBE api=${Build.VERSION.SDK_INT} source=$asset mime=$mime result=\"$verdict\"")
+            Log.i(CAPS, "AUDIOPROBE api=${Build.VERSION.SDK_INT} source=$asset mime=$mime result=\"$verdict\"")
+            src.delete()
+            out.delete()
         }
     }
 
