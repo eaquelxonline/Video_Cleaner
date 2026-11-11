@@ -3950,6 +3950,113 @@ pub mod jni {
         })
     }
 
+    /// `external fun nativePushHardwareBuffer(handle: Long, buffer: HardwareBuffer, cropLeft: Int, cropTop: Int,
+    /// ptsUs: Long, flags: Int): Long` — ImageReader görüntüsünün donanım tamponunu Java'da `Image.getPlanes()`
+    /// çağırmadan, `AHardwareBuffer_lockPlanes` ile kilitleyip iter.
+    ///
+    /// Neden: bazı cihazlarda (Galaxy Z Flip8, Android 17, Qualcomm çözücü) Surface çıkışı CPU'ya açılamayan
+    /// (sıkıştırılmış) tampon olur ve `getPlanes()` istisna yerine JNI abort ile süreci öldürür. Burada kilit
+    /// başarısızsa veya düzlem adresi boşsa çökmeden `Unsupported` (-14) döner; çağıran bayt tamponu yoluna düşer.
+    ///
+    /// # Safety
+    /// `env` geçerli olmalı; `buffer` bir `android.hardware.HardwareBuffer` olmalıdır.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "system" fn Java_com_video_cleaner_Core_nativePushHardwareBuffer(
+        env: *mut JniEnv,
+        _class: JObject,
+        handle: i64,
+        buffer: JObject,
+        crop_left: i32,
+        crop_top: i32,
+        pts_us: i64,
+        flags: i32,
+    ) -> i64 {
+        #[cfg(target_os = "android")]
+        {
+            use crate::hwbuf::*;
+            if buffer.is_null() || crop_left < 0 || crop_top < 0 {
+                return CoreError::BadArgument.code() as i64;
+            }
+            // SAFETY: env ve buffer JVM'den gelir; AHardwareBuffer çağrı boyunca HardwareBuffer nesnesiyle yaşar.
+            unsafe {
+                let ahb = AHardwareBuffer_fromHardwareBuffer(env as *mut c_void, buffer);
+                if ahb.is_null() {
+                    return CoreError::BadArgument.code() as i64;
+                }
+                let mut desc = Desc::default();
+                AHardwareBuffer_describe(ahb, &mut desc);
+                let mut planes = Planes {
+                    plane_count: 0,
+                    planes: [Plane {
+                        data: std::ptr::null_mut(),
+                        pixel_stride: 0,
+                        row_stride: 0,
+                    }; 4],
+                };
+                if AHardwareBuffer_lockPlanes(
+                    ahb,
+                    USAGE_CPU_READ_OFTEN,
+                    -1,
+                    std::ptr::null(),
+                    &mut planes,
+                ) != 0
+                {
+                    return CoreError::Unsupported.code() as i64;
+                }
+                let usable = planes.plane_count >= 3
+                    && planes.planes[..3]
+                        .iter()
+                        .all(|p| !p.data.is_null() && p.row_stride > 0 && p.pixel_stride > 0);
+                let result = if !usable {
+                    Err(CoreError::Unsupported)
+                } else {
+                    let rows = desc.height as usize;
+                    let (left, top) = (crop_left as usize, crop_top as usize);
+                    // Kırpma ofseti; 4:2:0 kroma yarım çözünürlüktedir.
+                    let mk =
+                        |p: Plane, plane_rows: usize, x: usize, y: usize| -> Option<RawPlane> {
+                            let (rs, ps) = (p.row_stride as usize, p.pixel_stride as usize);
+                            let offset = y * rs + x * ps;
+                            let total = rs * plane_rows;
+                            (offset < total).then(|| RawPlane {
+                                ptr: (p.data as *mut u8).add(offset),
+                                len: total - offset,
+                                row_stride: rs,
+                                pixel_stride: ps,
+                            })
+                        };
+                    match (
+                        mk(planes.planes[0], rows, left, top),
+                        mk(planes.planes[1], rows / 2, left / 2, top / 2),
+                        mk(planes.planes[2], rows / 2, left / 2, top / 2),
+                    ) {
+                        (Some(y), Some(u), Some(v)) => Ok((y, u, v)),
+                        _ => Err(CoreError::BadArgument),
+                    }
+                };
+                let code = match result {
+                    Err(error) => error.code() as i64,
+                    Ok((y, u, v)) => call(handle, |s| {
+                        let geo = s.pipeline.geometry();
+                        let meta = s.pipeline.push_with(|dst| {
+                            // SAFETY: düzlemler kilitli donanım tamponundadır ve kilit açılana dek geçerlidir.
+                            pack_nv12(geo, y, u, v, dst)?;
+                            Ok(Some((pts_us, flags as u32)))
+                        })?;
+                        meta.map(|m| m.seq as i64).ok_or(CoreError::Internal)
+                    }),
+                };
+                AHardwareBuffer_unlock(ahb, std::ptr::null_mut());
+                code
+            }
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            let _ = (env, handle, buffer, crop_left, crop_top, pts_us, flags);
+            CoreError::BadState.code() as i64
+        }
+    }
+
     /// `external fun nativePushNv12(handle: Long, frame: ByteBuffer, ptsUs: Long, flags: Int): Long`
     ///
     /// # Safety

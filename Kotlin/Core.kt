@@ -113,6 +113,12 @@ object Core {
     ): Long
 
     @JvmStatic external fun nativePushNv12(handle: Long, frame: ByteBuffer, ptsUs: Long, flags: Int): Long
+
+    /**
+     * ImageReader görüntüsünün donanım tamponunu `Image.getPlanes()` çağırmadan iter (AHardwareBuffer_lockPlanes).
+     * Tampon CPU'ya açılamıyorsa çökmeden -14 (desteklenmiyor) döner.
+     */
+    @JvmStatic external fun nativePushHardwareBuffer(handle: Long, buffer: HardwareBuffer, cropLeft: Int, cropTop: Int, ptsUs: Long, flags: Int): Long
     @JvmStatic external fun nativeFinish(handle: Long): Int
     @JvmStatic external fun nativeSetHint(handle: Long, seq: Long, hint: Int): Int
     @JvmStatic external fun nativeReadWindowFrame(handle: Long, pos: Int, dst: ByteBuffer): Int
@@ -197,8 +203,11 @@ class CoreException(val code: Int, where: String) : RuntimeException("$where: ${
             -11 -> "akış sonlandı"
             -12 -> "geçersiz tutamak"
             -13 -> "çekirdekte iç hata"
+            -14 -> "bu cihazda desteklenmiyor"
             else -> "bilinmeyen hata"
         }
+
+        const val UNSUPPORTED = -14
     }
 }
 
@@ -339,6 +348,17 @@ class CleanerSession(val width: Int, val height: Int) : AutoCloseable {
             ptsUs, 0,
         )
         if (seq < 0) throw CoreException(seq.toInt(), "push")
+        return seq
+    }
+
+    /**
+     * Donanım tamponundan iter. Bazı cihazlarda (ör. Galaxy Z Flip8) Surface çıkışı CPU'ya açılamaz ve
+     * `Image.getPlanes()` süreci JNI abort ile öldürür; bu yol düzlemleri yerelde kilitler. Tampon kilitlenemezse
+     * [CoreException] kodu [CoreException.UNSUPPORTED] olur ve çağıran bayt tamponu yoluna düşer.
+     */
+    fun pushHardwareBuffer(buffer: HardwareBuffer, cropLeft: Int, cropTop: Int, ptsUs: Long): Long {
+        val seq = Core.nativePushHardwareBuffer(handle, buffer, cropLeft, cropTop, ptsUs, 0)
+        if (seq < 0) throw CoreException(seq.toInt(), "pushHardwareBuffer")
         return seq
     }
 
@@ -1716,7 +1736,22 @@ class VideoJob(
                 }
                 // Çekirdek kesin artan zaman damgası ister; bozuk akışlarda en az 1 µs ilerlet.
                 val pts = if (lastPtsIn == Long.MIN_VALUE) ptsUs else max(ptsUs, lastPtsIn + 1)
-                active.push(image, pts)
+                if (surfaceReader != null) {
+                    // Surface görüntüsünde Image.getPlanes() ÇAĞRILMAZ: bazı cihazlarda (Galaxy Z Flip8) süreci öldürür.
+                    val hb = image.hardwareBuffer ?: throw HardwarePathFailedException("görüntünün donanım tamponu yok")
+                    try {
+                        active.pushHardwareBuffer(hb, crop.left, crop.top, pts)
+                    } catch (e: CoreException) {
+                        if (e.code == CoreException.UNSUPPORTED && framesDecoded == 0L) {
+                            throw HardwarePathFailedException("donanım tamponu CPU'ya açılamıyor", e)
+                        }
+                        throw e
+                    } finally {
+                        hb.close()
+                    }
+                } else {
+                    active.push(image, pts)
+                }
                 lastPtsIn = pts
                 framesDecoded++
             }
