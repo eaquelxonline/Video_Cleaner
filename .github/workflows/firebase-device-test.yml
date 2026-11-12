@@ -121,11 +121,18 @@ jobs:
           # Eğitilmemiş (sabit tohumlu) üç model ONNX'e aktarılır ve test APK'sına konur; telefonda
           # InferenceSkeletonTest operatör uyumluluğunu, süreyi ve belleği ölçer (bench=true).
           python -m pip install --quiet torch==2.15.0 --index-url https://download.pytorch.org/whl/cpu
-          python -m pip install --quiet onnx onnxscript onnxruntime numpy sympy packaging
+          python -m pip install --quiet onnx onnxscript onnxruntime numpy sympy packaging imageio-ffmpeg
           # Hibrit grafikler: kare başına kodlayıcı/çözücü + 30 karelik zamansal çekirdek; FP32 ve FP16.
           python Models/Export.py --out AndroidTest/assets/onnx
+          # Statik QDQ INT8 (simetrik, kanal başına; kalibrasyon: calib/c01–c08). Bellek için grafik başına
+          # ayrı süreç; çekirdekler küçük kopyada kalibre edilip aralık önbelleğiyle nicemlenir.
+          for g in det_enc det_core det_dec flow_enc flow_pair mamba_enc mamba_core mamba_dec; do
+            case $g in *core) lim=2; clips=c01,c05;; *) lim=32; clips=c01,c02,c03,c04,c05,c06,c07,c08;; esac
+            python Models/Quantize.py --onnx AndroidTest/assets/onnx --only $g --clips $clips --limit $lim || echo "::warning::$g INT8 üretilemedi"
+          done
+          rm -f AndroidTest/assets/onnx/*_ranges.json AndroidTest/assets/onnx/quantize_report.json
           ls -la AndroidTest/assets/onnx
-          { echo "## Dışa aktarılan hibrit grafikler"; echo '```'; python -c "import json;[print(d['name'],'düğüm',d['nodes'],'fp32',d['fp32_mb'],'MB fp16',d['fp16_mb'],'MB') for d in json.load(open('AndroidTest/assets/onnx/export_report.json'))]"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          { echo "## Dışa aktarılan hibrit grafikler"; echo '```'; python -c "import json;[print(d['name'],'düğüm',d['nodes'],'fp32',d['fp32_mb'],'MB fp16',d['fp16_mb'],'MB') for d in json.load(open('AndroidTest/assets/onnx/export_report.json'))]"; ls -la AndroidTest/assets/onnx/*_int8.onnx; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Build APKs
         if: steps.creds.outputs.skip == 'false' && inputs.reuse_results == ''

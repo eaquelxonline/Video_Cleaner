@@ -134,20 +134,32 @@ class InferenceSkeletonTest {
             "VCBENCH device=\"${Build.MANUFACTURER} ${Build.MODEL}\" soc=\"${if (Build.VERSION.SDK_INT >= 31) Build.SOC_MODEL else "-"}\" api=${Build.VERSION.SDK_INT} " +
                 "cores=${Runtime.getRuntime().availableProcessors()} files=${available.count { it.endsWith(".onnx") }}",
         )
-        for (variant in listOf("fp32", "fp16")) {
-            for (ep in listOf("xnnpack", "cpu", "nnapi")) {
-                if (SystemClock.elapsedRealtime() - started > budgetMs) {
-                    Log.i(TAG, "VCBENCH variant=$variant ep=$ep status=SKIPPED reason=\"süre bütçesi doldu\"")
-                    continue
-                }
-                runPipeline(env, variant, ep)
-                System.gc()
+        // Önem sırası (süre bütçesi biterse en değerliler ölçülmüş olur). "noarena": ORT CPU bellek arenası
+        // kapalı — 8 oturumun her biri ayrı arena büyütür ve tepe belleği işletim sistemine geri vermez.
+        // NNAPI Android 15'te kullanımdan kaldırıldı; yalnızca karşılaştırma için sona konur.
+        val plan = listOf(
+            Triple("fp16", "xnnpack", true), Triple("int8", "xnnpack", true), Triple("fp32", "xnnpack", true),
+            Triple("fp32", "xnnpack", false), Triple("int8", "cpu", true), Triple("fp32", "cpu", true),
+            Triple("fp16", "cpu", true), Triple("fp32", "nnapi", true),
+        )
+        for ((variant, ep, arena) in plan) {
+            val label = if (arena) ep else "$ep-noarena"
+            if (available.none { it.endsWith("_$variant.onnx") }) {
+                Log.i(TAG, "VCBENCH variant=$variant ep=$label status=SKIPPED reason=\"$variant grafikleri yok\"")
+                continue
             }
+            if (SystemClock.elapsedRealtime() - started > budgetMs) {
+                Log.i(TAG, "VCBENCH variant=$variant ep=$label status=SKIPPED reason=\"süre bütçesi doldu\"")
+                continue
+            }
+            runPipeline(env, variant, ep, arena)
+            System.gc()
         }
         Log.i(TAG, "VCBENCH status=DONE total_s=${(SystemClock.elapsedRealtime() - started) / 1000} thermal=${thermal()}")
     }
 
-    private fun runPipeline(env: OrtEnvironment, variant: String, ep: String) {
+    private fun runPipeline(env: OrtEnvironment, variant: String, ep: String, arena: Boolean) {
+        val label = if (arena) ep else "$ep-noarena"
         val graphs = listOf("det_enc", "det_core", "det_dec", "flow_enc", "flow_pair", "mamba_enc", "mamba_core", "mamba_dec")
         val peak = AtomicLong(rssMb())
         val sampling = AtomicBoolean(true)
@@ -174,6 +186,10 @@ class InferenceSkeletonTest {
                 val options = OrtSession.SessionOptions()
                 options.setIntraOpNumThreads(4)
                 options.setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
+                if (!arena) {
+                    options.setCPUArenaAllocator(false)
+                    options.setMemoryPatternOptimization(false)
+                }
                 when (ep) {
                     "xnnpack" -> options.addXnnpack(mapOf("intra_op_num_threads" to "4"))
                     "nnapi" -> {
@@ -226,14 +242,14 @@ class InferenceSkeletonTest {
             val frameMs = per.values.sum()
             Log.i(
                 TAG,
-                "VCBENCH variant=$variant ep=$ep status=OK load_ms=$loadMs frame_ms=${"%.1f".format(frameMs)} " +
+                "VCBENCH variant=$variant ep=$label status=OK load_ms=$loadMs frame_ms=${"%.1f".format(frameMs)} " +
                     per.entries.joinToString(" ") { (g, v) -> "$g=${"%.1f".format(v)}" } +
                     " window_ms=${"%.0f".format(p.ms.values.sum())} rss_before_mb=$rssBefore peak_rss_mb=${peak.get()} thermal=$thermalBefore->${thermal()}",
             )
         } catch (e: Throwable) {
             Log.i(
                 TAG,
-                "VCBENCH variant=$variant ep=$ep status=FAIL stage=\"$stage\" error=\"${e.javaClass.simpleName}: ${e.message?.take(300)?.replace('"', '\'')}\" " +
+                "VCBENCH variant=$variant ep=$label status=FAIL stage=\"$stage\" error=\"${e.javaClass.simpleName}: ${e.message?.take(300)?.replace('"', '\'')}\" " +
                     "peak_rss_mb=${peak.get()}",
             )
         } finally {
