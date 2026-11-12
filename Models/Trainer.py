@@ -47,7 +47,9 @@ import json
 import math
 import os
 import random
+import shutil
 import struct
+import subprocess
 import sys
 import time
 import zlib
@@ -92,6 +94,10 @@ class LossWeights:
     nll: float = 0.1                     # belirsizlik (Laplace NLL) katkısı
     flow: float = 1.0                    # ortak eğitimde akış kaybı
     detector: float = 1.0                # ortak eğitimde algılama kaybı
+    # Zamansal PatchGAN (yalnızca eğitim; telefonda 0 ms): L1 + DWT + algısal kayıpla eğitilen 20–40M
+    # parametreli onarıcılar kalın yazının altında "plastik" (fazla pürüzsüz) doku üretir. Ayrıştırıcı
+    # onarılan bölgeyi gerçek dokudan ayırt etmeye çalışır; onarıcı onu kandıracak dokuyu öğrenir.
+    adversarial: float = 0.01
 
 
 @dataclass
@@ -128,6 +134,8 @@ class TrainConfig:
     val_every: int = 2000
     val_clips: int = 8
     tiny: bool = False                   # küçük modeller (yalnızca duman testi)
+    gan_start: int = 20_000              # ayrıştırıcı kaybının devreye girdiği adım (önce yapı oturur)
+    gan_lr: float = 1e-4
     weights: LossWeights = field(default_factory=LossWeights)
 
 
@@ -246,6 +254,103 @@ def affine_inverse(points: torch.Tensor, center: torch.Tensor, scale: float, the
     x = cos * d[0] + sin * d[1] + origin[0]
     y = -sin * d[0] + cos * d[1] + origin[1]
     return torch.stack([x, y])
+
+
+# ---- gerçekçi sıkıştırma bozulması ---------------------------------------------------------------
+# Gerçek videolarda gömülü altyazının kenarında YUV420 renk alt örneklemesi (renk kanaması) ve H.264/HEVC
+# DCT blok halkaları (sivrisinek gürültüsü) vardır. Keskin metni temiz kareye basıp öyle eğitilen model,
+# gerçek MP4'te harf kenarındaki bu izleri "yazının parçası değil" sanıp bırakır. Girdi bu yüzden aynı
+# zincirden geçirilir; hedef (GT) sıkıştırılmamış temiz karedir.
+
+def _ffmpeg() -> Optional[str]:
+    try:
+        import imageio_ffmpeg  # type: ignore
+
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return shutil.which("ffmpeg")
+
+
+FFMPEG = _ffmpeg()
+
+
+def yuv420_roundtrip(frames: torch.Tensor, matrix: str = "bt601") -> torch.Tensor:
+    """[T, 3, H, W] 0..1 RGB → Y′CbCr (sınırlı aralık, 8 bit) → renk 2× alt örnekleme → RGB."""
+    kr, kb = (0.299, 0.114) if matrix == "bt601" else (0.2126, 0.0722)
+    r, g, b = frames.unbind(1)
+    y = kr * r + (1 - kr - kb) * g + kb * b
+    cb = (b - y) / (2 * (1 - kb))
+    cr = (r - y) / (2 * (1 - kr))
+    q = lambda v, lo, span: torch.round(v * span + lo) / 255.0          # 8 bit sınırlı aralık nicemleme
+    y = (q(y, 16, 219) * 255 - 16) / 219
+    c = torch.stack([cb, cr], 1)
+    t, _, h, w = frames.shape
+    c = F.avg_pool2d(F.pad(c, (0, w % 2, 0, h % 2), mode="replicate"), 2)
+    c = (torch.round(c * 224 + 128) - 128) / 224
+    c = F.interpolate(c, scale_factor=2.0, mode="bilinear", align_corners=False)[..., :h, :w]
+    cb, cr = c.unbind(1)
+    r = y + 2 * (1 - kr) * cr
+    b = y + 2 * (1 - kb) * cb
+    g = (y - kr * r - kb * b) / (1 - kr - kb)
+    return torch.stack([r, g, b], 1).clamp(0, 1)
+
+
+def codec_roundtrip(frames: torch.Tensor, codec: str, crf: int) -> Optional[torch.Tensor]:
+    """Gerçek kodlayıcıdan geçirme (ffmpeg; libx264 / libx265, yuv420p). ffmpeg yoksa veya hata olursa None."""
+    if FFMPEG is None:
+        return None
+    t, _, h, w = frames.shape
+    ph, pw = h + h % 2, w + w % 2
+    raw = (frames.permute(0, 2, 3, 1).numpy() * 255.0 + 0.5).clip(0, 255).astype(np.uint8)
+    if (ph, pw) != (h, w):
+        raw = np.pad(raw, ((0, 0), (0, ph - h), (0, pw - w), (0, 0)), mode="edge")
+    lib, fmt, extra = ("libx265", "hevc", ["-x265-params", "log-level=none:pools=1"]) if codec == "hevc" else ("libx264", "h264", ["-threads", "1"])
+    try:
+        enc = subprocess.run(
+            [FFMPEG, "-v", "error", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{pw}x{ph}", "-r", "30", "-i", "-",
+             "-c:v", lib, "-preset", "veryfast", "-crf", str(crf), "-pix_fmt", "yuv420p", *extra, "-f", fmt, "-"],
+            input=raw.tobytes(), capture_output=True, timeout=60, check=True,
+        ).stdout
+        dec = subprocess.run(
+            [FFMPEG, "-v", "error", "-f", fmt, "-i", "-", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
+            input=enc, capture_output=True, timeout=60, check=True,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    out = np.frombuffer(dec, np.uint8)
+    if out.size != t * ph * pw * 3:
+        return None
+    out = torch.from_numpy(out.reshape(t, ph, pw, 3)[:, :h, :w].copy()).permute(0, 3, 1, 2).float() / 255.0
+    return out
+
+
+def jpeg_roundtrip(frames: torch.Tensor, quality: int) -> torch.Tensor:
+    out = []
+    for f in frames:
+        buffer = io.BytesIO()
+        Image.fromarray((f.permute(1, 2, 0).numpy() * 255.0 + 0.5).astype(np.uint8)).save(buffer, "JPEG", quality=quality)
+        out.append(torch.from_numpy(np.asarray(Image.open(io.BytesIO(buffer.getvalue())).convert("RGB")).copy()).permute(2, 0, 1).float() / 255.0)
+    return torch.stack(out)
+
+
+DEGRADATIONS = ["yok", "yuv420", "yuv420+jpeg", "h264", "hevc"]
+
+
+def degrade(frames: torch.Tensor, rng: random.Random) -> Tuple[torch.Tensor, str]:
+    """Kaplama basılmış kareleri gerçekçi sıkıştırma zincirinden geçirir. Dönen: (girdi, kullanılan yol)."""
+    pick = rng.random()
+    if pick < 0.45:
+        codec = "hevc" if rng.random() < 0.25 else "h264"
+        out = codec_roundtrip(frames, codec, rng.randint(20, 38))
+        if out is not None:
+            return out, codec
+        pick = 0.5                                           # ffmpeg yok: JPEG yoluna düş
+    matrix = "bt709" if rng.random() < 0.5 else "bt601"
+    if pick < 0.75:
+        return jpeg_roundtrip(yuv420_roundtrip(frames, matrix), rng.randint(35, 95)), "yuv420+jpeg"
+    if pick < 0.92:
+        return yuv420_roundtrip(frames, matrix), "yuv420"
+    return frames, "yok"
 
 
 class ClipSynthesizer:
@@ -374,7 +479,8 @@ class ClipSynthesizer:
         """Bir altyazı/filigran durumunu çizer: yazı gövdesi + kontur, gölge/parıltı/kutu katmanı."""
         rng = self.rng
         text = random_text(rng, self.lines)
-        watermark = rng.random() < 0.15
+        # %30 yarı saydam logo/filigran (köşe, %20–60 opaklık), %70 opak altyazı (kontur, gölge, kutu)
+        watermark = rng.random() < 0.30
         size = rng.randint(max(8, h // 22), max(10, h // 7)) if not watermark else rng.randint(max(8, h // 26), max(10, h // 10))
         font = load_font(self.fonts, size, rng)
         stroke = rng.choice([0, 0, 1, 2, 3]) if size >= 14 else rng.choice([0, 1])
@@ -430,9 +536,20 @@ class ClipSynthesizer:
             box = Image.new("L", (w, h), 0)
             ImageDraw.Draw(box).rectangle((x - pad, y - pad, x + tw + pad, y + th + pad), fill=255)
             under = to_tensor(box) * rng.uniform(0.3, 0.8)
-        opacity = rng.uniform(0.35, 1.0) if rng.random() < 0.35 or watermark else 1.0
-        if watermark:
-            opacity = rng.uniform(0.2, 0.6)
+        opacity = rng.uniform(0.2, 0.6) if watermark else 1.0
+        if watermark and rng.random() < 0.5:
+            # Logo: yazının yanında/arkasında basit şekil (daire veya yuvarlatılmış kutu), aynı opaklıkla.
+            shape = Image.new("L", (w, h), 0)
+            pad = max(2, size // 4)
+            box = (x - pad, y - pad, x + tw + pad, y + th + pad)
+            if rng.random() < 0.5:
+                ImageDraw.Draw(shape).rounded_rectangle(box, radius=pad, outline=255, width=max(1, size // 10))
+            else:
+                r = max(4, size // 2)
+                cx, cy = x - r - pad, y + th / 2
+                ImageDraw.Draw(shape).ellipse((cx - r, cy - r, cx + r, cy + r), fill=255)
+            full = torch.maximum(full, to_tensor(shape))
+            color = torch.where(full > body, color.new_ones(1) * color.mean(dim=(1, 2), keepdim=True), color)
         return {"alpha_o": full * opacity, "color_o": color, "alpha_s": under * opacity, "color_s": under_color}
 
     def add_overlay(self, sample: Batch) -> Batch:
@@ -470,15 +587,8 @@ class ClipSynthesizer:
         space = "linear" if rng.random() < 0.3 else "gamma"
         comp = composite(clean, fg, alpha, space)
 
-        frames = comp
-        if rng.random() < 0.8:           # sıkıştırma izleri (kodek yerine JPEG yaklaşımı)
-            quality = rng.randint(35, 95)
-            degraded = []
-            for i in range(t):
-                buffer = io.BytesIO()
-                Image.fromarray((comp[i].permute(1, 2, 0).numpy() * 255.0 + 0.5).astype(np.uint8)).save(buffer, "JPEG", quality=quality)
-                degraded.append(torch.from_numpy(np.asarray(Image.open(io.BytesIO(buffer.getvalue())).convert("RGB")).copy()).permute(2, 0, 1).float() / 255.0)
-            frames = torch.stack(degraded)
+        # Gerçekçi bozulma: YUV420 renk alt örnekleme + gerçek H.264/HEVC veya JPEG (bkz. degrade).
+        frames, path = degrade(comp, rng)
 
         overlay = alpha_o > 0.02
         sample.update(
@@ -489,6 +599,7 @@ class ClipSynthesizer:
             alpha=alpha,
             fg_rgb=fg.clamp(0, 1),
             linear_blend=torch.tensor(space == "linear"),
+            degradation=torch.tensor(DEGRADATIONS.index(path)),
             valid=torch.ones(t, dtype=torch.bool),
         )
         return sample
@@ -630,6 +741,61 @@ def temporal_validity(
     return keep, e_true
 
 
+class TemporalPatchGAN(nn.Module):
+    """Zamansal PatchGAN ayrıştırıcı: [B, T, 3+1, H, W] (görüntü + onarım maskesi) → yama başına gerçeklik logiti.
+
+    3B evrişimler (zamanda 3, uzayda 4×4 adım-2) titreşen/plastik dokuyu kareler arası tutarlılıkla birlikte
+    yakalar. Spektral normalizasyon eğitimi kararlı tutar. Telefona gitmez.
+    """
+
+    def __init__(self, width: int = 64, depth: int = 4):
+        super().__init__()
+        sn = nn.utils.spectral_norm
+        layers: List[nn.Module] = []
+        cin = 4
+        for i in range(depth):
+            cout = width * 2 ** min(i, 3)
+            layers += [sn(nn.Conv3d(cin, cout, (3, 4, 4), stride=(1, 2, 2), padding=(1, 1, 1))), nn.LeakyReLU(0.2, inplace=True)]
+            cin = cout
+        layers.append(sn(nn.Conv3d(cin, 1, (3, 3, 3), padding=1)))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, frames: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        x = torch.cat([frames * 2.0 - 1.0, mask.to(frames.dtype)], dim=2)          # [B, T, 4, H, W]
+        return self.net(x.transpose(1, 2))                                        # [B, 1, T, h, w]
+
+
+class Adversarial:
+    """Onarıcı (üreteç) kaybı ve ayrıştırıcı adımı; hinge kaybı. ``active`` değilken hiçbir şey yapmaz."""
+
+    def __init__(self, disc: TemporalPatchGAN, optimizer: torch.optim.Optimizer, weight: float):
+        self.disc, self.optimizer, self.weight = disc, optimizer, weight
+        self.active = False
+        self._pair: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None
+
+    def generator_loss(self, fake: torch.Tensor, real: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        if not self.active or self.weight <= 0:
+            return fake.new_zeros(())
+        self._pair = (fake.detach(), real.detach(), mask.detach())
+        self.disc.requires_grad_(False)
+        loss = -self.disc(fake, mask).float().mean()
+        self.disc.requires_grad_(True)
+        return loss
+
+    def discriminator_step(self) -> Dict[str, float]:
+        if not self.active or self._pair is None:
+            return {}
+        fake, real, mask = self._pair
+        self._pair = None
+        d_real = self.disc(real, mask).float()
+        d_fake = self.disc(fake, mask).float()
+        loss = F.relu(1.0 - d_real).mean() + F.relu(1.0 + d_fake).mean()
+        self.optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        self.optimizer.step()
+        return {"gan/d": loss.item(), "gan/real": d_real.mean().item(), "gan/fake": d_fake.mean().item()}
+
+
 class VGGPerceptual(nn.Module):
     """İsteğe bağlı algısal kayıp (torchvision VGG16 özellikleri; ağırlık dosyası kullanıcıdan)."""
 
@@ -742,7 +908,8 @@ def flow_loss(flows: Batch, batch: Batch, gamma: float = 0.85) -> Tuple[torch.Te
 
 
 def restoration_loss(
-    out: Batch, batch: Batch, flow_fw: Optional[torch.Tensor], w: LossWeights, perceptual: Optional[VGGPerceptual]
+    out: Batch, batch: Batch, flow_fw: Optional[torch.Tensor], w: LossWeights, perceptual: Optional[VGGPerceptual],
+    adv: Optional["Adversarial"] = None,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """Mamba için λ₁..λ₅ (λ₆, λ₇ detector_loss içindedir)."""
     index = out["index"]
@@ -782,15 +949,20 @@ def restoration_loss(
         m = F.max_pool2d(m.flatten(0, 1), 2).view(*m.shape[:3], m.shape[3] // 2, m.shape[4] // 2)
         l_edge = l_edge + masked_mean((da - db).abs(), m)
 
+    l_adv = raw.new_zeros(())                                                                # PatchGAN
+    if adv is not None and adv.active:
+        fake = mask * raw.clamp(0, 1) + (1 - mask) * clean
+        l_adv = adv.generator_loss(fake, clean, mask)
+
     total = (
         w.mask_reconstruction * l_rec + w.nll * l_nll + w.preservation * l_keep
-        + w.temporal_warp * l_temp + w.perceptual * l_perc + w.edge_frequency * l_edge
+        + w.temporal_warp * l_temp + w.perceptual * l_perc + w.edge_frequency * l_edge + w.adversarial * l_adv
     )
     with torch.no_grad():
         mse = masked_mean((raw.clamp(0, 1) - clean) ** 2, mask).clamp_min(1e-10)
     return total, {
         "rec/mask": l_rec.item(), "rec/nll": l_nll.item(), "rec/keep": l_keep.item(), "rec/temporal": l_temp.item(),
-        "rec/perceptual": l_perc.item(), "rec/edge": l_edge.item(), "rec/psnr_mask": (10 * torch.log10(1 / mse)).item(),
+        "rec/perceptual": l_perc.item(), "rec/edge": l_edge.item(), "rec/adv": l_adv.item(), "rec/psnr_mask": (10 * torch.log10(1 / mse)).item(),
     }
 
 
@@ -815,7 +987,8 @@ def ground_truth_override(batch: Batch, rng: random.Random, with_flow: bool) -> 
 
 
 def stage_step(
-    engine: VideoCleaner, batch: Batch, cfg: TrainConfig, rng: random.Random, perceptual: Optional[VGGPerceptual]
+    engine: VideoCleaner, batch: Batch, cfg: TrainConfig, rng: random.Random, perceptual: Optional[VGGPerceptual],
+    adv: Optional[Adversarial] = None,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """Bir mikro-yığın için kayıp. Hangi modelin eğitildiği ``cfg.stage`` ile belirlenir."""
     frames, valid, w = batch["frames"], batch["valid"], cfg.weights
@@ -835,7 +1008,7 @@ def stage_step(
                 flows = engine.flow(frames, override["mask_soft"], valid)
             override["flow_fw"], override["flow_bw"] = flows["flow_fw"], flows["flow_bw"]
         out = engine(frames, valid, mode=mode, override=override, detach_priors=True)
-        return restoration_loss(out, batch, override["flow_fw"] if mode == "B" else None, w, perceptual)
+        return restoration_loss(out, batch, override["flow_fw"] if mode == "B" else None, w, perceptual, adv)
 
     if cfg.stage == "joint":
         out = engine(frames, valid, mode=mode, detach_priors=False)
@@ -845,7 +1018,7 @@ def stage_step(
         target_mask = (batch["overlay"] | batch["shadow"])[:, out["index"]]
         scored = dict(out)
         scored["mask"] = target_mask | out["mask"]
-        l_rec, s_rec = restoration_loss(scored, batch, out["flows"]["flow_fw"].detach() if mode == "B" else None, w, perceptual)
+        l_rec, s_rec = restoration_loss(scored, batch, out["flows"]["flow_fw"].detach() if mode == "B" else None, w, perceptual, adv)
         return l_rec + w.detector * l_det + w.flow * l_flow, {**s_det, **s_flow, **s_rec}
     raise ValueError(f"bilinmeyen aşama: {cfg.stage}")
 
@@ -1141,6 +1314,10 @@ def train(cfg: TrainConfig, device: torch.device, benchmark_steps: int = 0) -> D
             module.eval()
     perceptual = VGGPerceptual(cfg.vgg_weights).to(device) if cfg.vgg_weights else None
     runner = torch.compile(engine) if cfg.compile else engine
+    adv = None
+    if cfg.stage in ("mamba", "joint") and cfg.weights.adversarial > 0:
+        disc = TemporalPatchGAN(width=16 if cfg.tiny else 64).to(device)
+        adv = Adversarial(disc, torch.optim.Adam(disc.parameters(), lr=cfg.gan_lr, betas=(0.0, 0.9)), cfg.weights.adversarial)
 
     if device.type == "cuda":
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -1169,13 +1346,15 @@ def train(cfg: TrainConfig, device: torch.device, benchmark_steps: int = 0) -> D
             group["lr"] = lr
         t_data = t_fwd = t_bwd = 0.0
         t_step = time.perf_counter()
+        if adv is not None:
+            adv.active = step >= cfg.gan_start
         for _ in range(cfg.accum):
             t0 = time.perf_counter()
             batch = truncate_window(to_device(next(loader), device), rng, cfg.truncate_prob)
             sync(device)
             t1 = time.perf_counter()
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=amp):
-                loss, stats = stage_step(runner, batch, cfg, rng, perceptual)
+                loss, stats = stage_step(runner, batch, cfg, rng, perceptual, adv)
             sync(device)
             t2 = time.perf_counter()
             if not torch.isfinite(loss):
@@ -1189,6 +1368,9 @@ def train(cfg: TrainConfig, device: torch.device, benchmark_steps: int = 0) -> D
         grad_norm = torch.nn.utils.clip_grad_norm_(params, cfg.grad_clip)
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
+        if adv is not None and adv.active:
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=amp):
+                last_stats.update(adv.discriminator_step())
         update_ema(ema, engine, min(cfg.ema_decay, (1 + step) / (10 + step)))
         sync(device)
         t5 = time.perf_counter()
@@ -1404,6 +1586,14 @@ def selftest(device: torch.device) -> None:
     cfg = TrainConfig(tiny=True, crop=(64, 96), workers=0, accum=1, checkpointing=False, val_every=0, warmup=2)
     sample = ClipSynthesizer(cfg, 7).sample()
     batch = to_device({k: v.unsqueeze(0) for k, v in sample.items()}, device)
+    # Gerçekçi bozulma zinciri: YUV420 gidiş-dönüşü düzgün görüntüde kayıpsıza yakın (renk kayması yok);
+    # ffmpeg varsa H.264 gerçekten kodlanıp çözülür.
+    grad = torch.linspace(0, 1, 96).view(1, 1, 1, 96).expand(2, 3, 64, 96).clone()
+    grad[:, 0] *= 0.5
+    yuv_psnr = 10 * math.log10(1.0 / max(float(((yuv420_roundtrip(grad) - grad) ** 2).mean()), 1e-12))
+    h264 = codec_roundtrip(grad, "h264", 30) if FFMPEG else None
+    check("bozulma: YUV420 (+ H.264)", yuv_psnr > 45 and (FFMPEG is None or (h264 is not None and h264.shape == grad.shape)),
+          f"YUV420 PSNR {yuv_psnr:.1f} dB, ffmpeg {'var' if FFMPEG else 'yok (JPEG yedeği)'}")
     check("veri sözleşmesi", batch["frames"].shape == (1, WINDOW, 3, 64, 96) and batch["flow_fw"].shape == (1, WINDOW - 1, 2, 64, 96))
     space = "linear" if bool(sample["linear_blend"]) else "gamma"
     recon = composite(sample["clean"], sample["fg_rgb"], sample["alpha"], space)
@@ -1470,9 +1660,26 @@ def selftest(device: torch.device) -> None:
     check("VC-Tester: tüm kapılar ölçülüp sağlanınca GEÇTİ", tester_audit({**good, "restoration_lpips": 0.02, "restoration_ter": 0.001})["overall"] == "GEÇTİ")
     check("VC-Tester: koruma ihlali KALDI", tester_audit({**good, "preservation_max": 1 / 255})["axes"]["preservation"]["status"] == "KALDI")
 
+    # Zamansal PatchGAN: hinge kaybı, üreteç ve ayrıştırıcı adımları sonlu; ayrıştırıcı gerçek ile sahteyi ayırmaya başlar
+    disc = TemporalPatchGAN(width=8, depth=2).to(device)
+    gan = Adversarial(disc, torch.optim.Adam(disc.parameters(), lr=1e-3, betas=(0.0, 0.9)), 0.01)
+    gan.active = True
+    real = torch.rand(1, 6, 3, 32, 32, device=device)
+    fake = (real * 0.0 + 0.5).requires_grad_(True)
+    hole = torch.ones(1, 6, 1, 32, 32, device=device)
+    g_loss = gan.generator_loss(fake, real, hole)
+    g_loss.backward()
+    first = gan.discriminator_step()
+    for _ in range(20):
+        gan.generator_loss(fake.detach(), real, hole)
+        last = gan.discriminator_step()
+    check("PatchGAN: üreteç gradyanı ve ayrıştırıcı öğrenmesi", fake.grad is not None and math.isfinite(g_loss.item()) and last["gan/d"] < first["gan/d"],
+          f"D kaybı {first['gan/d']:.3f} → {last['gan/d']:.3f}")
+
     for stage in ("detector", "flow", "mamba", "joint"):
         stage_cfg = copy.deepcopy(cfg)
         stage_cfg.stage, stage_cfg.steps = stage, 8
+        stage_cfg.gan_start = 2                     # PatchGAN yolu da sınansın (adım 2'den itibaren)
         report = train(stage_cfg, device, benchmark_steps=4)
         check(f"eğitim adımı: {stage}", math.isfinite(report["final_loss"]), f"kayıp {report['final_loss']:.4f}, adım {report['step_s']:.2f} s")
     metrics = evaluate(VideoCleaner(tiny_engine_config()).to(device), cfg, device, clips=2)
