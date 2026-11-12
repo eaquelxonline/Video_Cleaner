@@ -109,6 +109,23 @@ jobs:
           yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-37.0" "build-tools;37.0.0" "ndk;30.0.16248370"
 
+      - name: Set up Python
+        if: steps.creds.outputs.skip == 'false' && inputs.reuse_results == ''
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Export untrained models (inference skeleton)
+        if: steps.creds.outputs.skip == 'false' && inputs.reuse_results == ''
+        run: |
+          # Eğitilmemiş (sabit tohumlu) üç model ONNX'e aktarılır ve test APK'sına konur; telefonda
+          # InferenceSkeletonTest operatör uyumluluğunu, süreyi ve belleği ölçer (bench=true).
+          python -m pip install --quiet torch==2.15.0 --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install --quiet onnx onnxscript onnxruntime numpy
+          python Models/Export.py --out AndroidTest/assets/onnx --no-measure --chunk 5
+          ls -la AndroidTest/assets/onnx
+          { echo "## Dışa aktarılan modeller"; echo '```'; cat AndroidTest/assets/onnx/export_report.json | python -c "import json,sys;[print(d['name'],d['params'],'fp32',d['fp32_mb'],'MB int8',d['int8_mb'],'MB düğüm',d['nodes']) for d in json.load(sys.stdin)]"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Build APKs
         if: steps.creds.outputs.skip == 'false' && inputs.reuse_results == ''
         run: |
@@ -152,7 +169,7 @@ jobs:
             --type instrumentation \
             --app "$APP_APK" --test "$TEST_APK" \
             $(cat devices.txt) \
-            --environment-variables calibrate=true,calibrateCandidates=policy_std+policy_high+policy_std_hevc \
+            --environment-variables calibrate=true,calibrateCandidates=policy_std+policy_high+policy_std_hevc,bench=true \
             --directories-to-pull /sdcard/Movies \
             --results-dir "video-cleaner/${{ github.run_id }}-${{ github.run_attempt }}" \
             --timeout 45m --no-record-video --no-performance-metrics 2>&1 | tee ftl.log

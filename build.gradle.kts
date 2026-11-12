@@ -66,6 +66,11 @@ android {
         targetCompatibility = JavaVersion.VERSION_21
     }
 
+    androidResources {
+        // ONNX modelleri (yüzlerce MB) sıkıştırılmadan paketlenir: hem derleme hem kopyalama hızlı.
+        noCompress += "onnx"
+    }
+
     packaging {
         jniLibs {
             // .so dosyaları APK içinde sıkıştırılmadan, sayfa hizalı durur ve doğrudan
@@ -98,6 +103,8 @@ dependencies {
     androidTestImplementation("androidx.test:runner:1.7.0")
     androidTestImplementation("androidx.test:core:1.7.0")
     androidTestImplementation("androidx.test.ext:junit:1.3.0")
+    // Çıkarım iskelet testi (InferenceSkeletonTest): eğitilmemiş modeller telefonda ONNX Runtime ile ölçülür.
+    androidTestImplementation("com.microsoft.onnxruntime:onnxruntime-android:1.30.0")
 }
 
 // -----------------------------------------------------------------------------

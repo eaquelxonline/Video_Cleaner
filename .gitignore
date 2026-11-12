@@ -13,3 +13,5 @@ __pycache__/
 /vc-logcat.txt
 /vc-output/
 /test-failed
+# Eğitilmemiş model ONNX dosyaları (CI'da Models/Export.py üretir; yüzlerce MB)
+/AndroidTest/assets/onnx/

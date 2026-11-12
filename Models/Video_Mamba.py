@@ -110,14 +110,21 @@ class SelectiveSSM(nn.Module):
     def _scan(self, x: torch.Tensor, dt: torch.Tensor, b: torch.Tensor, c: torch.Tensor, valid: Optional[torch.Tensor]) -> torch.Tensor:
         n, t, d = x.shape
         a = -torch.exp(self.A_log.to(x.dtype))                               # [D, S], hep negatif → kararlı
-        h = x.new_zeros(n, d, self.state)
+        # Başlangıç durumu sıfırdır; ilk adımda h = write (exp(ΔA)·0 + write) olarak kurulur. Sıfır
+        # tensörü açıkça oluşturulmaz: sabit şekilli dışa aktarımda (ONNX/LiteRT) her blokta
+        # [N, D, S] boyutlu bir sabit olarak dosyaya gömülüyordu (VC-Mamba'da ~270 MB).
+        h: Optional[torch.Tensor] = None
         ys = []
         for i in range(t):
-            decay = torch.exp(dt[:, i, :, None] * a)                         # [N, D, S]
             write = (dt[:, i] * x[:, i])[:, :, None] * b[:, i, None, :]      # [N, D, S]
-            h_new = decay * h + write
+            if h is None:
+                h_new = write
+                prev = write * 0.0
+            else:
+                h_new = torch.exp(dt[:, i, :, None] * a) * h + write          # [N, D, S]
+                prev = h
             # Dolgu karesi duruma yazılmaz; durum bir sonraki geçerli kareye aynen taşınır.
-            h = h_new if valid is None else torch.where(valid[:, i, None, None], h_new, h)
+            h = h_new if valid is None else torch.where(valid[:, i, None, None], h_new, prev)
             ys.append((h * c[:, i, None, :]).sum(-1))                        # [N, D]
         return torch.stack(ys, dim=1)
 
