@@ -1725,6 +1725,82 @@ internal class VuiFixer(mime: String, private val target: Target) {
     }
 }
 
+/**
+ * MediaMuxer kapandıktan sonra MP4'ün video örnek girdisindeki 'pasp' (piksel en-boy) kutusunu yerinde
+ * düzeltir. Android 11 MPEG4Writer'ı biçimdeki SAR anahtarını yok sayıp 'pasp' 1:1 yazıyor; oynatıcılar
+ * (ExoPlayer, ffmpeg) kaptaki değeri bit akışındakinden önce kullandığından anamorfik video basık görünüyordu
+ * (moto g play 2021, 32:27 → 1:1). Yalnızca kutu ağacı izlenir (moov/trak/mdia/minf/stbl/stsd/görsel girdi),
+ * medya verisi taranmaz; dosya boyu değişmez (yalnızca 8 bayt üzerine yazılır).
+ */
+internal object Mp4Patch {
+    private val CONTAINERS = setOf("moov", "trak", "mdia", "minf", "stbl")
+    private val VISUAL = setOf("avc1", "avc3", "hvc1", "hev1", "av01", "mp4v")
+
+    private fun read(fd: java.io.FileDescriptor, offset: Long, count: Int): ByteArray? {
+        val buf = ByteArray(count)
+        var done = 0
+        while (done < count) {
+            val n = android.system.Os.pread(fd, buf, done, count - done, offset + done)
+            if (n <= 0) return null
+            done += n
+        }
+        return buf
+    }
+
+    private fun u32(b: ByteArray, at: Int): Long =
+        ((b[at].toLong() and 0xFF) shl 24) or ((b[at + 1].toLong() and 0xFF) shl 16) or ((b[at + 2].toLong() and 0xFF) shl 8) or (b[at + 3].toLong() and 0xFF)
+
+    /** [start, end) aralığındaki kutular: (gövde başı, kutu sonu, tür). */
+    private fun boxes(fd: java.io.FileDescriptor, start: Long, end: Long): List<Triple<Long, Long, String>> {
+        val out = ArrayList<Triple<Long, Long, String>>()
+        var pos = start
+        while (pos + 8 <= end && out.size < 4096) {
+            val h = read(fd, pos, 16.coerceAtMost((end - pos).toInt().coerceAtLeast(8))) ?: break
+            var size = u32(h, 0)
+            val type = String(h, 4, 4, Charsets.ISO_8859_1)
+            var header = 8L
+            if (size == 1L) {
+                if (h.size < 16) break
+                size = (u32(h, 8) shl 32) or u32(h, 12)
+                header = 16
+            } else if (size == 0L) {
+                size = end - pos
+            }
+            if (size < header || pos + size > end) break
+            out += Triple(pos + header, pos + size, type)
+            pos += size
+        }
+        return out
+    }
+
+    /** Görsel örnek girdilerindeki 'pasp' kutularını [w]:[h] yapar; düzeltilen kutu sayısı. */
+    fun fixPasp(fd: java.io.FileDescriptor, w: Int, h: Int): Int {
+        val size = android.system.Os.fstat(fd).st_size
+        var patched = 0
+        fun walk(start: Long, end: Long, depth: Int) {
+            if (depth > 8) return
+            for ((body, boxEnd, type) in boxes(fd, start, end)) {
+                when {
+                    type in CONTAINERS -> walk(body, boxEnd, depth + 1)
+                    type == "stsd" -> walk(body + 8, boxEnd, depth + 1)          // tam kutu (4) + girdi sayısı (4)
+                    type in VISUAL -> {
+                        // Görsel örnek girdisi: 78 baytlık sabit alanlardan sonra alt kutular.
+                        for ((pBody, _, child) in boxes(fd, body + 78, boxEnd)) {
+                            if (child != "pasp") continue
+                            val cur = read(fd, pBody, 8) ?: continue
+                            if (u32(cur, 0) == w.toLong() && u32(cur, 4) == h.toLong()) continue
+                            val value = ByteBuffer.allocate(8).putInt(w).putInt(h).array()
+                            if (android.system.Os.pwrite(fd, value, 0, 8, pBody) == 8) patched++
+                        }
+                    }
+                }
+            }
+        }
+        walk(0, size, 0)
+        return patched
+    }
+}
+
 // ---- video -------------------------------------------------------------------
 
 class VideoJob(
@@ -1788,6 +1864,13 @@ class VideoJob(
         runCatching {
             if (output.scheme == "file") output.path?.let { java.io.File(it).delete() } else DocumentsContract.deleteDocument(context.contentResolver, output)
         }
+    }
+
+    /** Çoklayıcının yanlış yazdığı 'pasp' kutusunu düzeltir (bkz. [Mp4Patch]); sonucu nota yazar. */
+    private fun patchPasp(fd: ParcelFileDescriptor, w: Int, h: Int, notes: MutableList<String>) {
+        runCatching { Mp4Patch.fixPasp(fd.fileDescriptor, w, h) }
+            .onSuccess { if (it > 0) notes += "MP4 'pasp' kutusu $w:$h olarak düzeltildi (çoklayıcı 1:1 yazmıştı)." }
+            .onFailure { notes += "MP4 'pasp' kutusu düzeltilemedi (${it.javaClass.simpleName}); SAR yalnızca bit akışında." }
     }
 
     private class Encoder(val codec: MediaCodec, val mime: String, val name: String, val settings: EncoderSettings, val vui: VuiFixer.Target)
@@ -2038,6 +2121,7 @@ class VideoJob(
             for ((k, entry) in audioPaths.withIndex()) entry.first.pump(mux, audioOut[k], Long.MAX_VALUE)
             mux.stop()
             muxerStarted = false
+            SourceVideoTags.of(videoFormat).sar?.let { (w, h) -> patchPasp(fd, w, h, notes) }
             // Not: Android'in ayrıştırıcısı bazı izleri hiç göstermez (ör. MKV içindeki SRT, API 37'de denendi).
             // Görünmeyen izler de çıktıya yazılmaz; yalnızca video ve ses kopyalanır.
             notes += if (subtitles.isEmpty()) "Android bu dosyada ayrı altyazı izi görmedi; çıktıya yalnızca video ve ses (yeniden kodlanmadan) yazıldı."
@@ -2411,6 +2495,7 @@ class VideoJob(
             // arayüze "bütünlük uyarısı" şeklinde yansır.
             mux.stop()
             muxerStarted = false
+            sourceSar?.let { (w, h) -> patchPasp(fd, w, h, notes) }
             return JobResult(
                 framesDecoded, framesEncoded, SystemClock.elapsedRealtime() - started,
                 finalSession.width, finalSession.height, framesQueued, audioLabel, finalEncoder.mime, finalEncoder.name,
