@@ -1951,6 +1951,227 @@ impl Estimate {
     }
 }
 
+/// Geri yazmanın son dokunuşları: maske kenarı alfa yumuşatması ve kumlanma (grain) eşleme.
+///
+/// * **Yumuşatma**: onarım bölgesinin (tahmin ağırlığı > 0) dış kenarından içe doğru mesafe ölçülür
+///   (3-4 chamfer); kenardan `feather` piksel içeride tam onarım, arada kosinüs rampa ile orijinale geçiş.
+///   Bölge DIŞINDAKİ piksellere hiç dokunulmaz (bit-exact kapı korunur); onarıcı bölgeyi maskeden
+///   `feather` kadar fazla genişletmelidir ki yazı pikselleri tam onarım alanında kalsın.
+/// * **Kumlanma eşleme**: 20–40M parametreli onarıcılar "plastik" (fazla pürüzsüz) doku üretir. ROI'nin
+///   onarılmayan kısmından kameranın yüksek frekanslı gürültüsü ölçülür (y − 3×3 ortalama; σ = 1,4826 ·
+///   ortanca mutlak sapma), onarılan bölgenin kendi gürültüsü düşülür ve eksik kalan σ deterministik
+///   (kare sırasıyla tohumlanmış) gürültü olarak yalnızca parlaklığa eklenir.
+pub mod finish {
+    /// Bölge içi pikseller için dış kenara chamfer (3-4) mesafesi, piksel cinsinden (bölge dışı 0).
+    ///
+    /// `frame_edge` = [sol, üst, sağ, alt]: ROI'nin o kenarı karenin kenarıysa ötesi bölge İÇİ sayılır
+    /// (köşedeki filigran kare kenarına doğru yarım onarılmasın); değilse ötesi bölge dışıdır.
+    pub fn inner_distance(region: &[bool], w: usize, h: usize, frame_edge: [bool; 4]) -> Vec<f32> {
+        const INF: u32 = u32::MAX / 4;
+        let mut d: Vec<u32> = region.iter().map(|&r| if r { INF } else { 0 }).collect();
+        let at = |x: isize, y: isize, d: &Vec<u32>| -> u32 {
+            let beyond = [x < 0, y < 0, x >= w as isize, y >= h as isize];
+            if beyond.iter().any(|&b| b) {
+                return if beyond.iter().zip(frame_edge).any(|(&b, e)| b && !e) {
+                    0
+                } else {
+                    INF
+                };
+            }
+            d[y as usize * w + x as usize]
+        };
+        for y in 0..h as isize {
+            for x in 0..w as isize {
+                let i = y as usize * w + x as usize;
+                if d[i] == 0 {
+                    continue;
+                }
+                let best = (at(x - 1, y, &d) + 3)
+                    .min(at(x, y - 1, &d) + 3)
+                    .min(at(x - 1, y - 1, &d) + 4)
+                    .min(at(x + 1, y - 1, &d) + 4);
+                d[i] = d[i].min(best);
+            }
+        }
+        for y in (0..h as isize).rev() {
+            for x in (0..w as isize).rev() {
+                let i = y as usize * w + x as usize;
+                if d[i] == 0 {
+                    continue;
+                }
+                let best = (at(x + 1, y, &d) + 3)
+                    .min(at(x, y + 1, &d) + 3)
+                    .min(at(x + 1, y + 1, &d) + 4)
+                    .min(at(x - 1, y + 1, &d) + 4);
+                d[i] = d[i].min(best);
+            }
+        }
+        d.iter().map(|&v| v as f32 / 3.0).collect()
+    }
+
+    /// Mesafeden kapsama alfası (0..255): kenar komşusu küçük, `feather` + 1 pikselden derinde 255.
+    pub fn ramp(distance: f32, feather: u32) -> u8 {
+        if distance <= 0.0 {
+            return 0;
+        }
+        if feather == 0 || distance > feather as f32 {
+            return 255;
+        }
+        let t = distance / (feather as f32 + 1.0);
+        (127.5 * (1.0 - (std::f32::consts::PI * t).cos()))
+            .round()
+            .clamp(1.0, 255.0) as u8
+    }
+
+    /// Bir düzlemin yüksek frekanslı gürültü sigması (y − 3×3 ortalama, sağlam MAD), `sel` piksellerinde.
+    pub fn noise_sigma(
+        plane: &[u8],
+        w: usize,
+        h: usize,
+        sel: &dyn Fn(usize) -> bool,
+    ) -> Option<f32> {
+        let mut hist = [0u32; 256];
+        let mut n = 0u32;
+        for y in 1..h.saturating_sub(1) {
+            for x in 1..w.saturating_sub(1) {
+                let i = y * w + x;
+                if !sel(i) {
+                    continue;
+                }
+                let mut sum = 0i32;
+                for dy in [-1isize, 0, 1] {
+                    for dx in [-1isize, 0, 1] {
+                        sum += plane[(i as isize + dy * w as isize + dx) as usize] as i32;
+                    }
+                }
+                let r = (plane[i] as i32 * 9 - sum).abs() / 9;
+                hist[r.min(255) as usize] += 1;
+                n += 1;
+            }
+        }
+        if n < 64 {
+            return None;
+        }
+        let mut acc = 0;
+        for (v, &c) in hist.iter().enumerate() {
+            acc += c;
+            if acc * 2 >= n {
+                // 3×3 ortalamadan sapma, saf gürültü σ'sının √(8/9) katıdır; MAD → σ için 1,4826.
+                return Some(1.4826 * v as f32 / (8.0f32 / 9.0).sqrt());
+            }
+        }
+        None
+    }
+
+    /// Deterministik, yaklaşık normal (Irwin–Hall, 4 tekdüze) gürültü üreteci.
+    pub struct Grain(u64);
+
+    impl Grain {
+        pub fn new(seed: u64) -> Self {
+            Self(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1)
+        }
+        fn next(&mut self) -> u32 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 >> 32) as u32
+        }
+        /// Ortalama 0, σ ≈ 1.
+        pub fn normal(&mut self) -> f32 {
+            let s: f32 = (0..4).map(|_| (self.next() as f32) / u32::MAX as f32).sum();
+            (s - 2.0) * (3.0f32).sqrt()
+        }
+    }
+}
+
+/// Bileşimden sonra ROI içinde yumuşatma + kumlanma uygular (bkz. [`finish`]). `orig` girdinin, `dst`
+/// bileşimin NV12 kopyasıdır; bölge = ağırlığı > 0 olan pikseller. Eklenen σ'yı döndürür.
+fn finish_roi(
+    geo: FrameGeometry,
+    orig: &[u8],
+    dst: &mut [u8],
+    region_of: &dyn Fn(usize) -> bool,
+    roi: Rect,
+    feather: u32,
+    grain: bool,
+    seed: u64,
+) -> f32 {
+    if roi.is_empty() || (feather == 0 && !grain) {
+        return 0.0;
+    }
+    let w = geo.width();
+    let (rw, rh) = (roi.w, roi.h);
+    let region: Vec<bool> = (0..rw * rh)
+        .map(|k| region_of((roi.y + k / rw) * w + roi.x + k % rw))
+        .collect();
+    let edge = [
+        roi.x == 0,
+        roi.y == 0,
+        roi.x + rw >= w,
+        roi.y + rh >= geo.height(),
+    ];
+    let dist = finish::inner_distance(&region, rw, rh, edge);
+    let alpha: Vec<u8> = dist.iter().map(|&d| finish::ramp(d, feather)).collect();
+    let uv_base = geo.luma_bytes();
+    let mut added = 0.0;
+    if grain {
+        let mut src_y = vec![0u8; rw * rh];
+        let mut out_y = vec![0u8; rw * rh];
+        for r in 0..rh {
+            let row = (roi.y + r) * w + roi.x;
+            src_y[r * rw..(r + 1) * rw].copy_from_slice(&orig[row..row + rw]);
+            out_y[r * rw..(r + 1) * rw].copy_from_slice(&dst[row..row + rw]);
+        }
+        let s_src = finish::noise_sigma(&src_y, rw, rh, &|k| !region[k]);
+        let s_out = finish::noise_sigma(&out_y, rw, rh, &|k| alpha[k] == 255);
+        if let (Some(a), Some(b)) = (s_src, s_out) {
+            added = (a * a - b * b).max(0.0).sqrt();
+        }
+        if added > 0.25 {
+            let mut rng = finish::Grain::new(seed);
+            for (k, &inside) in region.iter().enumerate() {
+                if inside {
+                    let i = (roi.y + k / rw) * w + roi.x + k % rw;
+                    dst[i] = (dst[i] as f32 + added * rng.normal())
+                        .round()
+                        .clamp(0.0, 255.0) as u8;
+                }
+            }
+        }
+    }
+    if feather > 0 {
+        let mix = |o: u8, e: u8, a: u32| ((e as u32 * a + o as u32 * (255 - a) + 127) / 255) as u8;
+        for (k, &a) in alpha.iter().enumerate() {
+            if a != 0 && a != 255 {
+                let i = (roi.y + k / rw) * w + roi.x + k % rw;
+                dst[i] = mix(orig[i], dst[i], a as u32);
+            }
+        }
+        for cy in 0..rh / 2 {
+            for cx in 0..rw / 2 {
+                let ks = [
+                    2 * cy * rw + 2 * cx,
+                    2 * cy * rw + 2 * cx + 1,
+                    (2 * cy + 1) * rw + 2 * cx,
+                    (2 * cy + 1) * rw + 2 * cx + 1,
+                ];
+                if ks.iter().all(|&k| alpha[k] == 0) {
+                    continue;
+                }
+                let a = ks.iter().map(|&k| alpha[k] as u32).sum::<u32>() / 4;
+                if a == 255 {
+                    continue;
+                }
+                let i = uv_base + ((roi.y / 2) + cy) * w + roi.x + 2 * cx;
+                for c in 0..2 {
+                    dst[i + c] = mix(orig[i + c], dst[i + c], a);
+                }
+            }
+        }
+    }
+    added
+}
+
 /// `dst` (orijinal karenin kopyası) üzerine tahminleri uygular; değiştirilen Y
 /// pikseli sayısını döndürür.
 ///
@@ -2778,6 +2999,10 @@ pub struct Pipeline {
     prepared: Option<u64>,
     auto_scene_cut: bool,
     integrity_check: bool,
+    /// Maske kenarı alfa yumuşatması (piksel; 0 = kapalı). Bkz. [`finish`].
+    feather_px: u32,
+    /// Kumlanma eşleme açık mı.
+    grain: bool,
     stats: PipelineStats,
 }
 
@@ -2805,6 +3030,8 @@ impl Pipeline {
             prepared: None,
             auto_scene_cut: true,
             integrity_check: false,
+            feather_px: 0,
+            grain: false,
             stats: PipelineStats::default(),
         })
     }
@@ -2832,6 +3059,21 @@ impl Pipeline {
     /// Her çıkan karede koruma kapısını yeniden denetler (yavaş; test/tanılama için).
     pub fn set_integrity_check(&mut self, on: bool) {
         self.integrity_check = on;
+    }
+
+    /// Maske kenarı alfa yumuşatması (0..=16 piksel; 0 = sert geçiş). Onarıcı, bölgeyi maskeden bu kadar
+    /// fazla genişletmelidir. Üretim değeri 4.
+    pub fn set_feather(&mut self, px: u32) -> Result<(), CoreError> {
+        if px > 16 {
+            return Err(CoreError::BadArgument);
+        }
+        self.feather_px = px;
+        Ok(())
+    }
+
+    /// Kumlanma eşleme (onarılan bölgeye kameranın ölçülen gürültüsü eklenir).
+    pub fn set_grain(&mut self, on: bool) {
+        self.grain = on;
     }
 
     /// Sayaçlar.
@@ -2974,8 +3216,29 @@ impl Pipeline {
         } = item.source
         {
             let est = &self.est_emit[emit_index as usize];
-            let cached = fuse_index.map(|i| &self.est_tail[i as usize]);
+            let cached = fuse_index
+                .map(|i| &self.est_tail[i as usize])
+                .filter(|c| !c.roi.is_empty());
             modified = compose(self.geo, dst, est, cached);
+            if self.feather_px > 0 || self.grain {
+                let roi = match cached {
+                    Some(c) if !est.roi.is_empty() => est.roi.union(c.roi),
+                    Some(c) => c.roi,
+                    None => est.roi,
+                };
+                let region =
+                    |i: usize| est.weight[i] != 0 || cached.is_some_and(|c| c.weight[i] != 0);
+                finish_roi(
+                    self.geo,
+                    lease.data(),
+                    dst,
+                    &region,
+                    roi,
+                    self.feather_px,
+                    self.grain,
+                    item.seq,
+                );
+            }
             if self.integrity_check {
                 self.stats.preservation_violations +=
                     verify_preservation(self.geo, lease.data(), dst, est, cached);
@@ -3601,49 +3864,70 @@ impl Engine {
 
 /// Kare başına hangi sinir ağı aşamalarının gerçekten çalışacağına karar verir (telefonda süre).
 ///
-/// Gözlem: altyazı ortalama 2–3 sn (60–90 kare) aynı yerde sabit durur, filigran hiç kıpırdamaz.
-/// Altyazı şeridinin (ROI) parlaklık düzlemi bir önceki kareyle Assembly `sad_u8` ile karşılaştırılır
-/// (piksel başına ortalama mutlak fark):
+/// Gözlem: altyazı ortalama 2–3 sn (60–90 kare) aynı yerde sabit durur, filigran hiç kıpırdamaz. Şerit
+/// (ROI) parlaklık düzlemi bir önceki kareyle Assembly `sad_u8` ile üç bölgede karşılaştırılır (piksel
+/// başına ortalama mutlak fark):
 ///
-/// * **Algılayıcı**: şerit belirgin değişmediyse (`det_threshold`) önceki maske kullanılır; yine de en
-///   geç her `det_period` karede bir çalışır (yavaş beliren/solan yazıyı kaçırmamak için).
-/// * **Yama yeniden kullanımı**: şerit neredeyse aynıysa (`reuse_threshold`) ve maske değişmediyse bir
-///   önceki onarılmış yama aynen kullanılır, akış + onarım çalışmaz. Kayma birikmesin diye en fazla
-///   `max_reuse` kare art arda; sonra zorla yeniden hesaplanır.
+/// * **Yazı pikselleri** (ham maske): altyazının kendisi değişti mi?
+/// * **Çevre halkası** (maskenin `gate_passes` × 2 px genişletilmiş hâlinin, yani geri yazma bölgesinin,
+///   dışındaki `ring_passes` × 2 px şerit): yazının ARKASINDAKİ sahne
+///   hareket ediyor mu? Yazı pikselleri parlak ve baskın olduğundan tüm şerit ya da yalnızca yazı üzerinden
+///   ölçülen fark düşük çıkabilir; hareketli arka planın önünde sabit duran altyazıda önceki yamayı
+///   yapıştırmak "donmuş dikdörtgen" üretir. Halka bunu yakalar.
+/// * **Sütun blokları** (32 px): şeridin herhangi bir yerinde YENİ yazı belirdi mi (en büyük blok farkı)?
+///
+/// Kararlar:
+/// * **Algılayıcı**: yazı bölgesi ve bloklar değişmediyse önceki maske kullanılır (arka plan hareket etse
+///   bile); en geç her `det_period` karede bir yine çalışır.
+/// * **Yama yeniden kullanımı** (akış + onarım atlanır): yazı bölgesi VE çevre halkası neredeyse aynıysa
+///   (arka plan gerçekten durağan, ör. sabit kamera) ve maske değişmediyse; en fazla `max_reuse` kare art
+///   arda. Arka plan hareketliyse algılayıcı atlanır ama mevcut maskeyle akış + onarım çalışmaya devam eder.
 ///
 /// Planlayıcı yalnızca karar verir; maske/yamayı saklamak çağıranın (halka tampon) işidir.
 pub mod reuse {
-    use crate::kernels;
+    use crate::{dilate5x5, kernels};
 
     /// Eşikler (piksel başına ortalama mutlak fark, 0..255 ölçeğinde).
     #[derive(Clone, Copy, Debug)]
     pub struct Config {
+        /// Yazı bölgesi bu farkı aşarsa algılayıcı çalışır.
         pub det_threshold: f32,
+        /// Herhangi bir 32 px sütun bloğu bu farkı aşarsa (yeni yazı) algılayıcı çalışır.
+        pub new_text_threshold: f32,
         pub det_period: u32,
+        /// Yazı bölgesi ve çevre halkası bu farkın altındaysa yama yeniden kullanılır.
         pub reuse_threshold: f32,
         pub max_reuse: u32,
+        /// Yazı bölgesi genişletmesi: geçiş başına 2 px (5×5).
+        pub gate_passes: u32,
+        /// Çevre halkası genişliği: geçiş başına 2 px (varsayılan 4 → 8 px).
+        pub ring_passes: u32,
     }
 
     impl Default for Config {
         fn default() -> Self {
             Self {
                 det_threshold: 2.0,
+                new_text_threshold: 20.0,
                 det_period: 10,
                 reuse_threshold: 0.5,
                 max_reuse: 60,
+                gate_passes: 1,
+                ring_passes: 4,
             }
         }
     }
 
-    /// Bir kare için karar.
+    /// Bir kare için karar ve ölçülen farklar (×100, tanılama).
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct Plan {
         /// Algılayıcı bu karede çalışsın mı (yoksa önceki maske).
         pub run_detector: bool,
         /// Önceki onarılmış yama aynen kullanılsın mı (akış + onarım atlanır).
         pub reuse_patch: bool,
-        /// Ölçülen şerit farkı × 100 (tanılama; tam sayı).
-        pub sad_x100: u32,
+        pub text_sad_x100: u32,
+        pub ring_sad_x100: u32,
+        pub block_max_x100: u32,
     }
 
     #[derive(Clone, Debug, Default)]
@@ -3653,11 +3937,79 @@ pub mod reuse {
         pub reused: u64,
     }
 
+    /// Maskeden yazı bölgesi (genişletilmiş) ve çevre halkası: (yazı, halka) 0/255 baytları.
+    pub fn regions(
+        mask: &[u8],
+        width: usize,
+        height: usize,
+        gate_passes: u32,
+        ring_passes: u32,
+    ) -> (Vec<u8>, Vec<u8>) {
+        let mut gate = mask[..width * height].to_vec();
+        let mut tmp = vec![0u8; width * height];
+        for _ in 0..gate_passes {
+            dilate5x5(&gate, width, height, &mut tmp);
+            std::mem::swap(&mut gate, &mut tmp);
+        }
+        let mut outer = gate.clone();
+        for _ in 0..ring_passes {
+            dilate5x5(&outer, width, height, &mut tmp);
+            std::mem::swap(&mut outer, &mut tmp);
+        }
+        let ring = outer
+            .iter()
+            .zip(&gate)
+            .map(|(&o, &g)| if o != 0 && g == 0 { 255 } else { 0 })
+            .collect();
+        (gate, ring)
+    }
+
+    /// `region` (0 dışı) piksellerinde ortalama mutlak fark; bölge boşsa 0.
+    fn masked_sad(
+        a: &[u8],
+        b: &[u8],
+        region: &[u8],
+        buf_a: &mut Vec<u8>,
+        buf_b: &mut Vec<u8>,
+    ) -> f32 {
+        buf_a.clear();
+        buf_b.clear();
+        for ((&x, &y), &m) in a.iter().zip(b).zip(region) {
+            if m != 0 {
+                buf_a.push(x);
+                buf_b.push(y);
+            }
+        }
+        if buf_a.is_empty() {
+            0.0
+        } else {
+            kernels::sad_u8(buf_a, buf_b) as f32 / buf_a.len() as f32
+        }
+    }
+
+    /// 32 px sütun blokları içinde en büyük ortalama mutlak fark.
+    fn block_max(a: &[u8], b: &[u8], width: usize, height: usize) -> f32 {
+        let mut best = 0.0f32;
+        let mut x = 0;
+        while x < width {
+            let w = 32.min(width - x);
+            let mut sum = 0u64;
+            for y in 0..height {
+                let row = y * width + x;
+                sum += kernels::sad_u8(&a[row..row + w], &b[row..row + w]);
+            }
+            best = best.max(sum as f32 / (w * height) as f32);
+            x += w;
+        }
+        best
+    }
+
     pub struct Planner {
         cfg: Config,
         prev: Vec<u8>,
         since_detector: u32,
         reuse_run: u32,
+        scratch: (Vec<u8>, Vec<u8>),
         pub stats: Stats,
     }
 
@@ -3668,6 +4020,7 @@ pub mod reuse {
                 prev: Vec::new(),
                 since_detector: 0,
                 reuse_run: 0,
+                scratch: (Vec::new(), Vec::new()),
                 stats: Stats::default(),
             }
         }
@@ -3679,26 +4032,46 @@ pub mod reuse {
             self.reuse_run = 0;
         }
 
-        /// `band`: şeridin parlaklık baytları (her karede aynı boyut). `mask_changed`: bu karede
-        /// kullanılacak maske bir öncekinden farklı mı (algılayıcı çalıştıysa çağıran bildirir;
-        /// planlama algılayıcıdan önce yapıldığı için ilk çağrıda `false` verilip algılayıcı
-        /// çalıştıktan sonra [`Planner::confirm_mask`] ile düzeltilebilir).
-        pub fn plan(&mut self, band: &[u8], mask_changed: bool) -> Plan {
+        /// `band`: şeridin parlaklık baytları (`width × height`, her karede aynı boyut). `mask`: bu kare
+        /// için bilinen (önceki) yazı maskesi, 0/255. `mask_changed`: maske bir öncekinden farklı mı.
+        pub fn plan(
+            &mut self,
+            band: &[u8],
+            mask: &[u8],
+            width: usize,
+            height: usize,
+            mask_changed: bool,
+        ) -> Plan {
+            assert!(band.len() == width * height && mask.len() >= width * height);
             self.stats.frames += 1;
             let fresh = self.prev.len() != band.len();
-            let sad = if fresh || band.is_empty() {
-                f32::INFINITY
+            let (text, ring, blocks) = if fresh || band.is_empty() {
+                (f32::INFINITY, f32::INFINITY, f32::INFINITY)
             } else {
-                kernels::sad_u8(band, &self.prev) as f32 / band.len() as f32
+                // Yazı değişimi YALNIZCA ham maske piksellerinde ölçülür: genişletilmiş bölge yazının
+                // kenarındaki hareketli arka planı da içerir ve algılayıcıyı gereksiz yere tetikler.
+                let (_, ring_region) = regions(
+                    mask,
+                    width,
+                    height,
+                    self.cfg.gate_passes,
+                    self.cfg.ring_passes,
+                );
+                let (sa, sb) = &mut self.scratch;
+                let text = masked_sad(band, &self.prev, &mask[..width * height], sa, sb);
+                let ring = masked_sad(band, &self.prev, &ring_region, sa, sb);
+                (text, ring, block_max(band, &self.prev, width, height))
             };
             if fresh {
                 self.prev = band.to_vec();
             } else {
                 self.prev.copy_from_slice(band);
             }
+            let cfg = self.cfg;
             let run_detector = fresh
-                || sad > self.cfg.det_threshold
-                || self.since_detector + 1 >= self.cfg.det_period;
+                || text > cfg.det_threshold
+                || blocks > cfg.new_text_threshold
+                || self.since_detector + 1 >= cfg.det_period;
             self.since_detector = if run_detector {
                 0
             } else {
@@ -3707,23 +4080,25 @@ pub mod reuse {
             let reuse_patch = !fresh
                 && !run_detector
                 && !mask_changed
-                && sad <= self.cfg.reuse_threshold
-                && self.reuse_run < self.cfg.max_reuse;
+                && text <= cfg.reuse_threshold
+                && ring <= cfg.reuse_threshold
+                && self.reuse_run < cfg.max_reuse;
             self.reuse_run = if reuse_patch { self.reuse_run + 1 } else { 0 };
-            if run_detector {
-                self.stats.detector_runs += 1;
-            }
-            if reuse_patch {
-                self.stats.reused += 1;
-            }
+            self.stats.detector_runs += run_detector as u64;
+            self.stats.reused += reuse_patch as u64;
+            let x100 = |v: f32| {
+                if v.is_finite() {
+                    (v * 100.0) as u32
+                } else {
+                    u32::MAX
+                }
+            };
             Plan {
                 run_detector,
                 reuse_patch,
-                sad_x100: if sad.is_finite() {
-                    (sad * 100.0) as u32
-                } else {
-                    u32::MAX
-                },
+                text_sad_x100: x100(text),
+                ring_sad_x100: x100(ring),
+                block_max_x100: x100(blocks),
             }
         }
 
@@ -4690,6 +5065,8 @@ pub mod jni {
             match key {
                 1 => s.pipeline.set_auto_scene_cut(value != 0),
                 2 => s.pipeline.set_integrity_check(value != 0),
+                3 => s.pipeline.set_feather(value.max(0) as u32)?,
+                4 => s.pipeline.set_grain(value != 0),
                 _ => return Err(CoreError::BadArgument),
             }
             Ok(0)
@@ -8169,20 +8546,43 @@ mod vui_tests {
 mod reuse_tests {
     use super::reuse::*;
 
-    fn band(level: u8, len: usize) -> Vec<u8> {
-        (0..len)
-            .map(|i| level.wrapping_add((i % 7) as u8))
-            .collect()
+    const W: usize = 256;
+    const H: usize = 64;
+
+    /// Dokulu arka plan (kaydırılabilir) + sabit "altyazı" bloğu.
+    fn frame(shift: usize, text: bool) -> (Vec<u8>, Vec<u8>) {
+        let mut band = vec![0u8; W * H];
+        let mut mask = vec![0u8; W * H];
+        for y in 0..H {
+            for x in 0..W {
+                let v = (((x + shift) * 7 + y * 13) % 61) as u8 + 60;
+                band[y * W + x] = v;
+                if text && (24..40).contains(&y) && (64..192).contains(&x) {
+                    band[y * W + x] = 250;
+                    mask[y * W + x] = 255;
+                }
+            }
+        }
+        (band, mask)
     }
 
     #[test]
-    fn static_band_runs_detector_periodically_and_reuses_patch() {
+    fn regions_split_gate_and_ring() {
+        let (_, mask) = frame(0, true);
+        let (gate, ring) = regions(&mask, W, H, 1, 4);
+        let gate_px = gate.iter().filter(|&&v| v != 0).count();
+        let ring_px = ring.iter().filter(|&&v| v != 0).count();
+        assert_eq!(gate_px, (16 + 4) * (128 + 4)); // 2 px genişletme
+        assert_eq!(ring_px, (20 + 16) * (132 + 16) - gate_px); // +8 px halka
+        assert!(gate.iter().zip(&ring).all(|(&g, &r)| !(g != 0 && r != 0)));
+    }
+
+    #[test]
+    fn static_scene_runs_detector_periodically_and_reuses_patch() {
         let mut p = Planner::new(Config::default());
-        let b = band(100, 512 * 128);
-        let plans: Vec<Plan> = (0..30).map(|_| p.plan(&b, false)).collect();
-        // ilk kare her şeyi hesaplar
+        let (band, mask) = frame(0, true);
+        let plans: Vec<Plan> = (0..30).map(|_| p.plan(&band, &mask, W, H, false)).collect();
         assert!(plans[0].run_detector && !plans[0].reuse_patch);
-        // algılayıcı en geç her 10 karede bir
         let runs: Vec<usize> = plans
             .iter()
             .enumerate()
@@ -8190,38 +8590,57 @@ mod reuse_tests {
             .map(|(i, _)| i)
             .collect();
         assert_eq!(runs, vec![0, 10, 20]);
-        // algılayıcının çalışmadığı statik karelerde yama yeniden kullanılır
         assert!(
             plans
                 .iter()
                 .filter(|x| !x.run_detector)
                 .all(|x| x.reuse_patch)
         );
-        assert_eq!(p.stats.detector_runs, 3);
-        assert_eq!(p.stats.reused, 27);
+        assert_eq!((p.stats.detector_runs, p.stats.reused), (3, 27));
     }
 
     #[test]
-    fn change_forces_detector_and_blocks_reuse() {
+    fn moving_background_behind_static_subtitle_never_freezes_patch() {
+        // "Donmuş yama" tuzağı: altyazı sabit, arkadaki sahne kayıyor.
         let mut p = Planner::new(Config::default());
-        let a = band(100, 4096);
-        let c = band(140, 4096);
-        p.plan(&a, false);
-        assert!(p.plan(&a, false).reuse_patch);
-        let changed = p.plan(&c, false);
-        assert!(changed.run_detector && !changed.reuse_patch, "{changed:?}");
-        // maske değiştiyse yama kullanılmaz
-        let mut next = p.plan(&c, false);
-        assert!(next.reuse_patch);
+        let mut plans = Vec::new();
+        for i in 0..30 {
+            let (band, mask) = frame(i, true);
+            plans.push(p.plan(&band, &mask, W, H, false));
+        }
+        // algılayıcı yalnızca periyotla çalışır (yazı sabit), ama yama hiç yeniden kullanılmaz
+        let runs: Vec<usize> = plans
+            .iter()
+            .enumerate()
+            .filter(|(_, x)| x.run_detector)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(runs, vec![0, 10, 20], "{plans:?}");
+        assert_eq!(
+            p.stats.reused, 0,
+            "hareketli arka planda yama dondurulmamalı: {plans:?}"
+        );
+        assert!(
+            plans[5].text_sad_x100 <= 200 && plans[5].ring_sad_x100 > 50,
+            "{:?}",
+            plans[5]
+        );
+    }
+
+    #[test]
+    fn new_subtitle_anywhere_in_band_triggers_detector() {
+        let mut p = Planner::new(Config::default());
+        let (empty, no_mask) = frame(0, false);
+        p.plan(&empty, &no_mask, W, H, false);
+        assert!(p.plan(&empty, &no_mask, W, H, false).reuse_patch);
+        let (with_text, _) = frame(0, true);
+        // maske henüz bilinmiyor (boş): yazı bölgesi farkı 0, ama sütun bloğu büyük fark görür
+        let plan = p.plan(&with_text, &no_mask, W, H, false);
+        assert!(plan.run_detector && !plan.reuse_patch, "{plan:?}");
+        // algılayıcı maskeyi değiştirdiğini bildirince yeniden kullanım iptal
+        let mut next = p.plan(&with_text, &no_mask, W, H, false);
         p.confirm_mask(&mut next, true);
         assert!(!next.reuse_patch);
-        // küçük ama eşik üstü fark: algılayıcı yok, yeniden kullanım yok
-        let mut d = c.clone();
-        for x in d.iter_mut().step_by(2) {
-            *x = x.wrapping_add(2);
-        }
-        let small = p.plan(&d, false);
-        assert!(!small.run_detector && !small.reuse_patch, "{small:?}");
     }
 
     #[test]
@@ -8232,8 +8651,10 @@ mod reuse_tests {
             ..Config::default()
         };
         let mut p = Planner::new(cfg);
-        let b = band(9, 1024);
-        let reuse: Vec<bool> = (0..13).map(|_| p.plan(&b, false).reuse_patch).collect();
+        let (band, mask) = frame(3, true);
+        let reuse: Vec<bool> = (0..13)
+            .map(|_| p.plan(&band, &mask, W, H, false).reuse_patch)
+            .collect();
         assert_eq!(
             reuse,
             vec![
@@ -8241,7 +8662,124 @@ mod reuse_tests {
             ]
         );
         p.reset();
-        let first = p.plan(&b, false);
+        let first = p.plan(&band, &mask, W, H, false);
         assert!(first.run_detector && !first.reuse_patch);
+    }
+}
+
+#[cfg(test)]
+mod finish_tests {
+    use super::*;
+
+    #[test]
+    fn ramp_and_distance_follow_cosine_profile() {
+        assert_eq!(finish::ramp(0.0, 4), 0);
+        assert_eq!(finish::ramp(10.0, 4), 255);
+        assert_eq!(finish::ramp(1.0, 0), 255);
+        let r: Vec<u8> = (1..=5).map(|d| finish::ramp(d as f32, 4)).collect();
+        assert!(r.windows(2).all(|p| p[0] < p[1]), "{r:?}");
+        assert_eq!(r[4], 255);
+        // 6×6 bölgenin mesafesi: kenar 1, merkeze doğru artar
+        let region: Vec<bool> = (0..100)
+            .map(|k| (2..8).contains(&(k % 10)) && (2..8).contains(&(k / 10)))
+            .collect();
+        let d = finish::inner_distance(&region, 10, 10, [false; 4]);
+        // kare kenarına dayanan bölge: kenar tarafında yumuşatma yok
+        let corner: Vec<bool> = (0..100).map(|k| k % 10 < 5 && k / 10 < 5).collect();
+        let dc = finish::inner_distance(&corner, 10, 10, [true, true, false, false]);
+        assert_eq!(dc[0], 5.0);
+        assert_eq!(dc[4 * 10 + 4], 1.0);
+        assert_eq!(d[2 * 10 + 2], 1.0);
+        assert_eq!(d[4 * 10 + 4], 3.0);
+        assert_eq!(d[0], 0.0);
+    }
+
+    #[test]
+    fn feather_blends_only_inside_region_and_keeps_outside_bit_exact() {
+        let geo = FrameGeometry::new(64, 48).unwrap();
+        let mut orig = vec![0u8; geo.frame_bytes()];
+        for (i, v) in orig.iter_mut().enumerate() {
+            *v = (i * 37 % 251) as u8;
+        }
+        let mut est = Estimate::new(geo);
+        let roi = Rect::new(8, 8, 32, 16);
+        est.paint(roi, 200, 90, 160, 255).unwrap();
+        let mut dst = orig.clone();
+        compose(geo, &mut dst, &est, None);
+        finish_roi(
+            geo,
+            &orig,
+            &mut dst,
+            &|i| est.weight[i] != 0,
+            roi,
+            4,
+            false,
+            0,
+        );
+        let w = geo.width();
+        for y in 0..geo.height() {
+            for x in 0..w {
+                let i = y * w + x;
+                let inside = (8..40).contains(&x) && (8..24).contains(&y);
+                if !inside {
+                    assert_eq!(dst[i], orig[i], "bölge dışı değişmemeli ({x},{y})");
+                    continue;
+                }
+                let depth = (x - 8 + 1).min(40 - x).min(y - 8 + 1).min(24 - y);
+                if depth > 4 {
+                    assert_eq!(dst[i], 200, "derin bölge tam onarım ({x},{y})");
+                } else {
+                    let a = finish::ramp(depth as f32, 4) as u32;
+                    let expect = ((200 * a + orig[i] as u32 * (255 - a) + 127) / 255) as u8;
+                    assert!(
+                        (dst[i] as i32 - expect as i32).abs() <= 1,
+                        "({x},{y}) {} ≠ {expect}",
+                        dst[i]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn grain_restores_measured_camera_noise_deterministically() {
+        let geo = FrameGeometry::new(128, 64).unwrap();
+        let mut rng = finish::Grain::new(99);
+        let mut orig = vec![128u8; geo.frame_bytes()];
+        for v in orig[..geo.luma_bytes()].iter_mut() {
+            *v = (128.0 + 8.0 * rng.normal()).round().clamp(0.0, 255.0) as u8;
+        }
+        let mut est = Estimate::new(geo);
+        let region_rect = Rect::new(32, 16, 64, 32);
+        est.paint(region_rect, 128, 128, 128, 255).unwrap();
+        let roi = Rect::new(0, 0, 128, 64);
+        let run = |seed: u64| {
+            let mut dst = orig.clone();
+            compose(geo, &mut dst, &est, None);
+            let added = finish_roi(
+                geo,
+                &orig,
+                &mut dst,
+                &|i| est.weight[i] != 0,
+                roi,
+                0,
+                true,
+                seed,
+            );
+            (dst, added)
+        };
+        let (a, added) = run(5);
+        let (b, _) = run(5);
+        assert_eq!(a, b, "aynı kare sırası aynı gürültü");
+        let w = geo.width();
+        let plane = &a[..geo.luma_bytes()];
+        let inside = |i: usize| (32..96).contains(&(i % w)) && (16..48).contains(&(i / w));
+        let sigma_in = finish::noise_sigma(plane, w, geo.height(), &inside).unwrap();
+        let sigma_out = finish::noise_sigma(plane, w, geo.height(), &|i| !inside(i)).unwrap();
+        assert!(added > 6.0 && added < 10.0, "eklenen σ {added}");
+        assert!(
+            (sigma_in - sigma_out).abs() / sigma_out < 0.25,
+            "içeride σ {sigma_in}, dışarıda σ {sigma_out}"
+        );
     }
 }

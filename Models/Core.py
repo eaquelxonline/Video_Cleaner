@@ -36,6 +36,7 @@ Pencere modları (Rust/Core.rs içindeki Scheduler ile aynı tanım)
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Dict, Optional, Tuple
 
 import torch
@@ -409,6 +410,10 @@ class EngineConfig:
     roi_tube: bool = True              # çıkarımda VC-Mamba yalnızca maskenin zamansal sınır kutusunda çalışsın
     roi_margin: int = 32               # ROI çevresinde bırakılan bağlam payı (piksel)
     roi_max_fraction: float = 0.6      # ROI karenin bu oranından büyükse tam kare işlenir
+    # Geri yazma kenarı alfa yumuşatması (piksel; 0 = sert geçiş). Onarım bölgesi silme maskesinden bu kadar
+    # daha genişletilir; dış kenardan içe kosinüs rampayla orijinale geçilir, bölge dışı bit-exact kalır.
+    # Rust hattındaki Pipeline::set_feather ile aynı tanım (orada 3-4 chamfer, burada satranç tahtası mesafe).
+    feather_px: int = 4
 
 
 def roi_tube(
@@ -440,6 +445,29 @@ def roi_tube(
     if (y1 - y0) % multiple or (x1 - x0) % multiple or (y1 - y0) * (x1 - x0) > max_fraction * h * w:
         return None
     return (y0, y1, x0, x1)
+
+
+def feather_blend(src: torch.Tensor, est: torch.Tensor, gate: torch.Tensor, feather: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Bit-exact kapı + kenar yumuşatması. gate [.., 1, H, W] bool (silme maskesi).
+
+    Bölge = gate'in ``feather`` piksel genişletilmişi. Bölge içindeki piksel, dış kenara satranç tahtası
+    mesafesi d (1 = kenar komşusu) ile α = ½(1 − cos(π·d/(F+1))) ağırlık alır; d > F ise α = 1 (gate'in
+    tamamı bu alandadır). Bölge dışı ``torch.where`` ile girdiden AYNEN seçilir. Dönen: (çıktı, bölge).
+    """
+    if feather <= 0:
+        return torch.where(gate, est.to(src.dtype), src), gate
+    region = dilate(gate, feather)
+    flat = region.reshape(-1, 1, *region.shape[-2:]).float()
+    depth = flat.clone()
+    eroded = flat
+    for _ in range(feather):
+        # Kare kenarının ötesi bölge İÇİ sayılır (köşedeki filigran kenara doğru yarım kalmasın).
+        eroded = -F.max_pool2d(-F.pad(eroded, (1, 1, 1, 1), value=1.0), 3, stride=1)
+        depth = depth + eroded
+    alpha = torch.where(depth > feather, torch.ones_like(depth), 0.5 * (1.0 - torch.cos(math.pi * depth / (feather + 1))))
+    alpha = alpha.reshape(region.shape).to(src.dtype)
+    blended = alpha * est.to(src.dtype) + (1.0 - alpha) * src
+    return torch.where(region, blended, src), region
 
 
 def dilate(mask: torch.Tensor, radius: int) -> torch.Tensor:
@@ -633,8 +661,7 @@ class VideoCleaner(nn.Module):
 
         # 5) Bit-exact koruma kapısı: maskesiz piksel girdiden AYNEN seçilir (çarpma/yuvarlama yok).
         src = frames[:, index]
-        gate = mask_hard[:, index]
-        restored = torch.where(gate, out["rgb"].to(src.dtype), src)
+        restored, gate = feather_blend(src, out["rgb"], mask_hard[:, index], self.config.feather_px)
         return {
             "restored": restored,
             "raw": out["rgb"],
@@ -722,7 +749,12 @@ class VideoCleaner(nn.Module):
                     mask_any[i] = m
                     best_conf[i] = out["confidence"][0, 0].float() * m
         fused = acc / weight.clamp_min(1e-6)
-        restored = torch.where(mask_any, fused.to(video.dtype), video)
+        # mask_any, her pencerenin (yumuşatma bölgesi dahil) birleşimidir; yumuşatma burada çekirdek
+        # maskeye göre yeniden hesaplanır ki örtüşen pencereler kenarda tutarlı olsun.
+        core = mask_any
+        if self.config.feather_px > 0:
+            core = -F.max_pool2d(-mask_any.float(), 2 * self.config.feather_px + 1, stride=1, padding=self.config.feather_px) > 0.5
+        restored, mask_any = feather_blend(video, fused, core, self.config.feather_px)
         return {"restored": restored, "mask": mask_any, "confidence": best_conf}
 
 

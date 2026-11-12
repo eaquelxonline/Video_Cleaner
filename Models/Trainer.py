@@ -1441,7 +1441,9 @@ def selftest(device: torch.device) -> None:
     roi = cropped["roi"]
     check("ROI tüpü: küçük maskede kırpım, dışarısı bit-exact",
           isinstance(roi, tuple) and roi != (0, 0, 0, 0) and (roi[1] - roi[0]) * (roi[3] - roi[2]) < 64 * 96
-          and torch.equal(cropped["restored"][~small.expand_as(batch["frames"])], batch["frames"][~small.expand_as(batch["frames"])]),
+          and torch.equal(cropped["restored"][~cropped["mask"].expand_as(batch["frames"])], batch["frames"][~cropped["mask"].expand_as(batch["frames"])])
+          # yumuşatma bandı maskeden en fazla feather_px taşar
+          and bool((cropped["mask"] <= dilate(small, full.config.feather_px)).all()),
           f"ROI {roi}")
 
     # SEDiT tarzı bağlam aktarımı: Mod B penceresi bir özet üretir; FiLM sıfırla başladığı için
