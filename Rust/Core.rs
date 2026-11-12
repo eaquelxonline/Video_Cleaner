@@ -3596,6 +3596,149 @@ impl Engine {
 }
 
 // ============================================================================
+// 9b. Yeniden kullanım planlayıcısı — SAD ile algılayıcı atlama ve statik yama yeniden kullanımı
+// ============================================================================
+
+/// Kare başına hangi sinir ağı aşamalarının gerçekten çalışacağına karar verir (telefonda süre).
+///
+/// Gözlem: altyazı ortalama 2–3 sn (60–90 kare) aynı yerde sabit durur, filigran hiç kıpırdamaz.
+/// Altyazı şeridinin (ROI) parlaklık düzlemi bir önceki kareyle Assembly `sad_u8` ile karşılaştırılır
+/// (piksel başına ortalama mutlak fark):
+///
+/// * **Algılayıcı**: şerit belirgin değişmediyse (`det_threshold`) önceki maske kullanılır; yine de en
+///   geç her `det_period` karede bir çalışır (yavaş beliren/solan yazıyı kaçırmamak için).
+/// * **Yama yeniden kullanımı**: şerit neredeyse aynıysa (`reuse_threshold`) ve maske değişmediyse bir
+///   önceki onarılmış yama aynen kullanılır, akış + onarım çalışmaz. Kayma birikmesin diye en fazla
+///   `max_reuse` kare art arda; sonra zorla yeniden hesaplanır.
+///
+/// Planlayıcı yalnızca karar verir; maske/yamayı saklamak çağıranın (halka tampon) işidir.
+pub mod reuse {
+    use crate::kernels;
+
+    /// Eşikler (piksel başına ortalama mutlak fark, 0..255 ölçeğinde).
+    #[derive(Clone, Copy, Debug)]
+    pub struct Config {
+        pub det_threshold: f32,
+        pub det_period: u32,
+        pub reuse_threshold: f32,
+        pub max_reuse: u32,
+    }
+
+    impl Default for Config {
+        fn default() -> Self {
+            Self {
+                det_threshold: 2.0,
+                det_period: 10,
+                reuse_threshold: 0.5,
+                max_reuse: 60,
+            }
+        }
+    }
+
+    /// Bir kare için karar.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Plan {
+        /// Algılayıcı bu karede çalışsın mı (yoksa önceki maske).
+        pub run_detector: bool,
+        /// Önceki onarılmış yama aynen kullanılsın mı (akış + onarım atlanır).
+        pub reuse_patch: bool,
+        /// Ölçülen şerit farkı × 100 (tanılama; tam sayı).
+        pub sad_x100: u32,
+    }
+
+    #[derive(Clone, Debug, Default)]
+    pub struct Stats {
+        pub frames: u64,
+        pub detector_runs: u64,
+        pub reused: u64,
+    }
+
+    pub struct Planner {
+        cfg: Config,
+        prev: Vec<u8>,
+        since_detector: u32,
+        reuse_run: u32,
+        pub stats: Stats,
+    }
+
+    impl Planner {
+        pub fn new(cfg: Config) -> Self {
+            Self {
+                cfg,
+                prev: Vec::new(),
+                since_detector: 0,
+                reuse_run: 0,
+                stats: Stats::default(),
+            }
+        }
+
+        /// Yeni sahne / sahne kesmesi: bir sonraki kare her şeyi baştan hesaplar.
+        pub fn reset(&mut self) {
+            self.prev.clear();
+            self.since_detector = 0;
+            self.reuse_run = 0;
+        }
+
+        /// `band`: şeridin parlaklık baytları (her karede aynı boyut). `mask_changed`: bu karede
+        /// kullanılacak maske bir öncekinden farklı mı (algılayıcı çalıştıysa çağıran bildirir;
+        /// planlama algılayıcıdan önce yapıldığı için ilk çağrıda `false` verilip algılayıcı
+        /// çalıştıktan sonra [`Planner::confirm_mask`] ile düzeltilebilir).
+        pub fn plan(&mut self, band: &[u8], mask_changed: bool) -> Plan {
+            self.stats.frames += 1;
+            let fresh = self.prev.len() != band.len();
+            let sad = if fresh || band.is_empty() {
+                f32::INFINITY
+            } else {
+                kernels::sad_u8(band, &self.prev) as f32 / band.len() as f32
+            };
+            if fresh {
+                self.prev = band.to_vec();
+            } else {
+                self.prev.copy_from_slice(band);
+            }
+            let run_detector = fresh
+                || sad > self.cfg.det_threshold
+                || self.since_detector + 1 >= self.cfg.det_period;
+            self.since_detector = if run_detector {
+                0
+            } else {
+                self.since_detector + 1
+            };
+            let reuse_patch = !fresh
+                && !run_detector
+                && !mask_changed
+                && sad <= self.cfg.reuse_threshold
+                && self.reuse_run < self.cfg.max_reuse;
+            self.reuse_run = if reuse_patch { self.reuse_run + 1 } else { 0 };
+            if run_detector {
+                self.stats.detector_runs += 1;
+            }
+            if reuse_patch {
+                self.stats.reused += 1;
+            }
+            Plan {
+                run_detector,
+                reuse_patch,
+                sad_x100: if sad.is_finite() {
+                    (sad * 100.0) as u32
+                } else {
+                    u32::MAX
+                },
+            }
+        }
+
+        /// Algılayıcı çalıştıktan sonra maske değiştiyse yeniden kullanım iptal edilir.
+        pub fn confirm_mask(&mut self, plan: &mut Plan, mask_changed: bool) {
+            if mask_changed && plan.reuse_patch {
+                plan.reuse_patch = false;
+                self.reuse_run = 0;
+                self.stats.reused -= 1;
+            }
+        }
+    }
+}
+
+// ============================================================================
 // 9c. SPS/VUI yeniden yazıcı (H.264 + HEVC) — renk ve piksel en-boy oranı
 // ============================================================================
 
@@ -8019,5 +8162,86 @@ mod vui_tests {
         };
         let out = rewrite_annexb(codec, &data, t).unwrap().unwrap_or(data);
         std::fs::write(output, out).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod reuse_tests {
+    use super::reuse::*;
+
+    fn band(level: u8, len: usize) -> Vec<u8> {
+        (0..len)
+            .map(|i| level.wrapping_add((i % 7) as u8))
+            .collect()
+    }
+
+    #[test]
+    fn static_band_runs_detector_periodically_and_reuses_patch() {
+        let mut p = Planner::new(Config::default());
+        let b = band(100, 512 * 128);
+        let plans: Vec<Plan> = (0..30).map(|_| p.plan(&b, false)).collect();
+        // ilk kare her şeyi hesaplar
+        assert!(plans[0].run_detector && !plans[0].reuse_patch);
+        // algılayıcı en geç her 10 karede bir
+        let runs: Vec<usize> = plans
+            .iter()
+            .enumerate()
+            .filter(|(_, x)| x.run_detector)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(runs, vec![0, 10, 20]);
+        // algılayıcının çalışmadığı statik karelerde yama yeniden kullanılır
+        assert!(
+            plans
+                .iter()
+                .filter(|x| !x.run_detector)
+                .all(|x| x.reuse_patch)
+        );
+        assert_eq!(p.stats.detector_runs, 3);
+        assert_eq!(p.stats.reused, 27);
+    }
+
+    #[test]
+    fn change_forces_detector_and_blocks_reuse() {
+        let mut p = Planner::new(Config::default());
+        let a = band(100, 4096);
+        let c = band(140, 4096);
+        p.plan(&a, false);
+        assert!(p.plan(&a, false).reuse_patch);
+        let changed = p.plan(&c, false);
+        assert!(changed.run_detector && !changed.reuse_patch, "{changed:?}");
+        // maske değiştiyse yama kullanılmaz
+        let mut next = p.plan(&c, false);
+        assert!(next.reuse_patch);
+        p.confirm_mask(&mut next, true);
+        assert!(!next.reuse_patch);
+        // küçük ama eşik üstü fark: algılayıcı yok, yeniden kullanım yok
+        let mut d = c.clone();
+        for x in d.iter_mut().step_by(2) {
+            *x = x.wrapping_add(2);
+        }
+        let small = p.plan(&d, false);
+        assert!(!small.run_detector && !small.reuse_patch, "{small:?}");
+    }
+
+    #[test]
+    fn reuse_is_capped_and_reset_restarts() {
+        let cfg = Config {
+            det_period: 1000,
+            max_reuse: 5,
+            ..Config::default()
+        };
+        let mut p = Planner::new(cfg);
+        let b = band(9, 1024);
+        let reuse: Vec<bool> = (0..13).map(|_| p.plan(&b, false).reuse_patch).collect();
+        assert_eq!(
+            reuse,
+            vec![
+                false, true, true, true, true, true, false, true, true, true, true, true, false
+            ]
+        );
+        p.reset();
+        let first = p.plan(&b, false);
+        assert!(first.run_detector && !first.reuse_patch);
     }
 }
