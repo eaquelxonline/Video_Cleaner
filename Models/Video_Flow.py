@@ -34,7 +34,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from Core import check_window, run_block, warp
+from Core import check_window, coords_grid, run_block, warp
 
 
 @dataclass
@@ -48,6 +48,13 @@ class FlowConfig:
     iters: int = 6
     use_checkpoint: bool = False
     infer_chunk: int = 4            # çıkarımda kodlayıcı ve büyütme kaçar kare/çift işlesin (0 = hepsi)
+    # "global": döngüsüz — 1/8 ölçekte TEK MatMul tüm-çiftler korelasyonu + softmax beklenen yer değiştirme
+    # (GMFlow/NeuFlow ailesi) ve ``refine_steps`` sabit adımlı ayrılabilir evrişimle iyileştirme. Telefonda
+    # GridSample ve yinelemeli korelasyon araması yoktur (RAFT yolu ONNX'te ~104 bin düğüme açılıyordu).
+    # "raft": önceki yinelemeli GRU + yerel korelasyon piramidi.
+    kind: str = "global"
+    refine_steps: int = 2
+    query_chunk: int = 4096         # çıkarımda büyük karelerde korelasyon kaç sorgu konumunda dilimlensin
 
 
 def _norm(channels: int) -> nn.GroupNorm:
@@ -147,14 +154,71 @@ def convex_upsample(flow: torch.Tensor, weights: torch.Tensor, factor: int = 8) 
     return up.permute(0, 1, 4, 2, 5, 3).reshape(n, 2, factor * h, factor * w)
 
 
+class GlobalRefine(nn.Module):
+    """Döngüsüz akış iyileştirme: sabit sayıda adım, her adımda ayrılabilir (1×7, 7×1) evrişim + akış artışı."""
+
+    def __init__(self, hidden: int, context: int, steps: int):
+        super().__init__()
+        cin = hidden + context + 2 + 1 + 2          # gizli, bağlam, akış, maske, eşleşme istatistikleri
+        self.inp = nn.ModuleList([nn.Conv2d(cin, hidden, 3, padding=1) for _ in range(steps)])
+        self.mix = nn.ModuleList([
+            nn.Sequential(nn.Conv2d(hidden, hidden, (1, 7), padding=(0, 3)), nn.GELU(), nn.Conv2d(hidden, hidden, (7, 1), padding=(3, 0)))
+            for _ in range(steps)
+        ])
+        self.out = nn.ModuleList([nn.Conv2d(hidden, 2, 3, padding=1) for _ in range(steps)])
+        for conv in self.out:
+            nn.init.zeros_(conv.weight)
+            nn.init.zeros_(conv.bias)
+
+    def forward(self, net, context, flow, mask, stats, step: int):
+        z = F.gelu(self.inp[step](torch.cat([net, context, flow, mask, stats], dim=1)))
+        z = z + self.mix[step](z)
+        return z, flow + self.out[step](z)
+
+
+def global_match(f1: torch.Tensor, f2: torch.Tensor, mask2: torch.Tensor, query_chunk: int = 0):
+    """Tüm-çiftler korelasyonu tek MatMul: f1 [N, C, h, w] konumları f2'nin TÜM konumlarıyla eşleşir.
+
+    Dönen: (beklenen yer değiştirme [N, 2, h, w] piksel, istatistik [N, 2, h, w] = en yüksek olasılık ve
+    normalize entropi). Hedefteki kaplama (maske) konumları eşleşmeden düşürülür: altyazı ekranda sabit
+    durduğundan onunla eşleşmek "hareketsiz" yanlış akış üretir.
+    """
+    n, c, h, w = f1.shape
+    q = f1.flatten(2).transpose(1, 2) * c ** -0.5                          # [N, hw, C]
+    k = f2.flatten(2)                                                      # [N, C, hw]
+    grid = coords_grid(h, w, f1.device, f1.dtype).flatten(2).transpose(1, 2)   # [1, hw, 2]
+    bias = (mask2.flatten(2) * -10.0)                                      # [N, 1, hw]
+
+    def block(qs: torch.Tensor, start: int):
+        prob = torch.softmax(torch.matmul(qs, k) + bias, dim=-1)           # [N, q, hw]
+        target = torch.matmul(prob, grid.expand(n, -1, -1))               # [N, q, 2]
+        disp = target - grid[:, start: start + qs.shape[1]]
+        peak = prob.max(dim=-1).values
+        entropy = -(prob * torch.log(prob.clamp_min(1e-9))).sum(-1) / torch.log(torch.tensor(float(h * w)))
+        return disp, torch.stack([peak, entropy], dim=-1)
+
+    total = h * w
+    if not torch.is_grad_enabled() and 0 < query_chunk < total:
+        parts = [block(q[:, i: i + query_chunk], i) for i in range(0, total, query_chunk)]
+        disp, stats = torch.cat([p[0] for p in parts], 1), torch.cat([p[1] for p in parts], 1)
+    else:
+        disp, stats = block(q, 0)
+    return disp.transpose(1, 2).reshape(n, 2, h, w), stats.transpose(1, 2).reshape(n, 2, h, w)
+
+
 class VideoFlow(nn.Module):
     def __init__(self, config: Optional[FlowConfig] = None):
         super().__init__()
         cfg = self.config = config or FlowConfig()
         self.feature_net = Encoder(cfg.encoder_widths, cfg.feature_dim)
         self.context_net = Encoder(cfg.encoder_widths, cfg.hidden_dim + cfg.context_dim)
-        corr_channels = cfg.corr_levels * (2 * cfg.corr_radius + 1) ** 2
-        self.update = UpdateBlock(corr_channels, cfg.hidden_dim, cfg.context_dim)
+        if cfg.kind == "global":
+            self.refine = GlobalRefine(cfg.hidden_dim, cfg.context_dim, cfg.refine_steps)
+        elif cfg.kind == "raft":
+            corr_channels = cfg.corr_levels * (2 * cfg.corr_radius + 1) ** 2
+            self.update = UpdateBlock(corr_channels, cfg.hidden_dim, cfg.context_dim)
+        else:
+            raise ValueError(f"bilinmeyen akış türü: {cfg.kind}")
         self.up_mask = nn.Sequential(nn.Conv2d(cfg.hidden_dim, 256, 3, padding=1), nn.ReLU(), nn.Conv2d(256, 64 * 9, 1))
         self.conf_head = nn.Sequential(nn.Conv2d(cfg.hidden_dim, 64, 3, padding=1), nn.ReLU(), nn.Conv2d(64, 1, 1))
 
@@ -186,7 +250,36 @@ class VideoFlow(nn.Module):
         net, delta = self.update(net, context, corr, flow, mask)
         return net, flow + delta
 
+    # ---- Döngüsüz (global) yol ve hibrit çıkarım bölmesi ----------------------------------------
+    # Telefon: ``encode_frame`` her kare için BİR kez (özellikler halka tamponda), ``pair`` her çift için.
+
+    def encode_frame(self, frame_mask: torch.Tensor):
+        """frame_mask [N, 4, H, W] (RGB + maske) → (eşleştirme özelliği, bağlam), ikisi de 1/8 ölçek."""
+        return self.feature_net(frame_mask), self.context_net(frame_mask)
+
+    def pair(self, f1, f2, c1, mask1_lr, mask2_lr, h: int, w: int, keep_history: bool = False):
+        """Tek yön çift akışı (kaynak → hedef). Dönen: (tam çözünürlüklü akış listesi, güven logiti)."""
+        cfg = self.config
+        net, context = torch.split(c1, [cfg.hidden_dim, cfg.context_dim], dim=1)
+        net, context = torch.tanh(net), F.relu(context)
+        flow, stats = global_match(f1, f2, mask2_lr, cfg.query_chunk)
+        history: List[torch.Tensor] = []
+        if keep_history:
+            history.append(self._upsample(flow, net))
+        for step in range(cfg.refine_steps):
+            net, flow = self.refine(net, context, flow, mask1_lr, stats, step)
+            if keep_history or step == cfg.refine_steps - 1:
+                history.append(self._upsample(flow, net))
+        conf = F.interpolate(self.conf_head(net), size=(h, w), mode="bilinear", align_corners=False)
+        return history, conf
+
+    def _refine_global(self, fmap, cmap, mask_lr, src, dst, h: int, w: int):
+        history, conf = self.pair(fmap[src], fmap[dst], cmap[src], mask_lr[src], mask_lr[dst], h, w, keep_history=self.training)
+        return history, conf
+
     def _refine(self, fmap, cmap, mask_lr, src, dst, h: int, w: int):
+        if self.config.kind == "global":
+            return self._refine_global(fmap, cmap, mask_lr, src, dst, h, w)
         """Verilen (kaynak, hedef) kare çiftleri için yinelemeli akış iyileştirmesi.
 
         Dönen: (tam çözünürlüklü akışların listesi — eğitimde her yineleme, çıkarımda yalnızca

@@ -67,9 +67,9 @@ from Core import (  # noqa: E402
     HALF, PARAM_BUDGET, TARGET_A, WINDOW, EngineConfig, VideoCleaner, composite, coords_grid,
     count_parameters, dilate, format_parameter_report, haar_dwt, linear_to_srgb, srgb_to_linear, warp,
 )
-from Video_Detector import DetectorConfig  # noqa: E402
-from Video_Flow import FlowConfig  # noqa: E402
-from Video_Mamba import MambaConfig  # noqa: E402
+from Video_Detector import HEADS as DETECTOR_HEADS, DetectorConfig, VideoDetector  # noqa: E402
+from Video_Flow import FlowConfig, VideoFlow  # noqa: E402
+from Video_Mamba import MambaConfig, VideoMamba  # noqa: E402
 
 Batch = Dict[str, torch.Tensor]
 
@@ -1351,6 +1351,55 @@ def selftest(device: torch.device) -> None:
     report = full.parameter_report()
     print(format_parameter_report(report))
     check("parametre bütçeleri aşılmıyor", all(report[k]["params"] <= PARAM_BUDGET[k] for k in PARAM_BUDGET))
+
+    # Mamba-2 SSD matris biçimi = ardışık özyineleme (dolgu kareleri dahil), çift hassasiyette
+    from Video_Mamba import SSDMixer
+    ssd = SSDMixer(64, 8, 3, 8).double()
+    xs = torch.randn(9, WINDOW, 64, dtype=torch.float64)
+    vs = torch.rand(9, WINDOW) > 0.2
+    xp, dtp, bp, cp = ssd.project(xs, vs)
+    gap = float((ssd._mix(xp, dtp, bp, cp) - ssd.reference(xp, dtp, bp, cp)).abs().max())
+    check("SSD (matris) = ardışık tarama", gap < 1e-10, f"maks fark {gap:.1e}")
+
+    # Hibrit çıkarım bölmesi (telefon): kare başına kodlayıcı + zamansal çekirdek + kare başına çözücü
+    # bileşimi tam modelle aynı olmalı. Sıfırla başlayan çıkış başlıkları rastgele doldurulur ki çözücü
+    # gerçekten sınansın.
+    with torch.no_grad():
+        tiny = tiny_engine_config()
+        det, mam = VideoDetector(tiny.detector).eval(), VideoMamba(tiny.mamba).eval()
+        for head in (det.head[2], mam.head[2]):
+            head.weight.normal_(0, 0.05)
+            head.bias.normal_(0, 0.05)
+        th, tw = 64, 96
+        fr = torch.rand(1, WINDOW, 3, th, tw)
+        vd = torch.ones(1, WINDOW, dtype=torch.bool)
+        vd[0, -4:] = False
+        ref = det(fr, vd)
+        ref = torch.cat([ref[n] for n, _ in DETECTOR_HEADS], 2)[0]
+        a0, a1, a8 = det.encode_frame(fr[0])
+        a8, a16 = det.temporal_core(a8, vd)
+        gap_d = float((det.decode_frame(a16, a0, a1, a8) - ref).abs().max())
+        msk = (torch.rand(1, WINDOW, 1, th, tw) > 0.8).float()
+        pri = {k: torch.rand(1, WINDOW, c, th, tw) for k, c in (("bg_gamma", 3), ("bg_linear", 3), ("analytic_conf", 1), ("pulled", 3), ("pulled_conf", 1))}
+        ctx = torch.randn(1, tiny.mamba.widths[3])
+        full_out = mam(fr, msk, pri, vd, context_state=ctx)
+        packed = torch.cat([fr, msk, pri["bg_gamma"], pri["bg_linear"], pri["analytic_conf"], pri["pulled"], pri["pulled_conf"]], 2)[0]
+        m1, m2, m8 = mam.encode_frame(packed * vd[0].view(-1, 1, 1, 1).float())
+        m3, m16, nxt = mam.temporal_core(m8, vd, ctx)
+        rgb, conf = mam.decode_frame(packed, m16, m3, m2, m1)
+        gap_m = max(float((rgb - full_out["rgb"][0]).abs().max()), float((conf - full_out["confidence"][0]).abs().max()),
+                    float((nxt - full_out["context_state"]).abs().max()))
+        flw = VideoFlow(tiny.flow).eval()
+        for conv in flw.refine.out:
+            conv.weight.normal_(0, 0.05)
+        fo = flw(fr, msk, vd)
+        fmap, cmap = flw.encode_frame(torch.cat([fr, msk], 2)[0])
+        mlr = F.avg_pool2d(msk[0], 8)
+        hist, cf = flw.pair(fmap[:-1], fmap[1:], cmap[:-1], mlr[:-1], mlr[1:], th, tw)
+        ok_pairs = (vd[0, :-1] & vd[0, 1:]).view(-1, 1, 1, 1)
+        gap_f = float(((hist[-1] - fo["flow_fw"][0]) * ok_pairs).abs().max())
+    check("hibrit bölme (kare/çekirdek/kare) = tam model", gap_d < 1e-4 and gap_m < 1e-4 and gap_f < 1e-4,
+          f"algılayıcı {gap_d:.1e}, Mamba {gap_m:.1e}, akış {gap_f:.1e}")
 
     cfg = TrainConfig(tiny=True, crop=(64, 96), workers=0, accum=1, checkpointing=False, val_every=0, warmup=2)
     sample = ClipSynthesizer(cfg, 7).sample()

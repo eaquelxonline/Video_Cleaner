@@ -130,6 +130,45 @@ class VideoDetector(nn.Module):
                 x = run_block(blk, x, use_checkpoint=self.config.use_checkpoint)
         return self.head(x)
 
+    # ---- Hibrit çıkarım (telefon): kare başına kodlayıcı / 30 karelik zamansal çekirdek / kare başına çözücü.
+    # Ara özellikler grafiğin dışında (Rust halka tamponu) tutulur; her kare BİR kez kodlanır. Üçünün
+    # bileşimi ``forward`` ile aynı sonucu verir (selftest denetler).
+
+    def encode_frame(self, frame: torch.Tensor):
+        """frame [N, 3, H, W] → (1/2 atlama, 1/4 atlama, 1/8 zamansal öncesi özellik)."""
+        x = self.stem(frame)
+        skips = []
+        for i in range(3):
+            for blk in self.enc[i]:
+                x = blk(x)
+            if i < 2:
+                skips.append(x)
+                x = self.down[i](x)
+        return skips[0], skips[1], x
+
+    def temporal_core(self, x8: torch.Tensor, valid: torch.Tensor):
+        """x8 [T, C₂, h, w] (bir pencere), valid [1, T] → (1/8 atlama, 1/16 özellik); kareler arası tek aşama."""
+        vf = valid.to(x8.dtype)
+        for mix in self.temporal8:
+            x8 = mix(x8, vf)
+        x = self.down[2](x8)
+        for blk in self.enc[3]:
+            x = blk(x)
+        for mix in self.temporal16:
+            x = mix(x, vf)
+        return x8, x
+
+    def decode_frame(self, x16: torch.Tensor, s0: torch.Tensor, s1: torch.Tensor, s2: torch.Tensor) -> torch.Tensor:
+        """Kare başına çözücü → [N, 8, H, W] (alfa ve kaplama rengi sigmoid sonrası, diğerleri logit)."""
+        out = self._decode(x16, [s0, s1, s2])
+        offset = 0
+        parts = []
+        for name, channels in HEADS:
+            part = out[:, offset: offset + channels]
+            parts.append(torch.sigmoid(part) if name in ("alpha", "fg_rgb") else part)
+            offset += channels
+        return torch.cat(parts, dim=1)
+
     def forward(self, frames: torch.Tensor, valid: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
         valid = check_window(frames, valid)
         ckpt, chunk = self.config.use_checkpoint, self.config.infer_chunk

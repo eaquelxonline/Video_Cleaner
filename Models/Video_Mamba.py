@@ -69,6 +69,10 @@ class MambaConfig:
     attn_window: int = 8
     attn_heads: int = 8
     ssm_fp32: bool = True
+    # "ssd": Mamba-2 SSD matris biçimi (başlık başına skaler sönüm; zaman döngüsü yok, yalnızca MatMul) —
+    # telefon NPU/XNNPACK için. "selective": Mamba-1 ardışık taraması (kanal × durum başına sönüm).
+    ssm_kind: str = "ssd"
+    ssm_heads: int = 8
     use_checkpoint: bool = False
     infer_chunk: int = 4            # çıkarımda kare başına bloklar kaçar kare işlesin (0 = hepsi)
     ssm_token_chunk: int = 2048     # çıkarımda zamansal tarama kaçar uzamsal konum işlesin (0 = hepsi)
@@ -142,20 +146,104 @@ class SelectiveSSM(nn.Module):
         return y + x * self.D
 
 
+class SSDMixer(nn.Module):
+    """Mamba-2 SSD (durum uzayı ikiliği) karıştırıcısı — zaman döngüsü olmadan, yalnızca matris çarpımı.
+
+    Başlık h için skaler sönüm a_h < 0 ve girdiye bağlı adım Δ_t,h ile özyineleme
+
+        h_t = exp(Δ_t a_h) · h_{t-1} + Δ_t B_t x_t        y_t = C_t · h_t + D x_t
+
+    kapalı biçimde  y_t = Σ_{s≤t} exp(Λ_t − Λ_s) · (C_t·B_s) · Δ_s x_s  (Λ_t = Σ_{k≤t} Δ_k a_h) olur, yani
+
+        Y = (L ⊙ C Bᵀ) (Δ ⊙ X) + D X,     L[t, s] = exp(Λ_t − Λ_s) (s ≤ t), 0 (s > t)
+
+    T = 30 olduğundan L yalnızca 30×30'dur: ardışık 30 adımlık döngü (dışa aktarımda ~50 bin düğüm,
+    gigabaytlarca ara tampon) yerine birkaç MatMul. Dolgu karesinde Δ = 0 → sönüm 1, yazma 0: durum
+    aynen taşınır (Mamba-1 sürümündeki ``torch.where`` ile aynı anlam). Girdi/çıktı: [N, T, D].
+    """
+
+    def __init__(self, dim: int, state: int = 8, conv: int = 3, heads: int = 8, fp32: bool = True):
+        super().__init__()
+        heads = math.gcd(dim, heads) if dim % heads else heads
+        self.dim, self.state, self.heads, self.fp32 = dim, state, heads, fp32
+        self.conv = nn.Conv1d(dim, dim, conv, padding=conv - 1, groups=dim)
+        self.x_proj = nn.Linear(dim, 2 * state + heads, bias=False)
+        self.dt_bias = nn.Parameter(torch.empty(heads))
+        # Mamba-2 başlangıcı: a_h = −exp(A_log) ∈ [−16, −1], Δ ∈ [1e-3, 1e-1].
+        self.A_log = nn.Parameter(torch.log(torch.empty(heads).uniform_(1.0, 16.0)))
+        self.D = nn.Parameter(torch.ones(dim))
+        with torch.no_grad():
+            dt = torch.exp(torch.rand(heads) * (math.log(0.1) - math.log(1e-3)) + math.log(1e-3))
+            self.dt_bias.copy_(dt + torch.log(-torch.expm1(-dt)))
+
+    def _mix(self, x: torch.Tensor, dt: torch.Tensor, b: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+        n, t, d = x.shape
+        hh, p = self.heads, d // self.heads
+        a = -torch.exp(self.A_log.to(x.dtype))                                # [H]
+        lam = torch.cumsum(dt * a, dim=1).transpose(1, 2)                    # [N, H, T]
+        diff = lam.unsqueeze(-1) - lam.unsqueeze(-2)                         # [N, H, T, T]: Λ_t − Λ_s
+        causal = torch.ones(t, t, dtype=torch.bool, device=x.device).tril()
+        decay = torch.exp(torch.where(causal, diff, -1e4))                   # s > t: exp(−1e4) = 0
+        gram = torch.matmul(c, b.transpose(1, 2)).unsqueeze(1)               # [N, 1, T, T]: C_t · B_s
+        xh = (x.view(n, t, hh, p) * dt.unsqueeze(-1)).transpose(1, 2)        # [N, H, T, P]: Δ_s x_s
+        y = torch.matmul(decay * gram, xh)                                   # [N, H, T, P]
+        return y.transpose(1, 2).reshape(n, t, d)
+
+    def reference(self, x: torch.Tensor, dt: torch.Tensor, b: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+        """Aynı özyinelemenin ardışık hâli (yalnızca testlerde eşdeğerlik denetimi için)."""
+        n, t, d = x.shape
+        hh, p = self.heads, d // self.heads
+        a = -torch.exp(self.A_log.to(x.dtype))
+        h = x.new_zeros(n, hh, p, self.state)
+        ys = []
+        for i in range(t):
+            decay = torch.exp(dt[:, i] * a)[:, :, None, None]
+            write = (x[:, i].view(n, hh, p) * dt[:, i, :, None])[..., None] * b[:, i, None, None, :]
+            h = decay * h + write
+            ys.append((h * c[:, i, None, None, :]).sum(-1).reshape(n, d))
+        return torch.stack(ys, dim=1)
+
+    def project(self, x: torch.Tensor, valid: Optional[torch.Tensor]):
+        """Ortak giriş: nedensel 1B evrişim, B/C/Δ izdüşümü; dolgu karesinde Δ = 0."""
+        t = x.shape[1]
+        x = F.silu(self.conv(x.transpose(1, 2))[..., :t].transpose(1, 2))
+        b, c, dt = self.x_proj(x).split([self.state, self.state, self.heads], dim=-1)
+        dt = F.softplus(dt + self.dt_bias)
+        if valid is not None:
+            dt = dt * valid.unsqueeze(-1).to(dt.dtype)
+        return x, dt, b, c
+
+    def forward(self, x: torch.Tensor, valid: Optional[torch.Tensor] = None) -> torch.Tensor:
+        x, dt, b, c = self.project(x, valid)
+        if self.fp32:
+            with torch.autocast(device_type=x.device.type, enabled=False):
+                y = self._mix(x.float(), dt.float(), b.float(), c.float()).to(x.dtype)
+        else:
+            y = self._mix(x, dt, b, c)
+        return y + x * self.D
+
+
 class BiMamba(nn.Module):
     """Çift yönlü zamansal Mamba bloğu: ileri ve geri tarama, ortak giriş/çıkış izdüşümü.
 
     Girdi/çıktı: [B·T, C, h, w] (kare başına harita); içeride [B·h·w, T, C] dizisine açılır.
     """
 
-    def __init__(self, dim: int, expand: int = 2, state: int = 8, conv: int = 3, fp32: bool = True, token_chunk: int = 0):
+    def __init__(self, dim: int, expand: int = 2, state: int = 8, conv: int = 3, fp32: bool = True, token_chunk: int = 0,
+                 kind: str = "ssd", heads: int = 8):
         super().__init__()
         inner = dim * expand
         self.token_chunk = token_chunk
         self.norm = nn.LayerNorm(dim)
         self.in_proj = nn.Linear(dim, 2 * inner)
-        self.fwd = SelectiveSSM(inner, state, conv, fp32)
-        self.bwd = SelectiveSSM(inner, state, conv, fp32)
+        if kind == "ssd":
+            self.fwd: nn.Module = SSDMixer(inner, state, conv, heads, fp32)
+            self.bwd: nn.Module = SSDMixer(inner, state, conv, heads, fp32)
+        elif kind == "selective":
+            self.fwd = SelectiveSSM(inner, state, conv, fp32)
+            self.bwd = SelectiveSSM(inner, state, conv, fp32)
+        else:
+            raise ValueError(f"bilinmeyen ssm_kind: {kind}")
         self.out_proj = nn.Linear(inner, dim)
         nn.init.zeros_(self.out_proj.weight)        # blok özdeşlik olarak başlar
         nn.init.zeros_(self.out_proj.bias)
@@ -235,7 +323,7 @@ class SpatioTemporalBlock(nn.Module):
     def __init__(self, dim: int, cfg: MambaConfig, attention: bool):
         super().__init__()
         self.conv = ConvBlock(dim, cfg.conv_expansion, kernel=7)
-        self.ssm = BiMamba(dim, cfg.ssm_expand, cfg.ssm_state, cfg.ssm_conv, cfg.ssm_fp32, cfg.ssm_token_chunk)
+        self.ssm = BiMamba(dim, cfg.ssm_expand, cfg.ssm_state, cfg.ssm_conv, cfg.ssm_fp32, cfg.ssm_token_chunk, cfg.ssm_kind, cfg.ssm_heads)
         self.attn = WindowAttention(dim, cfg.attn_window, cfg.attn_heads) if attention else None
         self.chunk = cfg.infer_chunk
 
@@ -295,6 +383,52 @@ class VideoMamba(nn.Module):
         pc = priors["pulled_conf"].to(frames.dtype)
         analytic = ac * priors["bg_gamma"].to(frames.dtype) + (1.0 - ac) * frames
         return pc * priors["pulled"].to(frames.dtype) + (1.0 - pc) * analytic
+
+    # ---- Hibrit çıkarım (telefon): kare başına kodlayıcı / 30 karelik zamansal çekirdek / kare başına çözücü.
+    # Girdi kare başına 15 kanallı tek tensördür (kare, maske, bg_gamma, bg_linear, analytic_conf, pulled,
+    # pulled_conf — ``forward`` içindeki sırayla). Atlama özellikleri halka tamponda tutulur; her kare BİR
+    # kez kodlanır, örtüşen iki pencerede yeniden kullanılır. Bileşim ``forward`` ile aynıdır (selftest).
+
+    def encode_frame(self, packed: torch.Tensor):
+        """packed [N, 15, H, W] → (1/2 atlama, 1/4 atlama, 1/8 özellik)."""
+        x = self.embed(packed)
+        for blk in self.enc1:
+            x = blk(x)
+        s1 = x
+        x = self.down[0](x)
+        for blk in self.enc2:
+            x = blk(x)
+        s2 = x
+        return s1, s2, self.down[1](x)
+
+    def temporal_core(self, x8: torch.Tensor, valid: torch.Tensor, context_state: Optional[torch.Tensor] = None):
+        """x8 [T, C₂, h, w], valid [1, T] → (1/8 atlama s3, 1/16 özellik, sonraki pencere özeti)."""
+        vf = valid.to(x8.dtype)
+        b, t = vf.shape
+        x = x8
+        for blk in self.enc3:
+            x = blk(x, vf)
+        s3 = x
+        x = self.down[2](x)
+        if context_state is not None:
+            film = self.context(context_state.to(x.dtype))
+            scale, shift = film.view(b, 1, 2, -1, 1, 1).unbind(2)
+            x = (x.view(b, t, *x.shape[1:]) * (1 + scale) + shift).flatten(0, 1)
+        for blk in self.enc4:
+            x = blk(x, vf)
+        tail = x.view(b, t, *x.shape[1:])[:, -min(t, 15):].float().mean((-2, -1))
+        tail_valid = vf[:, -min(t, 15):].float().unsqueeze(-1)
+        next_state = (tail * tail_valid).sum(1) / tail_valid.sum(1).clamp_min(1.0)
+        return s3, x, next_state
+
+    def decode_frame(self, packed: torch.Tensor, x16: torch.Tensor, s3: torch.Tensor, s2: torch.Tensor, s1: torch.Tensor):
+        """Kare başına çözücü + taban birleştirme → (rgb [N, 3, H, W], güven [N, 1, H, W])."""
+        out = self._decode(x16, s3, s2, s1)
+        frame, ac, gamma, pc, pulled = packed[:, 0:3], packed[:, 10:11], packed[:, 4:7], packed[:, 14:15], packed[:, 11:14]
+        base = pc * pulled + (1.0 - pc) * (ac * gamma + (1.0 - ac) * frame)
+        rgb = (base + out[:, :3]).clamp(0.0, 1.0)
+        log_b = out[:, 3:4].float().clamp(-7.0, 2.0)
+        return rgb, torch.exp(-torch.exp(log_b) / CONFIDENCE_SCALE)
 
     def forward(
         self,
