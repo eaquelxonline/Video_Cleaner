@@ -176,21 +176,28 @@ class SSDMixer(nn.Module):
             dt = torch.exp(torch.rand(heads) * (math.log(0.1) - math.log(1e-3)) + math.log(1e-3))
             self.dt_bias.copy_(dt + torch.log(-torch.expm1(-dt)))
 
-    def _mix(self, x: torch.Tensor, dt: torch.Tensor, b: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+    def _mix(self, x: torch.Tensor, dt: torch.Tensor, b: torch.Tensor, c: torch.Tensor, reverse: bool = False) -> torch.Tensor:
+        """``reverse``: ters yön (geri tarama) dizi ÇEVRİLMEDEN — ters kümülatif toplam ve üst üçgen maske.
+        Çevirerek yapılan geri taramayla aynıdır: y_t = Σ_{s≥t} exp(R_t − R_s)·(C_t·B_s)·Δ_s x_s,
+        R_t = Σ_{k≥t} Δ_k a. Telefonda dizi çevirme ve eksen değişimleri (Transpose) sürenin %39'uydu."""
         n, t, d = x.shape
         hh, p = self.heads, d // self.heads
         a = -torch.exp(self.A_log.to(x.dtype))                                # [H]
-        lam = torch.cumsum(dt * a, dim=1).transpose(1, 2)                    # [N, H, T]
-        diff = lam.unsqueeze(-1) - lam.unsqueeze(-2)                         # [N, H, T, T]: Λ_t − Λ_s
-        causal = torch.ones(t, t, dtype=torch.bool, device=x.device).tril()
-        decay = torch.exp(torch.where(causal, diff, -1e4))                   # s > t: exp(−1e4) = 0
+        step = dt * a
+        lam = (torch.cumsum(step.flip(1), dim=1).flip(1) if reverse else torch.cumsum(step, dim=1)).transpose(1, 2)   # [N, H, T]
+        diff = lam.unsqueeze(-1) - lam.unsqueeze(-2)                         # [N, H, T, T]: Λ_t − Λ_s (ters: R_t − R_s)
+        ones = torch.ones(t, t, dtype=torch.bool, device=x.device)
+        causal = ones.triu() if reverse else ones.tril()
+        decay = torch.exp(torch.where(causal, diff, -1e4))                   # maskelenen: exp(−1e4) = 0
         gram = torch.matmul(c, b.transpose(1, 2)).unsqueeze(1)               # [N, 1, T, T]: C_t · B_s
         xh = (x.view(n, t, hh, p) * dt.unsqueeze(-1)).transpose(1, 2)        # [N, H, T, P]: Δ_s x_s
         y = torch.matmul(decay * gram, xh)                                   # [N, H, T, P]
         return y.transpose(1, 2).reshape(n, t, d)
 
-    def reference(self, x: torch.Tensor, dt: torch.Tensor, b: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+    def reference(self, x: torch.Tensor, dt: torch.Tensor, b: torch.Tensor, c: torch.Tensor, reverse: bool = False) -> torch.Tensor:
         """Aynı özyinelemenin ardışık hâli (yalnızca testlerde eşdeğerlik denetimi için)."""
+        if reverse:
+            return self.reference(x.flip(1), dt.flip(1), b.flip(1), c.flip(1)).flip(1)
         n, t, d = x.shape
         hh, p = self.heads, d // self.heads
         a = -torch.exp(self.A_log.to(x.dtype))
@@ -203,23 +210,37 @@ class SSDMixer(nn.Module):
             ys.append((h * c[:, i, None, None, :]).sum(-1).reshape(n, d))
         return torch.stack(ys, dim=1)
 
-    def project(self, x: torch.Tensor, valid: Optional[torch.Tensor]):
+    def _causal_conv(self, x: torch.Tensor, reverse: bool) -> torch.Tensor:
+        """Derinlik-yönlü nedensel 1B evrişim, eksen değiştirmeden: kaydırılmış dilimlerin ağırlıklı toplamı.
+        ``nn.Conv1d(padding=K−1)[..., :T]`` ile aynı (ters yönde gelecek kareler)."""
+        weight = self.conv.weight[:, 0, :]                                  # [D, K]
+        k, t = weight.shape[1], x.shape[1]
+        out = x * weight[:, k - 1] + self.conv.bias
+        for j in range(k - 1):
+            shift = min(k - 1 - j, t)
+            if reverse:
+                moved = F.pad(x[:, shift:], (0, 0, 0, shift))                 # x[t + shift]
+            else:
+                moved = F.pad(x[:, : t - shift], (0, 0, shift, 0))            # x[t − shift]
+            out = out + moved * weight[:, j]
+        return out
+
+    def project(self, x: torch.Tensor, valid: Optional[torch.Tensor], reverse: bool = False):
         """Ortak giriş: nedensel 1B evrişim, B/C/Δ izdüşümü; dolgu karesinde Δ = 0."""
-        t = x.shape[1]
-        x = F.silu(self.conv(x.transpose(1, 2))[..., :t].transpose(1, 2))
+        x = F.silu(self._causal_conv(x, reverse))
         b, c, dt = self.x_proj(x).split([self.state, self.state, self.heads], dim=-1)
         dt = F.softplus(dt + self.dt_bias)
         if valid is not None:
             dt = dt * valid.unsqueeze(-1).to(dt.dtype)
         return x, dt, b, c
 
-    def forward(self, x: torch.Tensor, valid: Optional[torch.Tensor] = None) -> torch.Tensor:
-        x, dt, b, c = self.project(x, valid)
+    def forward(self, x: torch.Tensor, valid: Optional[torch.Tensor] = None, reverse: bool = False) -> torch.Tensor:
+        x, dt, b, c = self.project(x, valid, reverse)
         if self.fp32:
             with torch.autocast(device_type=x.device.type, enabled=False):
-                y = self._mix(x.float(), dt.float(), b.float(), c.float()).to(x.dtype)
+                y = self._mix(x.float(), dt.float(), b.float(), c.float(), reverse).to(x.dtype)
         else:
-            y = self._mix(x, dt, b, c)
+            y = self._mix(x, dt, b, c, reverse)
         return y + x * self.D
 
 
@@ -268,7 +289,10 @@ class BiMamba(nn.Module):
         """[N, T, C] dizilerinde ileri + geri tarama ve artık bağlantı."""
         u, gate = self.in_proj(self.norm(seq)).chunk(2, dim=-1)
         u = u * ok.unsqueeze(-1).to(u.dtype)
-        y = self.fwd(u, ok) + self.bwd(u.flip(1), ok.flip(1)).flip(1)
+        if isinstance(self.bwd, SSDMixer):
+            y = self.fwd(u, ok) + self.bwd(u, ok, reverse=True)              # çevirmeden geri tarama
+        else:
+            y = self.fwd(u, ok) + self.bwd(u.flip(1), ok.flip(1)).flip(1)
         return seq + self.out_proj(y * F.silu(gate))
 
 

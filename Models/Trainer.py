@@ -1539,9 +1539,13 @@ def selftest(device: torch.device) -> None:
     ssd = SSDMixer(64, 8, 3, 8).double()
     xs = torch.randn(9, WINDOW, 64, dtype=torch.float64)
     vs = torch.rand(9, WINDOW) > 0.2
-    xp, dtp, bp, cp = ssd.project(xs, vs)
-    gap = float((ssd._mix(xp, dtp, bp, cp) - ssd.reference(xp, dtp, bp, cp)).abs().max())
-    check("SSD (matris) = ardışık tarama", gap < 1e-10, f"maks fark {gap:.1e}")
+    gap = 0.0
+    for rev in (False, True):                       # ileri ve (dizi çevrilmeden) geri tarama
+        xp, dtp, bp, cp = ssd.project(xs, vs, rev)
+        gap = max(gap, float((ssd._mix(xp, dtp, bp, cp, rev) - ssd.reference(xp, dtp, bp, cp, rev)).abs().max()))
+    flip_gap = float((ssd(xs, vs, reverse=True) - ssd(xs.flip(1), vs.flip(1)).flip(1)).abs().max())
+    check("SSD (matris) = ardışık tarama; ters yön = çevrilmiş ileri", gap < 1e-10 and flip_gap < 1e-6,
+          f"maks fark {gap:.1e}, çevirme farkı {flip_gap:.1e}")
 
     # Hibrit çıkarım bölmesi (telefon): kare başına kodlayıcı + zamansal çekirdek + kare başına çözücü
     # bileşimi tam modelle aynı olmalı. Sıfırla başlayan çıkış başlıkları rastgele doldurulur ki çözücü
