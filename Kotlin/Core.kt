@@ -129,6 +129,13 @@ object Core {
         sarWidth: Int, sarHeight: Int, primaries: Int, transfer: Int, matrix: Int, fullRange: Int,
     ): Int
 
+    /**
+     * Annex B H.264 (0) / HEVC (1) parametre kümelerindeki ilk SPS'in VUI değerleri `out`'a (doğrudan tampon,
+     * yerel bayt sırası, 9 × Int): sarW, sarH, renkVar, primaries, transfer, matrix, aralıkVar, tamAralık, vuiVar.
+     * Dönüş: 1 SPS bulundu, 0 yok, negatif hata.
+     */
+    @JvmStatic external fun nativeProbeVui(codec: Int, src: ByteBuffer, offset: Int, length: Int, out: ByteBuffer): Int
+
     @JvmStatic external fun nativePushHardwareBuffer(handle: Long, buffer: HardwareBuffer, cropLeft: Int, cropTop: Int, ptsUs: Long, flags: Int): Long
     @JvmStatic external fun nativeFinish(handle: Long): Int
     @JvmStatic external fun nativeSetHint(handle: Long, seq: Long, hint: Int): Int
@@ -1065,21 +1072,26 @@ private class AudioCopy(private val extractor: MediaExtractor, override val trac
  */
 internal object AacDelayProbe {
     const val FALLBACK_SAMPLES = 2048
-    private val cache = HashMap<String, Int>()
+    private val cache = HashMap<String, Result>()
 
-    /** (gecikme örnek sayısı, ölçüldü mü) */
+    /**
+     * [delay]: ön dolgu (örnek). [tailPad]: kodlayıcı akış sonunda son örnekleri boşaltmıyorsa (ör. Android 11
+     * c2.android.aac.encoder ~2048 örnek kırpıyor) içeriğin sonu kaybolmasın diye EOS'tan önce eklenecek sessizlik.
+     */
+    data class Result(val delay: Int, val tailPad: Int, val measured: Boolean)
+
     @Synchronized
-    fun samples(encoderName: String, format: MediaFormat): Pair<Int, Boolean> {
+    fun samples(encoderName: String, format: MediaFormat): Result {
         val rate = format.getInteger(MediaFormat.KEY_SAMPLE_RATE)
         val channels = format.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
         val key = "$encoderName/$rate/$channels"
-        cache[key]?.let { return it to true }
+        cache[key]?.let { return it }
         val measured = runCatching { measure(encoderName, format, rate, channels) }.getOrNull()
         if (measured != null) cache[key] = measured
-        return (measured ?: FALLBACK_SAMPLES) to (measured != null)
+        return measured ?: Result(FALLBACK_SAMPLES, FALLBACK_SAMPLES, false)
     }
 
-    private fun measure(encoderName: String, format: MediaFormat, rate: Int, channels: Int): Int? {
+    private fun measure(encoderName: String, format: MediaFormat, rate: Int, channels: Int): Result? {
         // 0,25 s sessizlik + 0,5 s sabit tohumlu gürültü + 0,25 s sessizlik (tek kanal içerik, tüm kanallara).
         val lead = rate / 4
         val noise = rate / 2
@@ -1203,7 +1215,12 @@ internal object AacDelayProbe {
             }
         }
         // Güvenilirlik: ilinti, sinyal enerjisinin anlamlı bir kesri olmalı (kodlama kayıplı).
-        return if (bestLag >= 0 && best > 0.3 * energy) bestLag else null
+        if (bestLag < 0 || best <= 0.3 * energy) return null
+        // Kuyruk: kayıpsız boşaltan kodlayıcıda çözülen örnek sayısı ≥ girdi + ön dolgu. Eksikse fark (1024'e
+        // yukarı yuvarlanmış) kadar sessizlik EOS'tan önce eklenmelidir.
+        val missing = total + bestLag - decoded.size
+        val pad = if (missing > 0) (missing + 1023) / 1024 * 1024 else 0
+        return Result(bestLag, pad, true)
     }
 }
 
@@ -1275,6 +1292,7 @@ private class AudioTranscode(private val extractor: MediaExtractor, source: Medi
     private var framesSent = 0L
     private var firstOutputSeen = false
     private var trimFrames = 0L
+    private var tailPadLeft = 0L
 
     init {
         source.setInteger(MediaFormat.KEY_PCM_ENCODING, android.media.AudioFormat.ENCODING_PCM_16BIT)
@@ -1314,12 +1332,14 @@ private class AudioTranscode(private val extractor: MediaExtractor, source: Medi
         format.setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC)
         format.setInteger(MediaFormat.KEY_BIT_RATE, (64_000 * channels).coerceIn(64_000, 320_000))
         val enc = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC)
-        val (delay, measured) = AacDelayProbe.samples(enc.name, format)
-        delayUs = delay * 1_000_000L / rate
+        val probe = AacDelayProbe.samples(enc.name, format)
+        delayUs = probe.delay * 1_000_000L / rate
+        tailPadLeft = probe.tailPad.toLong()
         enc.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
         enc.start()
         encoder = enc
-        timingNote = "AAC ön dolgusu ${delay} örnek (${if (measured) "cihazda ölçüldü" else "ölçülemedi, varsayılan"}, ${enc.name})"
+        timingNote = "AAC ön dolgusu ${probe.delay} örnek (${if (probe.measured) "cihazda ölçüldü" else "ölçülemedi, varsayılan"}, ${enc.name})" +
+            if (probe.tailPad > 0) "; kodlayıcı akış sonunu kırpıyor: sona ${probe.tailPad} örnek sessizlik" else ""
     }
 
     /** İlk dolu çözücü çıkışı: Opus ön atlamasını çözücü attı mı? Atmadıysa burada atılır. */
@@ -1333,6 +1353,14 @@ private class AudioTranscode(private val extractor: MediaExtractor, source: Medi
         val kept = frames >= expected - 1
         trimFrames = if (kept) preSkip else 0L
         timingNote += "; Opus ön atlaması ${preSkip} örnek: çözücü ${if (kept) "atmadı, burada atıldı" else "attı"}"
+        // Fazla atma: bazı çıkarıcı+çözücü çiftleri (MP4 Opus, düzenleme listesi + csd-1) ön atlamayı iki kez
+        // uyguluyor ve ilk duyulur örnekler kayboluyor. Kayıp geri gelmez; zaman çizelgesi o kadar kaydırılır ki
+        // kalan ses görüntüyle hizalı kalsın.
+        val deficit = expected - preSkip - frames
+        if (!kept && deficit > 1) {
+            baseUs += deficit * 1_000_000L / sampleRate
+            timingNote += "; çözücü ${deficit} örnek fazla attı: ses ${deficit * 1000 / sampleRate} ms kaydırıldı"
+        }
     }
 
     private fun step(muxer: MediaMuxer?, track: Int) {
@@ -1415,8 +1443,18 @@ private class AudioTranscode(private val extractor: MediaExtractor, source: Medi
             } else if (decoderDone && !eosQueued) {
                 val index = enc.dequeueInputBuffer(0)
                 if (index >= 0) {
-                    enc.queueInputBuffer(index, 0, 0, baseUs + framesSent * 1_000_000L / sampleRate, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
-                    eosQueued = true
+                    if (tailPadLeft > 0) {
+                        // Akış sonunu kırpan kodlayıcı için sessizlik (bkz. AacDelayProbe.Result.tailPad).
+                        val target = enc.getInputBuffer(index) ?: throw JobException("Ses kodlayıcı girişi alınamadı")
+                        val frames = minOf((target.remaining() / frameBytes).toLong(), tailPadLeft).toInt()
+                        repeat(frames * frameBytes) { target.put(0.toByte()) }
+                        enc.queueInputBuffer(index, 0, frames * frameBytes, baseUs + framesSent * 1_000_000L / sampleRate, 0)
+                        framesSent += frames
+                        tailPadLeft -= frames
+                    } else {
+                        enc.queueInputBuffer(index, 0, 0, baseUs + framesSent * 1_000_000L / sampleRate, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                        eosQueued = true
+                    }
                 }
             }
             // 4) AAC → çoklayıcı (veya çoklayıcı başlayana kadar kuyruk)
@@ -1478,6 +1516,106 @@ private class AudioTranscode(private val extractor: MediaExtractor, source: Medi
             if (format.getString(MediaFormat.KEY_MIME) != MediaFormat.MIMETYPE_AUDIO_OPUS) return firstSampleUs
             val preSkipUs = opusPreSkipNs(format) / 1_000
             return if (preSkipUs > 0 && firstSampleUs <= -preSkipUs / 2) firstSampleUs + preSkipUs else firstSampleUs
+        }
+    }
+}
+
+/**
+ * Kaynak videonun gerçek renk ve SAR bilgisi. Çözücünün çıkış biçimine güvenilmez: Qualcomm çözücüleri
+ * (c2.qti, Galaxy Z Flip8) etiketsiz 480p akışı BT.709 diye bildiriyor; Android 11 çıkarıcısı SPS'teki SAR'ı
+ * vermiyor. Öncelik: H.264/HEVC'de kaynağın kendi SPS'i (Rust `vui` ayrıştırıcı) → kap anahtarları
+ * (MP4 'colr'/'pasp', Matroska Colour/DisplayWidth) → yok (oynatıcı varsayılanı kodlayıcı tarafında yazılır).
+ */
+internal data class SourceVideoTags(val sar: Pair<Int, Int>?, val color: MediaFormat?, val from: String) {
+    companion object {
+        /** ISO/IEC 23091-2 → MediaFormat sabitleri. */
+        fun standardOf(primaries: Int, matrix: Int): Int = when (matrix) {
+            1 -> MediaFormat.COLOR_STANDARD_BT709
+            5, 6 -> if (primaries == 5) MediaFormat.COLOR_STANDARD_BT601_PAL else MediaFormat.COLOR_STANDARD_BT601_NTSC
+            9, 10 -> MediaFormat.COLOR_STANDARD_BT2020
+            else -> 0
+        }
+
+        fun transferOf(transfer: Int): Int = when (transfer) {
+            1, 6, 14, 15 -> MediaFormat.COLOR_TRANSFER_SDR_VIDEO
+            8 -> MediaFormat.COLOR_TRANSFER_LINEAR
+            16 -> MediaFormat.COLOR_TRANSFER_ST2084
+            18 -> MediaFormat.COLOR_TRANSFER_HLG
+            else -> 0
+        }
+
+        private fun reduce(w: Long, h: Long): Pair<Int, Int>? {
+            if (w <= 0 || h <= 0) return null
+            var a = w
+            var b = h
+            while (b != 0L) a = b.also { b = a % b }
+            val rw = w / a
+            val rh = h / a
+            return if (rw == rh || rw > 65535 || rh > 65535) null else rw.toInt() to rh.toInt()
+        }
+
+        fun of(format: MediaFormat): SourceVideoTags {
+            val mime = format.getString(MediaFormat.KEY_MIME)
+            var sar: Pair<Int, Int>? = null
+            var standard = 0
+            var transfer = 0
+            var range = 0
+            val from = ArrayList<String>()
+            // 1) H.264/HEVC: kaynağın SPS'i
+            val codec = when (mime) {
+                MediaFormat.MIMETYPE_VIDEO_AVC -> 0
+                MediaFormat.MIMETYPE_VIDEO_HEVC -> 1
+                else -> -1
+            }
+            val csd = if (codec >= 0) runCatching { format.getByteBuffer("csd-0") }.getOrNull() else null
+            if (csd != null && csd.remaining() > 4) {
+                val src = ByteBuffer.allocateDirect(csd.remaining())
+                src.put(csd.duplicate())
+                src.flip()
+                val out = ByteBuffer.allocateDirect(36).order(java.nio.ByteOrder.nativeOrder())
+                val found = runCatching { Core.nativeProbeVui(codec, src, 0, src.remaining(), out) }.getOrDefault(-1)
+                if (found == 1) {
+                    val v = IntArray(9) { out.getInt(it * 4) }
+                    if (v[0] > 0 && v[1] > 0 && v[0] != v[1]) sar = v[0] to v[1]
+                    if (v[2] == 1) {
+                        standard = standardOf(v[3], v[5])
+                        transfer = transferOf(v[4])
+                    }
+                    if (v[6] == 1) range = if (v[7] == 1) MediaFormat.COLOR_RANGE_FULL else MediaFormat.COLOR_RANGE_LIMITED
+                    from += "SPS"
+                }
+            }
+            // 2) Kap anahtarları (yalnızca SPS'te olmayan alanlar için)
+            if (sar == null) {
+                val w = format.intOr(MediaFormat.KEY_PIXEL_ASPECT_RATIO_WIDTH, 1)
+                val h = format.intOr(MediaFormat.KEY_PIXEL_ASPECT_RATIO_HEIGHT, 1)
+                if (w > 0 && h > 0 && w != h) {
+                    sar = w to h
+                    from += "kap SAR"
+                }
+            }
+            if (sar == null) {
+                // Matroska/WebM DisplayWidth × DisplayHeight → SAR = (gösterim G × kodlanmış Y) / (gösterim Y × kodlanmış G)
+                val dw = format.intOr("display-width", 0)
+                val dh = format.intOr("display-height", 0)
+                val cw = format.intOr(MediaFormat.KEY_WIDTH, 0)
+                val ch = format.intOr(MediaFormat.KEY_HEIGHT, 0)
+                if (dw > 0 && dh > 0 && cw > 0 && ch > 0) {
+                    reduce(dw.toLong() * ch, dh.toLong() * cw)?.let {
+                        sar = it
+                        from += "gösterim boyutu"
+                    }
+                }
+            }
+            if (standard == 0) standard = format.intOr(MediaFormat.KEY_COLOR_STANDARD, 0)
+            if (transfer == 0) transfer = format.intOr(MediaFormat.KEY_COLOR_TRANSFER, 0)
+            if (range == 0) range = format.intOr(MediaFormat.KEY_COLOR_RANGE, 0)
+            val color = MediaFormat().apply {
+                if (standard != 0) setInteger(MediaFormat.KEY_COLOR_STANDARD, standard)
+                if (transfer != 0) setInteger(MediaFormat.KEY_COLOR_TRANSFER, transfer)
+                if (range != 0) setInteger(MediaFormat.KEY_COLOR_RANGE, range)
+            }
+            return SourceVideoTags(sar, color, from.joinToString("+").ifEmpty { "etiket yok" })
         }
     }
 }
@@ -1949,12 +2087,10 @@ class VideoJob(
             val durationUs = if (sourceFormat.containsKey(MediaFormat.KEY_DURATION)) sourceFormat.getLong(MediaFormat.KEY_DURATION) else 0L
             val rotation = sourceFormat.intOr(MediaFormat.KEY_ROTATION, 0)
             val sourceBitrate = sourceFormat.intOr(MediaFormat.KEY_BIT_RATE, 0)
-            // Piksel en-boy oranı (SAR): 1:1 değilse çıktıya taşınır (VUI + MP4 'pasp').
-            val sourceSar = run {
-                val w = sourceFormat.intOr(MediaFormat.KEY_PIXEL_ASPECT_RATIO_WIDTH, 1)
-                val h = sourceFormat.intOr(MediaFormat.KEY_PIXEL_ASPECT_RATIO_HEIGHT, 1)
-                if (w > 0 && h > 0 && w != h) w to h else null
-            }
+            // Piksel en-boy oranı (SAR) ve renk: kaynağın kendisinden (SPS / kap), çözücüden DEĞİL
+            // (bkz. SourceVideoTags). SAR 1:1 değilse çıktıya taşınır (VUI + MP4 'pasp').
+            val sourceTags = SourceVideoTags.of(sourceFormat)
+            val sourceSar = sourceTags.sar
             val sourceVideo = runCatching { measureVideoTrack(videoTrack) }.getOrNull()
             // Kare hızı yalnızca kodlayıcının hız denetimi içindir; kare zaman damgaları kaynaktan aynen taşınır.
             // Beyan yoksa örnek tablosundan ölçülen ortalama kullanılır.
@@ -2045,7 +2181,6 @@ class VideoJob(
 
             // ---- döngü durumu --------------------------------------------------
             val info = MediaCodec.BufferInfo()
-            var colorFormat: MediaFormat? = null
             var inputDone = false
             var decoderDone = false
             var eosQueued = false
@@ -2124,7 +2259,7 @@ class VideoJob(
                     }
                     if (image.format == ImageFormat.YCBCR_P010) notes += "10 bit kaynak 8 bite indirildi (ton eşlemesi yok)."
                     if (surfaceReader != null) notes += "Çözme yolu: Surface → ImageReader (HardwareBuffer)."
-                    encoder = startEncoder(width, height, frameRate, sourceVideo, sourceMime, colorFormat, sourceSar)
+                    encoder = startEncoder(width, height, frameRate, sourceVideo, sourceMime, sourceTags.color, sourceSar)
                     CleanerSession(width, height).also { session = it }
                 }
                 if (width != active.width || height != active.height) {
@@ -2169,7 +2304,7 @@ class VideoJob(
                 }
                 val index = dec.dequeueOutputBuffer(info, CODEC_TIMEOUT_US)
                 if (index == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
-                    colorFormat = dec.outputFormat
+                    // Çözücünün bildirdiği renk kullanılmaz (etiketsiz akışta cihaza göre uydurulabiliyor).
                 } else if (index >= 0 && surfaceReader != null) {
                     val end = info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0
                     // Surface kipinde bazı çözücüler boyutu 0 bildirir: akış sonu dışındaki her tampon çizilir.

@@ -121,6 +121,54 @@ def audible_start(path):
     return float(first) + onset
 
 
+def decoded_audio(path, seconds=2.5, rate=48000):
+    """İlk çözülmüş ses karesinden başlayarak tek kanal float dizi (numpy) ve o karenin zamanı; numpy yoksa None."""
+    try:
+        import numpy as np
+    except ImportError:
+        return None
+    out = run(["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_frames", "-read_intervals", "%+#4",
+               "-show_entries", "frame=pts_time", "-of", "csv=p=0", path]).stdout
+    first = next((line.split(",")[0] for line in out.splitlines() if line.strip() and line.split(",")[0] not in ("", "N/A")), None)
+    raw = subprocess.run(["ffmpeg", "-v", "error", "-i", path, "-map", "0:a:0", "-ac", "1", "-ar", str(rate), "-t", str(seconds),
+                          "-f", "f32le", "-"], capture_output=True).stdout
+    if first is None or not raw:
+        return None
+    return float(first), np.frombuffer(raw, dtype="<f4").astype(np.float64)
+
+
+def content_lag(src, out, rate=48000, max_ms=120):
+    """Çıktı sesinin kaynağa göre içerik kayması (sn; + = çıktıda geç), çapraz ilintiyle. Geniş bantlı seste
+    (gürültü, konuşma) örnek hassasiyetindedir; saf sinüste periyodik olduğundan tepe tek değildir → None
+    (o zaman duyulur-başlangıç yöntemi kullanılır). Dönüş: (kayma, tepe/ikinci tepe oranı) veya None."""
+    a, b = decoded_audio(src), decoded_audio(out)
+    if a is None or b is None:
+        return None
+    import numpy as np
+    (ts, x), (to, y) = a, b
+    n = min(len(x), len(y))
+    if n < rate // 2:
+        return None
+    x, y = x[:n] - x[:n].mean(), y[:n] - y[:n].mean()
+    size = 1 << int(np.ceil(np.log2(2 * n)))
+    corr = np.fft.irfft(np.fft.rfft(y, size) * np.conj(np.fft.rfft(x, size)), size)
+    m = int(rate * max_ms / 1000)
+    lags = np.concatenate([np.arange(0, m + 1), np.arange(-m, 0)])
+    vals = np.concatenate([corr[: m + 1], corr[-m:]])
+    k = int(np.argmax(vals))
+    best = vals[k]
+    if best <= 0:
+        return None
+    # İkinci tepe: en iyi kaymadan ≥ 1 ms uzaktaki en büyük değer
+    far = np.abs(lags - lags[k]) > rate // 1000
+    second = vals[far].max() if far.any() else 0.0
+    ratio = float(best / second) if second > 0 else float("inf")
+    if ratio < 1.5:
+        return None
+    lag_s = lags[k] / rate
+    return (to + lag_s) - ts, ratio
+
+
 def audio_hashes(path):
     """Ses paketlerinin MD5 listesi (yeniden kodlamadan, paket verisi)."""
     out = run(["ffmpeg", "-v", "error", "-i", path, "-map", "0:a:0", "-c", "copy", "-f", "framemd5", "-"]).stdout
@@ -294,6 +342,7 @@ def main():
         audio_mode = "-"
         packets_same = "-"
         av_src = av_out = dur_src = dur_out = None
+        sync_ms, sync_method = None, "-"
         if sa:
             if not oa:
                 problems.append("ses yok")
@@ -318,9 +367,16 @@ def main():
                     problems.append("ses senkronu ölçülemedi")
                 else:
                     sync_ms = ((a_o - ot0) - (a_s - st0)) * 1000
-                    av_src, av_out = a_s - st0, a_o - ot0
+                    # Geniş bantlı seste içerik ilintisi daha güçlüdür: başlangıçta kesilen ses de görülür.
+                    xc = content_lag(src, out)
+                    if xc is not None:
+                        sync_ms = (xc[0] - (ot0 - st0)) * 1000
+                        sync_method = f"ilinti (tepe oranı {xc[1]:.1f})"
+                    else:
+                        sync_method = "duyulur başlangıç"
+                    av_src, av_out = a_s - st0, a_s - st0 + sync_ms / 1000
                     if abs(sync_ms) > 10:
-                        problems.append(f"ses senkronu {sync_ms:+.1f} ms")
+                        problems.append(f"ses senkronu {sync_ms:+.1f} ms ({sync_method})")
                     # Süre: duyulur başlangıçtan son paketin sonuna (ön dolgu/ön atlama sayılmaz).
                     dur_src = sas["start"] + sas["span"] - a_s
                     dur_out = oas["start"] + oas["span"] - a_o
@@ -361,6 +417,7 @@ def main():
             "audio": f"{sa['codec_name']}/{sa.get('sample_rate')}/{sa.get('channels')}ch→{oa['codec_name']}/{oa.get('sample_rate')}/{oa.get('channels')}ch" if sa and oa else ("-" if not sa else "kayıp"),
             "audio_mode": audio_mode, "audio_packets": packets_same,
             "av_offset_ms": f"{av_src * 1000:.1f}→{av_out * 1000:.1f}" if av_src is not None else "-",
+            "audio_sync_ms": f"{sync_ms:+.1f} ({sync_method})" if sync_ms is not None else "-",
             "audio_dur_s": f"{dur_src:.3f}→{dur_out:.3f}" if dur_src is not None else "-",
             "colr_out": f"{o_colr['primaries']}/{o_colr['transfer']}/{o_colr['matrix']}/{'full' if o_colr['full'] else 'tv'}" if o_colr else "yok",
             "vui_out": (f"{o_vui.get('primaries', '-')}/{o_vui.get('transfer', '-')}/{o_vui.get('matrix', '-')}/{'full' if o_vui.get('full') else 'tv'}" if o_vui and o_vui.get("desc") else "renk yok") if o_vui else "-",

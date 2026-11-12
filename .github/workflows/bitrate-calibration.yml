@@ -103,7 +103,7 @@ jobs:
           # Paket sunucusuna geçici erişim hatalarına karşı 3 deneme; her deneme en çok 10 dk.
           ok=0
           for attempt in 1 2 3; do
-            if timeout 600 sudo apt-get $APT update -qq && timeout 600 sudo apt-get $APT install -y -qq --fix-missing ffmpeg meson ninja-build nasm xxd > /dev/null; then ok=1; break; fi
+            if timeout 600 sudo apt-get $APT update -qq && timeout 600 sudo apt-get $APT install -y -qq --fix-missing ffmpeg meson ninja-build nasm xxd python3-numpy > /dev/null; then ok=1; break; fi
             echo "apt denemesi $attempt başarısız; 20 sn sonra yeniden"; sleep 20
           done
           [ "$ok" = 1 ]

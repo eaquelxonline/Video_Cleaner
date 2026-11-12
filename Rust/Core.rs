@@ -3656,6 +3656,8 @@ pub mod vui {
         pub aspect_idc: Option<u8>,
         pub colour: Option<Colour>,
         pub video_format: Option<u8>,
+        /// video_signal_type varsa tam aralık bayrağı (renk açıklaması olmasa da).
+        pub full_range: Option<bool>,
     }
 
     // ---- öykünme önleme --------------------------------------------------------
@@ -4061,6 +4063,7 @@ pub mod vui {
         if r.bit()? == 1 {
             parsed.video_format = Some(r.u(3)? as u8);
             let full = r.bit()? == 1;
+            parsed.full_range = Some(full);
             if r.bit()? == 1 {
                 parsed.colour = Some(Colour {
                     primaries: r.u(8)? as u8,
@@ -4127,6 +4130,45 @@ pub mod vui {
         let rbsp = unescape(nal);
         let end = stop_bit(&rbsp)?;
         Ok(layout(codec, &rbsp, end)?.parsed)
+    }
+
+    /// Annex B verisindeki ilk SPS'in VUI değerleri; SPS yoksa `None`.
+    pub fn probe_annexb(codec: Codec, data: &[u8]) -> Result<Option<Parsed>, VuiError> {
+        let mut i = 0;
+        while i + 3 <= data.len() {
+            let payload = if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
+                i + 3
+            } else if i + 4 <= data.len()
+                && data[i] == 0
+                && data[i + 1] == 0
+                && data[i + 2] == 0
+                && data[i + 3] == 1
+            {
+                i + 4
+            } else {
+                i += 1;
+                continue;
+            };
+            // NAL sonu: bir sonraki başlangıç kodu (00 00 01) veya veri sonu.
+            let mut end = payload;
+            while end + 3 <= data.len()
+                && !(data[end] == 0
+                    && data[end + 1] == 0
+                    && (data[end + 2] == 1
+                        || (data[end + 2] == 0 && end + 3 < data.len() && data[end + 3] == 1)))
+            {
+                end += 1;
+            }
+            if end + 3 > data.len() {
+                end = data.len();
+            }
+            let nal = &data[payload..end];
+            if is_sps(codec, nal) {
+                return parse_sps(codec, nal).map(Some);
+            }
+            i = end;
+        }
+        Ok(None)
     }
 
     /// Başlık baytları dahil tek bir SPS NAL'ini yeniden yazar. Değişiklik gerekmiyorsa `None`.
@@ -4718,6 +4760,74 @@ pub mod jni {
             let _ = (env, handle, buffer, crop_left, crop_top, pts_us, flags);
             CoreError::BadState.code() as i64
         }
+    }
+
+    /// `external fun nativeProbeVui(codec: Int, src: ByteBuffer, offset: Int, length: Int, out: ByteBuffer): Int`
+    ///
+    /// Kaynağın parametre kümelerindeki (csd-0, Annex B) ilk SPS'in VUI değerleri `out`'a (doğrudan tampon,
+    /// yerel bayt sırasıyla 9 × i32) yazılır:
+    /// [sarW, sarH, renkVar, primaries, transfer, matrix, aralıkVar, tamAralık, vuiVar]; SAR yoksa 0/0.
+    /// Dönüş: 1 SPS bulundu, 0 SPS yok, negatif hata.
+    ///
+    /// # Safety
+    /// `env` geçerli olmalı; `src` doğrudan ByteBuffer olmalıdır.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "system" fn Java_com_video_cleaner_Core_nativeProbeVui(
+        env: *mut JniEnv,
+        _class: JObject,
+        codec: i32,
+        src: JObject,
+        offset: i32,
+        length: i32,
+        out: JObject,
+    ) -> i32 {
+        use crate::vui::{Codec, probe_annexb};
+        let codec = match codec {
+            0 => Codec::Avc,
+            1 => Codec::Hevc,
+            _ => return CoreError::BadArgument.code(),
+        };
+        // SAFETY: çağıranın sözleşmesi.
+        let (src_ptr, src_cap) = match unsafe { direct_buffer(env, src) } {
+            Ok(v) => v,
+            Err(e) => return e.code(),
+        };
+        if offset < 0 || length <= 0 || offset as usize + length as usize > src_cap {
+            return CoreError::BadArgument.code();
+        }
+        // SAFETY: aralık tampon içinde denetlendi.
+        let data =
+            unsafe { std::slice::from_raw_parts(src_ptr.add(offset as usize), length as usize) };
+        let parsed = match probe_annexb(codec, data) {
+            Ok(Some(p)) => p,
+            Ok(None) => return 0,
+            Err(_) => return CoreError::Unsupported.code(),
+        };
+        let (sw, sh) = parsed
+            .sar
+            .map(|(w, h)| (w as i32, h as i32))
+            .unwrap_or((0, 0));
+        let c = parsed.colour;
+        let values = [
+            sw,
+            sh,
+            c.is_some() as i32,
+            c.map(|c| c.primaries as i32).unwrap_or(2),
+            c.map(|c| c.transfer as i32).unwrap_or(2),
+            c.map(|c| c.matrix as i32).unwrap_or(2),
+            parsed.full_range.is_some() as i32,
+            parsed.full_range.unwrap_or(false) as i32,
+            parsed.vui_present as i32,
+        ];
+        // SAFETY: çağıranın sözleşmesi; `out` en az 36 baytlık doğrudan tampon.
+        let dst = match unsafe { buffer_mut(env, out, values.len() * 4) } {
+            Ok(b) => b,
+            Err(e) => return e.code(),
+        };
+        for (k, v) in values.iter().enumerate() {
+            put_i32(dst, k * 4, *v);
+        }
+        1
     }
 
     /// `external fun nativeRewriteVui(codec: Int, src: ByteBuffer, offset: Int, length: Int, dst: ByteBuffer,
@@ -7823,6 +7933,39 @@ mod vui_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn probe_finds_first_sps_in_parameter_sets() {
+        // csd-0 biçimi: VPS/SPS/PPS başlangıç kodlarıyla; HEVC'de SPS ikinci NAL'dir.
+        for (codec, sps) in all() {
+            let mut stream = vec![0, 0, 0, 1];
+            if codec == Codec::Hevc {
+                stream.extend(hex("40010c01ffff016000000300900000030000030078959809"));
+                stream.extend([0, 0, 0, 1]);
+            }
+            stream.extend(&sps);
+            stream.extend([0, 0, 0, 1]);
+            stream.extend(hex(if codec == Codec::Avc {
+                "68ebe3cb22c0"
+            } else {
+                "4401c172b46240"
+            }));
+            let probed = probe_annexb(codec, &stream).unwrap().unwrap();
+            assert_eq!(probed, parse_sps(codec, &sps).unwrap());
+        }
+        // SAR 32:27 + BT.709 örneği değerleriyle okunur.
+        let mut stream = vec![0, 0, 1];
+        stream.extend(hex(AVC[2]));
+        let p = probe_annexb(Codec::Avc, &stream).unwrap().unwrap();
+        assert_eq!(p.sar, Some((32, 27)));
+        assert_eq!(p.colour.map(|c| (c.primaries, c.matrix)), Some((1, 1)));
+        assert_eq!(p.full_range, Some(false));
+        // SPS yok
+        assert_eq!(
+            probe_annexb(Codec::Avc, &[0, 0, 1, 0x68, 0xeb]).unwrap(),
+            None
+        );
     }
 
     #[test]
