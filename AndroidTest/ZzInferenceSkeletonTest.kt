@@ -167,8 +167,8 @@ class ZzInferenceSkeletonTest {
             Triple("fp32", "xnnpack", false), Triple("int8", "cpu", true), Triple("fp32", "cpu", true),
             Triple("fp16", "cpu", true), Triple("fp32", "nnapi", true),
         )
-        for ((variant, ep, arena) in plan) {
-            val label = if (arena) ep else "$ep-noarena"
+        for ((variant, ep, cpuArena) in plan) {
+            val label = if (cpuArena) ep else "$ep-noarena"
             if (available.none { it.endsWith("_$variant.onnx") }) {
                 Log.i(TAG, "VCBENCH variant=$variant ep=$label status=SKIPPED reason=\"$variant grafikleri yok\"")
                 continue
@@ -177,14 +177,14 @@ class ZzInferenceSkeletonTest {
                 Log.i(TAG, "VCBENCH variant=$variant ep=$label status=SKIPPED reason=\"süre bütçesi doldu\"")
                 continue
             }
-            runPipeline(env, variant, ep, arena)
+            runPipeline(env, variant, ep, cpuArena)
             System.gc()
         }
         Log.i(TAG, "VCBENCH status=DONE total_s=${(SystemClock.elapsedRealtime() - started) / 1000} thermal=${thermal()}")
     }
 
-    private fun runPipeline(env: OrtEnvironment, variant: String, ep: String, arena: Boolean) {
-        val label = if (arena) ep else "$ep-noarena"
+    private fun runPipeline(env: OrtEnvironment, variant: String, ep: String, cpuArena: Boolean) {
+        val label = if (cpuArena) ep else "$ep-noarena"
         val graphs = listOf("det_enc", "det_core", "det_dec", "flow_enc", "flow_pair", "mamba_enc", "mamba_core", "mamba_dec")
         val peak = AtomicLong(rssMb())
         val sampling = AtomicBoolean(true)
@@ -213,7 +213,7 @@ class ZzInferenceSkeletonTest {
                 val options = OrtSession.SessionOptions()
                 options.setIntraOpNumThreads(4)
                 options.setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
-                if (!arena) {
+                if (!cpuArena) {
                     options.setCPUArenaAllocator(false)
                     options.setMemoryPatternOptimization(false)
                 }
