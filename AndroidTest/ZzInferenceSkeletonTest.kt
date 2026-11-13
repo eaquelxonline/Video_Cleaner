@@ -3,7 +3,10 @@
 // Mimari: ONNX yalnızca evrişim/MatMul hızlandırıcısıdır. Her model üç grafiğe bölünmüştür (Models/Export.py):
 // kare başına kodlayıcı, 30 karelik zamansal çekirdek, kare başına çözücü (akışta: kare başına kodlayıcı +
 // çift başına eşleştirme). 30 karelik pencere ve ara özellikler grafiğin DIŞINDA (burada yerel bellekte
-// doğrudan tamponlar; üretimde Rust halka tamponu) tutulur; her kare BİR kez kodlanır.
+// Rust'ın ayırdığı yerel bellek — Core.nativeAllocDirect; üretimde Rust halka tamponu) tutulur; her kare BİR
+// kez kodlanır. Android'de ByteBuffer.allocateDirect Java yığınından ayrılır (192–256 MB sınırı): ilk telefon
+// turunda (13 Kasım) bütün varyantlar bu yüzden OutOfMemoryError ile düştü ve moto'da süreç lmkd ile öldü.
+// Sınıf adı "Zz" ile başlar: AndroidJUnitRunner sınıfları ada göre sıralar, ölçüm diğer testlerden SONRA koşar.
 //
 // Ölçülen: grafik başına süre, Mod B'de kare başına toplam süre, oturum yükleme, en yüksek RSS, ısıl durum,
 // NNAPI düğüm kapsamı (ORT günlüğünde "number of nodes supported by NNAPI"). Çıktı görüntüsü anlamsızdır.
@@ -35,7 +38,7 @@ import org.junit.Test
 import org.junit.runner.RunWith
 
 @RunWith(AndroidJUnit4::class)
-class InferenceSkeletonTest {
+class ZzInferenceSkeletonTest {
     private val instrumentation = InstrumentationRegistry.getInstrumentation()
     private val app = instrumentation.targetContext
     private val testAssets = instrumentation.context.assets
@@ -45,7 +48,29 @@ class InferenceSkeletonTest {
         val perItem: Int get() = (data.capacity() / shape[0]).toInt()
     }
 
-    private fun direct(count: Int): FloatBuffer = ByteBuffer.allocateDirect(count * 4).order(ByteOrder.nativeOrder()).asFloatBuffer()
+    /** Java yığını dışı bellek bölgesi (Rust nativeAllocDirect); [free] ile topluca geri verilir. */
+    private class NativeArena {
+        private val blocks = ArrayList<ByteBuffer>()
+        var bytes = 0L
+            private set
+
+        fun floats(count: Int): FloatBuffer {
+            val block = Core.nativeAllocDirect(count * 4L) ?: throw OutOfMemoryError("yerel bellek ayrılamadı (${count * 4L} bayt)")
+            blocks += block
+            bytes += count * 4L
+            return block.order(ByteOrder.nativeOrder()).asFloatBuffer()
+        }
+
+        fun free() {
+            blocks.forEach { Core.nativeFreeDirect(it) }
+            blocks.clear()
+            bytes = 0
+        }
+    }
+
+    private var arena = NativeArena()
+
+    private fun direct(count: Int): FloatBuffer = arena.floats(count)
 
     private fun random(shape: LongArray, seed: Long): Feature {
         val count = shape.fold(1L) { a, b -> a * b }.toInt()
@@ -175,6 +200,8 @@ class InferenceSkeletonTest {
         val files = ArrayList<File>()
         var stage = "yükleme"
         var pipeline: Pipeline? = null
+        var ringMb = 0L
+        arena = NativeArena()
         try {
             val t0 = SystemClock.elapsedRealtime()
             for (g in graphs) {
@@ -203,13 +230,15 @@ class InferenceSkeletonTest {
             val p = Pipeline(env, sessions)
             pipeline = p
             val t = 30
-            val valid = Feature(longArrayOf(1, t.toLong()), direct(t).also { b -> repeat(t) { b.put(1f) }; b.rewind() })
+            fun validMask() = Feature(longArrayOf(1, t.toLong()), direct(t).also { b -> repeat(t) { b.put(1f) }; b.rewind() })
 
             stage = "algılayıcı"
             val frame = random(p.shapeOf("det_enc", "frame"), 1)
             val det = (0 until t).map { p.run("det_enc", "frame" to frame) }
-            val dCore = p.run("det_core", "x8" to concat(det.map { it[2] }), "valid" to valid)
+            val dCore = p.run("det_core", "x8" to concat(det.map { it[2] }), "valid" to validMask())
             for (i in 0 until t) p.run("det_dec", "x16" to item(dCore[1], i), "s0" to det[i][0], "s1" to det[i][1], "s2" to item(dCore[0], i))
+            ringMb = maxOf(ringMb, arena.bytes shr 20)
+            arena.free()                                         // algılayıcı halkası serbest
 
             stage = "akış"
             val fm = random(p.shapeOf("flow_enc", "frame_mask"), 2)
@@ -220,15 +249,18 @@ class InferenceSkeletonTest {
                     p.run("flow_pair", "feat_src" to fe[a][0], "feat_dst" to fe[b][0], "ctx_src" to fe[a][1], "mask_src" to mask, "mask_dst" to mask)
                 }
             }
+            ringMb = maxOf(ringMb, arena.bytes shr 20)
+            arena.free()
 
             stage = "onarım"
             val packed = random(p.shapeOf("mamba_enc", "packed"), 4)
             val me = (0 until t).map { p.run("mamba_enc", "packed" to packed) }
             val context = random(p.shapeOf("mamba_core", "context"), 5)
-            val mCore = p.run("mamba_core", "x8" to concat(me.map { it[2] }), "valid" to valid, "context" to context)
+            val mCore = p.run("mamba_core", "x8" to concat(me.map { it[2] }), "valid" to validMask(), "context" to context)
             for (i in 0 until t) {
                 p.run("mamba_dec", "packed" to packed, "x16" to item(mCore[1], i), "s3" to item(mCore[0], i), "s2" to me[i][1], "s1" to me[i][0])
             }
+            ringMb = maxOf(ringMb, arena.bytes shr 20)
 
             // Mod B (pencere 15 kare kayar): kare başına = kodlayıcı + 2 çift + 2 çözücü + çekirdek/15
             val per = LinkedHashMap<String, Double>()
@@ -244,7 +276,7 @@ class InferenceSkeletonTest {
                 TAG,
                 "VCBENCH variant=$variant ep=$label status=OK load_ms=$loadMs frame_ms=${"%.1f".format(frameMs)} " +
                     per.entries.joinToString(" ") { (g, v) -> "$g=${"%.1f".format(v)}" } +
-                    " window_ms=${"%.0f".format(p.ms.values.sum())} rss_before_mb=$rssBefore peak_rss_mb=${peak.get()} thermal=$thermalBefore->${thermal()}",
+                    " window_ms=${"%.0f".format(p.ms.values.sum())} ring_mb=$ringMb rss_before_mb=$rssBefore peak_rss_mb=${peak.get()} thermal=$thermalBefore->${thermal()}",
             )
         } catch (e: Throwable) {
             Log.i(
@@ -256,6 +288,7 @@ class InferenceSkeletonTest {
             sampling.set(false)
             sampler.join(500)
             pipeline?.close()
+            arena.free()
             sessions.values.forEach { runCatching { it.close() } }
             files.forEach { it.delete() }
         }

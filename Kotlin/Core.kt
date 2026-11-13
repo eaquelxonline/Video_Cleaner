@@ -134,6 +134,16 @@ object Core {
      * yerel bayt sırası, 9 × Int): sarW, sarH, renkVar, primaries, transfer, matrix, aralıkVar, tamAralık, vuiVar.
      * Dönüş: 1 SPS bulundu, 0 yok, negatif hata.
      */
+    /**
+     * Java yığınına SAYILMAYAN yerel bellek üzerinde doğrudan ByteBuffer (64 bayt hizalı, sıfırlanmış).
+     * Android'de `ByteBuffer.allocateDirect` Java yığınından ayrılır ve 192–256 MB sınırına takılır; 30 karelik
+     * ara özellik halkası burada tutulur. [nativeFreeDirect] ile geri verilmelidir. Bellek yoksa null.
+     */
+    @JvmStatic external fun nativeAllocDirect(bytes: Long): ByteBuffer?
+
+    /** [nativeAllocDirect] belleğini geri verir (0 başarı). Yalnızca o işlevden gelen tampon verilmelidir. */
+    @JvmStatic external fun nativeFreeDirect(buffer: ByteBuffer): Int
+
     @JvmStatic external fun nativeProbeVui(codec: Int, src: ByteBuffer, offset: Int, length: Int, out: ByteBuffer): Int
 
     @JvmStatic external fun nativePushHardwareBuffer(handle: Long, buffer: HardwareBuffer, cropLeft: Int, cropTop: Int, ptsUs: Long, flags: Int): Long

@@ -4836,6 +4836,7 @@ pub mod jni {
 
     const JNI_GET_DIRECT_BUFFER_ADDRESS: usize = 230;
     const JNI_GET_DIRECT_BUFFER_CAPACITY: usize = 231;
+    const JNI_NEW_DIRECT_BYTE_BUFFER: usize = 229;
     const HANDLE_MAGIC: u64 = 0x5643_4C45_414E_3230; // "VCLEAN20"
 
     /// `nativePoll` adım kodları.
@@ -5279,6 +5280,81 @@ pub mod jni {
         {
             let _ = (env, handle, buffer, crop_left, crop_top, pts_us, flags);
             CoreError::BadState.code() as i64
+        }
+    }
+
+    /// `external fun nativeAllocDirect(bytes: Long): ByteBuffer?`
+    ///
+    /// Java yığınına SAYILMAYAN, 64 bayt hizalı, sıfırlanmış yerel bellek üzerinde doğrudan ByteBuffer.
+    /// Android'de `ByteBuffer.allocateDirect` Java yığınından ayrılır (taşınmaz dizi) ve 192–256 MB yığın
+    /// sınırına takılır: 30 karelik ara özellik halkası (yüzlerce MB) orada tutulamaz. Bellek
+    /// [`Java_com_video_cleaner_Core_nativeFreeDirect`] ile geri verilmelidir.
+    ///
+    /// # Safety
+    /// `env` geçerli olmalıdır.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "system" fn Java_com_video_cleaner_Core_nativeAllocDirect(
+        env: *mut JniEnv,
+        _class: JObject,
+        bytes: i64,
+    ) -> JObject {
+        if env.is_null() || bytes <= 0 {
+            return std::ptr::null_mut();
+        }
+        let Some(ptr) = native_alloc(bytes as usize) else {
+            return std::ptr::null_mut();
+        };
+        type NewDirect = unsafe extern "system" fn(*mut JniEnv, *mut c_void, i64) -> JObject;
+        // SAFETY: JNI belirtimi: işlev tablosunun 229. girişi NewDirectByteBuffer'dır (JNI 1.4+).
+        unsafe {
+            let table: *const *const c_void = *env;
+            let new_direct: NewDirect = std::mem::transmute(*table.add(JNI_NEW_DIRECT_BYTE_BUFFER));
+            let buffer = new_direct(env, ptr as *mut c_void, bytes);
+            if buffer.is_null() {
+                native_free(ptr, bytes as usize);
+            }
+            buffer
+        }
+    }
+
+    /// `external fun nativeFreeDirect(buffer: ByteBuffer): Int` — [`Java_com_video_cleaner_Core_nativeAllocDirect`]
+    /// ile ayrılan belleği geri verir (0 başarı). Başka kaynaklı bir tampon VERİLMEMELİDİR.
+    ///
+    /// # Safety
+    /// `env` geçerli olmalı; `buffer` nativeAllocDirect'ten gelmeli ve bir kez serbest bırakılmalıdır.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "system" fn Java_com_video_cleaner_Core_nativeFreeDirect(
+        env: *mut JniEnv,
+        _class: JObject,
+        buffer: JObject,
+    ) -> i32 {
+        // SAFETY: çağıranın sözleşmesi.
+        match unsafe { direct_buffer(env, buffer) } {
+            Ok((ptr, capacity)) => {
+                // SAFETY: ptr/capacity nativeAllocDirect'in ayırdığı blok.
+                unsafe { native_free(ptr, capacity) };
+                0
+            }
+            Err(e) => e.code(),
+        }
+    }
+
+    const NATIVE_ALIGN: usize = 64;
+
+    /// Sıfırlanmış, 64 bayt hizalı blok; boyut taşarsa veya bellek yoksa `None`.
+    pub(crate) fn native_alloc(bytes: usize) -> Option<*mut u8> {
+        let layout = std::alloc::Layout::from_size_align(bytes, NATIVE_ALIGN).ok()?;
+        // SAFETY: boyut > 0 (çağıran denetler).
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+        (!ptr.is_null()).then_some(ptr)
+    }
+
+    /// # Safety
+    /// `ptr` aynı `bytes` ile [`native_alloc`]'tan gelmiş olmalıdır.
+    pub(crate) unsafe fn native_free(ptr: *mut u8, bytes: usize) {
+        if let Ok(layout) = std::alloc::Layout::from_size_align(bytes, NATIVE_ALIGN) {
+            // SAFETY: çağıranın sözleşmesi.
+            unsafe { std::alloc::dealloc(ptr, layout) };
         }
     }
 
@@ -8781,5 +8857,22 @@ mod finish_tests {
             (sigma_in - sigma_out).abs() / sigma_out < 0.25,
             "içeride σ {sigma_in}, dışarıda σ {sigma_out}"
         );
+    }
+}
+
+#[cfg(test)]
+mod native_alloc_tests {
+    #[test]
+    fn native_blocks_are_zeroed_aligned_and_freeable() {
+        for bytes in [1usize, 63, 64, 4096, 40 << 20] {
+            let ptr = super::jni::native_alloc(bytes).expect("ayrılmalı");
+            assert_eq!(ptr as usize % 64, 0);
+            // SAFETY: blok `bytes` uzunluğunda ve yeni ayrıldı.
+            let slice = unsafe { std::slice::from_raw_parts_mut(ptr, bytes) };
+            assert!(slice.iter().all(|&b| b == 0));
+            slice[bytes - 1] = 7;
+            // SAFETY: aynı boyutla ayrıldı.
+            unsafe { super::jni::native_free(ptr, bytes) };
+        }
     }
 }

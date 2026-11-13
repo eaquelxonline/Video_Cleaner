@@ -119,7 +119,7 @@ jobs:
         if: steps.creds.outputs.skip == 'false' && inputs.reuse_results == ''
         run: |
           # Eğitilmemiş (sabit tohumlu) üç model ONNX'e aktarılır ve test APK'sına konur; telefonda
-          # InferenceSkeletonTest operatör uyumluluğunu, süreyi ve belleği ölçer (bench=true).
+          # ZzInferenceSkeletonTest operatör uyumluluğunu, süreyi ve belleği ölçer (bench=true).
           python -m pip install --quiet torch==2.15.0 --index-url https://download.pytorch.org/whl/cpu
           python -m pip install --quiet onnx onnxscript onnxruntime numpy sympy packaging imageio-ffmpeg
           # Hibrit grafikler: kare başına kodlayıcı/çözücü + 30 karelik zamansal çekirdek; FP32 ve FP16.
