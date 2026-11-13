@@ -20,6 +20,7 @@ import ai.onnxruntime.OrtEnvironment
 import ai.onnxruntime.OrtLoggingLevel
 import ai.onnxruntime.OrtSession
 import ai.onnxruntime.TensorInfo
+import android.app.ActivityManager
 import android.content.Context
 import android.os.Build
 import android.os.PowerManager
@@ -159,14 +160,24 @@ class ZzInferenceSkeletonTest {
             "VCBENCH device=\"${Build.MANUFACTURER} ${Build.MODEL}\" soc=\"${if (Build.VERSION.SDK_INT >= 31) Build.SOC_MODEL else "-"}\" api=${Build.VERSION.SDK_INT} " +
                 "cores=${Runtime.getRuntime().availableProcessors()} files=${available.count { it.endsWith(".onnx") }}",
         )
-        // Önem sırası (süre bütçesi biterse en değerliler ölçülmüş olur). "noarena": ORT CPU bellek arenası
-        // kapalı — 8 oturumun her biri ayrı arena büyütür ve tepe belleği işletim sistemine geri vermez.
-        // NNAPI Android 15'te kullanımdan kaldırıldı; yalnızca karşılaştırma için sona konur.
-        val plan = listOf(
-            Triple("fp16", "xnnpack", true), Triple("int8", "xnnpack", true), Triple("fp32", "xnnpack", true),
-            Triple("fp32", "xnnpack", false), Triple("int8", "cpu", true), Triple("fp32", "cpu", true),
-            Triple("fp16", "cpu", true), Triple("fp32", "nnapi", true),
-        )
+        // Önem sırası (süre bütçesi biterse en değerliler ölçülmüş olur). 13 Kasım Z Flip8: ORT CPU (MLAS) FP32
+        // kare başına 1743 ms ile XNNPACK FP32'den (3205 ms) ve FP16'dan (2138 ms) hızlı — CPU önde. "noarena": ORT
+        // CPU bellek arenası kapalı. NNAPI Android 15'te kullanımdan kaldırıldı; yalnızca karşılaştırma için sonda.
+        // Düşük RAM'li cihazda (< 6 GB; moto g play 2021) yalnızca arenasız CPU varyantları: 13 Kasım'da moto'da
+        // üçüncü varyantta süreç lmkd ile öldürüldü (her varyant ~2 GB; oturum kapansa da RSS geri dönmüyor).
+        val memory = ActivityManager.MemoryInfo().also { (app.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager).getMemoryInfo(it) }
+        val totalMb = memory.totalMem shr 20
+        val lowRam = totalMb < 6 * 1024
+        val plan = if (lowRam) {
+            listOf(Triple("int8", "cpu", false), Triple("fp32", "cpu", false))
+        } else {
+            listOf(
+                Triple("int8", "cpu", true), Triple("fp32", "cpu", true), Triple("int8", "xnnpack", true),
+                Triple("fp16", "xnnpack", true), Triple("fp32", "xnnpack", true), Triple("fp16", "cpu", true),
+                Triple("fp32", "cpu", false), Triple("fp32", "nnapi", true),
+            )
+        }
+        Log.i(TAG, "VCBENCH ram_total_mb=$totalMb avail_mb=${memory.availMem shr 20} low_ram=$lowRam plan=${plan.size}")
         for ((variant, ep, cpuArena) in plan) {
             val label = if (cpuArena) ep else "$ep-noarena"
             if (available.none { it.endsWith("_$variant.onnx") }) {
@@ -175,6 +186,11 @@ class ZzInferenceSkeletonTest {
             }
             if (SystemClock.elapsedRealtime() - started > budgetMs) {
                 Log.i(TAG, "VCBENCH variant=$variant ep=$label status=SKIPPED reason=\"süre bütçesi doldu\"")
+                continue
+            }
+            val avail = ActivityManager.MemoryInfo().also { (app.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager).getMemoryInfo(it) }
+            if (avail.availMem shr 20 < MIN_AVAIL_MB) {
+                Log.i(TAG, "VCBENCH variant=$variant ep=$label status=SKIPPED reason=\"boş bellek az (${avail.availMem shr 20} MB < $MIN_AVAIL_MB)\" rss_mb=${rssMb()}")
                 continue
             }
             runPipeline(env, variant, ep, cpuArena)
@@ -297,6 +313,7 @@ class ZzInferenceSkeletonTest {
     private companion object {
         const val TAG = "VCTEST"
         const val CALL_LIMIT_MS = 60_000L          // tek grafik çağrısı
+        const val MIN_AVAIL_MB = 1200L             // altında varyant atlanır (lmkd öldürmesin, diğer satırlar kalsın)
         const val PIPELINE_LIMIT_MS = 4 * 60_000L  // bir değişken × sağlayıcı hattının tamamı
     }
 }

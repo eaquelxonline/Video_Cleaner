@@ -134,16 +134,25 @@ class Reader:
 SMALL = {"det_core": (10, 16, 16), "mamba_core": (10, 16, 16)}
 
 def activation_matmuls(path: Path) -> List[str]:
-    """İki girdisi de etkinleştirme olan MatMul düğümleri (ağırlık içermeyen: SSD'nin 30×30 sönüm ⊙ C·Bᵀ
-    çarpımları, pencere dikkatinin q·kᵀ ve p·v'si, akışın tüm-çiftler korelasyonu). Bunlar FP32 kalır: x86
-    ölçümünde int8'de bağıl hata mamba_core %22, flow_pair %23 idi. Ağırlıklı Conv/Linear int8 olur."""
+    """Gerçek 2 boyutlu ağırlığı OLMAYAN MatMul düğümleri (iki girdisi de etkinleştirme: SSD'nin 30×30 sönüm ⊙
+    C·Bᵀ çarpımları, pencere dikkatinin q·kᵀ ve p·v'si, akışın tüm-çiftler korelasyonu). Bunlar FP32 kalır: x86
+    ölçümünde int8'de bağıl hata mamba_core %22, flow_pair %23 idi. Ağırlıklı Conv/Linear int8 olur.
+
+    Ağırlık = 2 boyutlu başlatıcı (Linear [K, N]). Sabite katlanmış 3+ boyutlu tensörler ağırlık sayılmaz:
+    ORT 1.32'nin ön işlemesi akışın koordinat ızgarasını (Expand) [1, HW, 2] başlatıcıya katlıyor; o MatMul
+    nicemlenince B kanal başına 1 boyutlu ölçekle kalıyor ve telefondaki ORT QLinearMatMul'ü
+    "IsBQuantParamSupported" ile reddediyordu (13 Kasım, Z Flip8 + moto). Koordinat beklentisi zaten FP32 kalmalı."""
     import onnx
+    from onnx import numpy_helper
 
     model = onnx.load(str(path), load_external_data=False)
-    weights = {t.name for t in model.graph.initializer}
-    consts = {o for n in model.graph.node if n.op_type == "Constant" for o in n.output}
-    fixed = weights | consts
-    return [n.name for n in model.graph.node if n.op_type == "MatMul" and not any(i in fixed for i in n.input)]
+    weights = {t.name for t in model.graph.initializer if len(t.dims) == 2}
+    for n in model.graph.node:
+        if n.op_type == "Constant":
+            for a in n.attribute:
+                if a.name == "value" and len(numpy_helper.to_array(a.t).shape) == 2:
+                    weights.add(n.output[0])
+    return [n.name for n in model.graph.node if n.op_type == "MatMul" and n.input[1] not in weights]
 
 
 def small_core(onnx_dir: Path, name: str, feeds: List[Dict[str, np.ndarray]]):

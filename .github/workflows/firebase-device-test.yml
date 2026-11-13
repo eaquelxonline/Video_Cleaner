@@ -121,7 +121,7 @@ jobs:
           # Eğitilmemiş (sabit tohumlu) üç model ONNX'e aktarılır ve test APK'sına konur; telefonda
           # ZzInferenceSkeletonTest operatör uyumluluğunu, süreyi ve belleği ölçer (bench=true).
           python -m pip install --quiet torch==2.15.0 --index-url https://download.pytorch.org/whl/cpu
-          python -m pip install --quiet onnx onnxscript onnxruntime numpy sympy packaging imageio-ffmpeg
+          python -m pip install --quiet onnx==1.23.2 onnxscript onnxruntime==1.30.0 numpy sympy packaging imageio-ffmpeg
           # Hibrit grafikler: kare başına kodlayıcı/çözücü + 30 karelik zamansal çekirdek; FP32 ve FP16.
           python Models/Export.py --out AndroidTest/assets/onnx
           # Statik QDQ INT8 (simetrik, kanal başına; kalibrasyon: calib/c01–c08). Bellek için grafik başına
