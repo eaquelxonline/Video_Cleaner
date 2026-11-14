@@ -1,9 +1,11 @@
-"""VC-Quantize — hibrit grafiklerin simetrik, kanal başına statik QDQ INT8 nicelemesi.
+"""VC-Quantize — hibrit grafiklerin kanal başına statik QDQ INT8 nicelemesi.
 
 Neden statik QDQ: dinamik INT8 evrişimleri ``ConvInteger``'a çevirir ve ONNX Runtime'da optimize SIMD
 çekirdeği yoktur (x86 ölçümü: 6,7× YAVAŞ). Statik QDQ'da ağırlıklar kanal başına simetrik int8, ara
-değerler kalibrasyonla ölçeklenmiş simetrik int8'dir; ARM'da XNNPACK/KleidiAI SDOT / I8MM komutları ve
-Qualcomm HTP (QNN) bu biçimi doğrudan yürütür.
+değerler kalibrasyonla ölçeklenmiş ASİMETRİK int8'dir (sıfır noktalı); ARM'da ORT MLAS SDOT / I8MM komutları bu
+biçimi doğrudan yürütür. Asimetrik neden: ReLU'nun ardındaki Quantize sıfır noktası −128 olunca ORT ReLU'yu
+QLinearConv'a katar; simetrik etkinleştirmede (sıfır noktası 0) ReLU ayrı düğüm kalıyordu (14 Kasım, aarch64 ORT
+1.30 qemu: det_enc 9, mamba_dec 8 ayrı ReLU → 0; evrişimlerin tamamı QLinearConv). ``VC_ACT_SYMMETRIC=1`` eskisi.
 
 Kalibrasyon verisi: AndroidTest/assets/calib/c01–c08 (depodaki doğrulama klipleri). Her klipten ardışık
 kareler alınır; algılayıcı için tüm kare 288×512'ye, akış ve onarım için alt 128×512 altyazı şeridine
@@ -14,12 +16,13 @@ Not: eğitilmemiş ağırlıklarla kalibrasyon yalnızca hız ve operatör uyuml
 sonra aynı betik eğitilmiş FP32 grafiklerle yeniden çalıştırılır; doğruluk raporu o zaman anlamlıdır.
 
 Kullanım:
-    python Models/Quantize.py --onnx DIR --calib AndroidTest/assets/calib [--frames 30] [--measure]
+    python Models/Quantize.py --onnx DIR --calib AndroidTest/assets/calib [--frames 15] [--measure]
 """
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import time
@@ -28,7 +31,7 @@ from typing import Dict, List
 
 import numpy as np
 
-T = 30
+T = 15                # Core.WINDOW (pencere)
 DET_HW = (288, 512)
 ROI_HW = (128, 512)
 GRAPHS = ["det_enc", "det_core", "det_dec", "flow_enc", "flow_pair", "mamba_enc", "mamba_core", "mamba_dec"]
@@ -53,7 +56,7 @@ def decode(path: Path, frames: int, size: tuple, band: bool) -> np.ndarray:
 
 class Feeds(dict):
     """Grafik başına kalibrasyon girdileri; yalnızca istenen grafikler ve en çok ``limit`` örnek saklanır
-    (bellek: 30 karelik ara özellikler örnek başına onlarca MB)."""
+    (bellek: 15 karelik ara özellikler örnek başına onlarca MB)."""
 
     def __init__(self, wanted: List[str], limit: int):
         super().__init__({g: [] for g in GRAPHS})
@@ -127,11 +130,12 @@ class Reader:
         pass
 
 
-# Çekirdek grafikler (30 kare) kalibrasyonda tüm ara tensörlerini çıktı yapar: tam boyda 15 GB'ı aşıyor.
+# Çekirdek grafikler (15 kare) kalibrasyonda tüm ara tensörlerini çıktı yapar: tam boyda 15 GB'ı aşıyor.
 # Etkinleştirme aralıkları evrişim/MatMul'da uzamsal boyuttan büyük ölçüde bağımsız olduğundan, AYNI
 # ağırlıklarla küçük bir kopya (T=10, 1/8 ölçekte 16×16) kalibre edilir; aralıklar önbelleğe yazılır ve tam
 # boy grafik aynı önbellekle nicemlenir (tensör adları aynı modül yollarından gelir).
 SMALL = {"det_core": (10, 16, 16), "mamba_core": (10, 16, 16)}
+CORE_OUTPUTS = {"det_core": ["s2", "x16"], "mamba_core": ["s3", "x16", "next_context"]}   # Export.graphs ile aynı
 
 def activation_matmuls(path: Path) -> List[str]:
     """Gerçek 2 boyutlu ağırlığı OLMAYAN MatMul düğümleri (iki girdisi de etkinleştirme: SSD'nin 30×30 sönüm ⊙
@@ -153,6 +157,34 @@ def activation_matmuls(path: Path) -> List[str]:
                 if a.name == "value" and len(numpy_helper.to_array(a.t).shape) == 2:
                     weights.add(n.output[0])
     return [n.name for n in model.graph.node if n.op_type == "MatMul" and n.input[1] not in weights]
+
+
+OP_TYPES = ["Conv", "MatMul", "Gemm", "Add"]
+ACT_SYMMETRIC = os.environ.get("VC_ACT_SYMMETRIC", "0") == "1"
+
+
+def residual_adds(path: Path) -> List[str]:
+    """Artık bağlantı toplamaları: ``x + conv(...)`` (iki girdi de etkinleştirme, biri bir Conv çıktısı).
+
+    Bunlar nicemlenince (QLinearAdd) bir sonraki bloğun derinlik-yönlü evrişimi de INT8 girdi alır ve QLinearConv'a
+    kaynaşır; nicemlenmezse her bloğun ilk evrişimi FP32 kalıyordu (14 Kasım x86 incelemesi, det_enc'de 10 Conv).
+    """
+    import onnx
+
+    model = onnx.load(str(path), load_external_data=False)
+    fixed = {t.name for t in model.graph.initializer} | {o for n in model.graph.node if n.op_type == "Constant" for o in n.output}
+    producer = {o: n.op_type for n in model.graph.node for o in n.output}
+    return [n.name for n in model.graph.node if n.op_type == "Add" and len(n.input) == 2
+            and not any(i in fixed for i in n.input) and any(producer.get(i) == "Conv" for i in n.input)]
+
+
+def excluded(path: Path) -> List[str]:
+    """Nicemlenmeyecek düğümler: ağırlıksız MatMul'lar ve artık bağlantı OLMAYAN bütün Add'ler."""
+    import onnx
+
+    model = onnx.load(str(path), load_external_data=False)
+    keep = set(residual_adds(path))
+    return activation_matmuls(path) + [n.name for n in model.graph.node if n.op_type == "Add" and n.name not in keep]
 
 
 def small_core(onnx_dir: Path, name: str, feeds: List[Dict[str, np.ndarray]]):
@@ -179,8 +211,10 @@ def small_core(onnx_dir: Path, name: str, feeds: List[Dict[str, np.ndarray]]):
     names = list(small_feeds[0])
     path = onnx_dir / f"vc_{name}_calib_small.onnx"
     with torch.no_grad():
+        # Çıktı adları tam boy grafikle AYNI olmalı: aralık önbelleği tensör adıyla eşleşir (BN katlandıktan sonra
+        # evrişim çıktısı doğrudan grafik çıktısı s2/s3 olabiliyor).
         torch.onnx.export(module, tuple(torch.from_numpy(small_feeds[0][n]) for n in names), str(path), input_names=names,
-                          opset_version=18, dynamo=False, do_constant_folding=True)
+                          output_names=CORE_OUTPUTS[name], opset_version=18, dynamo=False, do_constant_folding=True)
     return path, small_feeds
 
 
@@ -206,9 +240,9 @@ def quantize(onnx_dir: Path, feeds: Dict[str, List[Dict[str, np.ndarray]]], only
             quantize_static(
                 str(small_pre), str(onnx_dir / f"vc_{g}_calib_small_int8.onnx"), Reader(small_feeds),
                 quant_format=QuantFormat.QDQ, per_channel=True, weight_type=QuantType.QInt8, activation_type=QuantType.QInt8,
-                op_types_to_quantize=["Conv", "MatMul", "Gemm"], nodes_to_exclude=activation_matmuls(small_pre),
+                op_types_to_quantize=OP_TYPES, nodes_to_exclude=excluded(small_pre),
                 calibrate_method=CalibrationMethod.MinMax,
-                extra_options={"ActivationSymmetric": True, "WeightSymmetric": True},
+                extra_options={"ActivationSymmetric": ACT_SYMMETRIC, "WeightSymmetric": True},
                 calibration_cache_path=str(cache),
             )
             for f in (small, small_pre, onnx_dir / f"vc_{g}_calib_small_int8.onnx"):
@@ -218,10 +252,10 @@ def quantize(onnx_dir: Path, feeds: Dict[str, List[Dict[str, np.ndarray]]], only
             str(pre), str(out), Reader(calib_feeds) if calib_feeds is not None else None,
             quant_format=QuantFormat.QDQ, per_channel=True,
             weight_type=QuantType.QInt8, activation_type=QuantType.QInt8,
-            op_types_to_quantize=["Conv", "MatMul", "Gemm"],
-            nodes_to_exclude=activation_matmuls(pre),
+            op_types_to_quantize=OP_TYPES,
+            nodes_to_exclude=excluded(pre),
             calibrate_method=CalibrationMethod.MinMax,
-            extra_options={"ActivationSymmetric": True, "WeightSymmetric": True},
+            extra_options={"ActivationSymmetric": ACT_SYMMETRIC, "WeightSymmetric": True},
             calibration_cache_path=str(cache) if cache else None,
         )
         pre.unlink(missing_ok=True)

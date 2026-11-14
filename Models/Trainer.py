@@ -66,7 +66,7 @@ from PIL import Image, ImageDraw, ImageFilter, ImageFont
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from Core import (  # noqa: E402
-    HALF, PARAM_BUDGET, TARGET_A, WINDOW, EngineConfig, VideoCleaner, composite, coords_grid,
+    PARAM_BUDGET, STRIDE, TARGET_A, WINDOW, EngineConfig, VideoCleaner, composite, coords_grid,
     count_parameters, dilate, format_parameter_report, haar_dwt, linear_to_srgb, srgb_to_linear, warp,
 )
 from Video_Detector import HEADS as DETECTOR_HEADS, DetectorConfig, VideoDetector  # noqa: E402
@@ -113,7 +113,7 @@ class TrainConfig:
     warmup: int = 1000
     grad_clip: float = 1.0
     ema_decay: float = 0.999
-    mode_a_prob: float = 0.25            # Mamba/ortak aşamada Mod A (yalnızca 14. kare) adımı oranı
+    mode_a_prob: float = 0.25            # Mamba/ortak aşamada Mod A (yalnızca 7. kare) adımı oranı
     truncate_prob: float = 0.2           # dolgulu (kısa sahne) pencere oranı
     amp: bool = True
     checkpointing: bool = True           # aktivasyon denetim noktası (VRAM ↓, süre ↑)
@@ -152,7 +152,7 @@ def tiny_engine_config(checkpoint: bool = False) -> EngineConfig:
     return EngineConfig(
         detector=DetectorConfig(widths=(8, 16, 24, 32), depths=(1, 1, 1, 1), decoder_depths=(1, 1, 1), temporal_depths=(1, 1), use_checkpoint=checkpoint),
         flow=FlowConfig(encoder_widths=(16, 24, 32), feature_dim=32, context_dim=16, hidden_dim=24, corr_radius=2, corr_levels=2, iters=3, use_checkpoint=checkpoint),
-        mamba=MambaConfig(widths=(8, 16, 24, 32), enc_depths=(1, 1, 1, 1), dec_depths=(1, 1, 1), ssm_state=4, attn_window=4, attn_heads=4, use_checkpoint=checkpoint),
+        mamba=MambaConfig(widths=(8, 16, 24, 32), dec_widths=(12, 8, 4), enc_depths=(1, 1, 1, 1), dec_depths=(1, 1, 1), ssm_state=4, attn_window=4, attn_heads=4, use_checkpoint=checkpoint),
     )
 
 
@@ -445,7 +445,7 @@ class ClipSynthesizer:
         }
 
     def folder_clip(self) -> Batch:
-        """Diskteki bir klipten rastgele 30 kare ve rastgele kırpım (gerçek akış bilinmez)."""
+        """Diskteki bir klipten rastgele WINDOW (15) kare ve rastgele kırpım (gerçek akış bilinmez)."""
         cfg, rng = self.cfg, self.rng
         t, (h, w) = cfg.frames, cfg.crop
         files = rng.choice(self.clips)
@@ -1077,7 +1077,7 @@ def evaluate(
     temporal_excess       : maske bölgesinde, gerçek videonun üstünde kalan çarpıtma hatası
     temporal_ewarp        : onarılan bölgede E_warp (MSE; örtülme, güvenilmez akış ve sahne geçişi dışı)
     temporal_ewarp_source : aynı piksellerde TEMİZ videonun E_warp'ı (karşılaştırma tabanı)
-    boundary_jump         : 14→15 blok sınırı çiftinin fazlalık hatası − diğer çiftlerin ortancası
+    boundary_jump         : 7→8 (Mod A hedefi → sonraki) çiftinin fazlalık hatası − diğer çiftlerin ortancası
     detector_iou, missed_overlay, scene_text_erased, flow_epe : ara modellerin doğruluğu
     """
     engine.eval()
@@ -1117,7 +1117,7 @@ def evaluate(
                 masked_mean((clean[:, :-1] - warp_pairs(clean, fw)).pow(2).mean(2, keepdim=True), pair_region).item()
                 if pair_region.sum() > 0 else float("nan")
             )
-            # Blok sınırı 14→15 (Mod A hedefi ile sonraki yarı): bu çiftin fazlalık hatası diğer
+            # Mod A hedefi → sonraki kare (7→8): bu çiftin fazlalık hatası diğer
             # çiftlerin ortancasını aşmamalı ("sıçrama yok").
             per_pair = [
                 masked_mean(F.relu(e_out - e_true)[:, i], pair_region[:, i]).item()
@@ -1187,7 +1187,7 @@ TESTER_GATES = (
     ("restoration", "LPIPS", "restoration_lpips", "<", 0.04, "AlexNet LPIPS"),
     ("restoration", "kalan yazı hatası (TER)", "restoration_ter", "<", 0.005, "OCR gerekir (<%0,5)"),
     ("temporal", "E_warp", "temporal_ewarp", "<", 0.0020, "MSE, onarılan bölge"),
-    ("temporal", "14→15 blok sınırı sıçraması", "boundary_jump", "<=", 1e-4, "fazlalık − ortanca"),
+    ("temporal", "7→8 hedef sınırı sıçraması", "boundary_jump", "<=", 1e-4, "fazlalık − ortanca"),
 )
 
 _OPS = {"==": lambda a, b: a == b, "<": lambda a, b: a < b, "<=": lambda a, b: a <= b, ">=": lambda a, b: a >= b}
@@ -1617,8 +1617,9 @@ def selftest(device: torch.device) -> None:
         out_a = full(batch["frames"], batch["valid"], mode="A", override=override)
     outside = ~out_b["mask"].expand_as(batch["frames"])
     check("bit-exact kapı: maskesiz pikseller girdiyle birebir aynı", torch.equal(out_b["restored"][outside], batch["frames"][outside]))
-    check("Mod A (14+1+15) = Mod B'nin 14. karesi", torch.allclose(out_a["restored"][:, 0], out_b["restored"][:, TARGET_A], atol=1e-4))
-    check("Mod B 30 kare, Mod A 1 kare üretir", out_b["restored"].shape[1] == WINDOW and out_a["restored"].shape[1] == 1 and HALF * 2 == WINDOW)
+    check("Mod A (7+1+7) = Mod B'nin 7. karesi", torch.allclose(out_a["restored"][:, 0], out_b["restored"][:, TARGET_A], atol=1e-4))
+    check("Mod B 15 kare, Mod A 1 kare üretir", out_b["restored"].shape[1] == WINDOW and out_a["restored"].shape[1] == 1
+          and WINDOW == 15 and STRIDE == 11 and TARGET_A == WINDOW // 2)
 
     # Dinamik ROI tüpü ve akıllı bypass (çıkarım yolu)
     with torch.no_grad():
@@ -1651,9 +1652,9 @@ def selftest(device: torch.device) -> None:
 
     # Geçerlilik maskeli zamansal kayıp: sahne geçişi olan çift tamamen, örtülen pikseller dışlanır.
     spliced = batch["clean"].clone()
-    spliced[:, 15:] = 1 - spliced[:, 15:].flip(-1)
+    spliced[:, 8:] = 1 - spliced[:, 8:].flip(-1)
     keep, _ = temporal_validity(spliced, batch["flow_fw"], batch["valid"])
-    check("sahne geçişi çifti (14→15) zamansal kayıptan dışlanır", not bool(keep[:, 14].any()) and bool(keep[:, :14].any()))
+    check("sahne geçişi çifti (7→8) zamansal kayıptan dışlanır", not bool(keep[:, 7].any()) and bool(keep[:, :7].any()))
     unreliable = torch.zeros_like(keep)
     keep2, _ = temporal_validity(batch["clean"], batch["flow_fw"], batch["valid"], unreliable)
     check("VC-Flow'un güvenmediği pikseller dışlanır", not bool(keep2.any()))

@@ -1,6 +1,6 @@
 """VC-Export — üç modelin hibrit çıkarım grafikleri (telefon) ve iskelet ölçümü.
 
-Mimari ilke: ONNX yalnızca evrişim / matris çarpımı hızlandırıcısıdır. Kontrol akışı, 30 karelik
+Mimari ilke: ONNX yalnızca evrişim / matris çarpımı hızlandırıcısıdır. Kontrol akışı, 15 karelik
 pencere, ara özelliklerin saklanması ve kareler arası yönetim grafiğin DIŞINDA (Rust halka tamponu /
 Kotlin) yapılır. Her model üç parçaya bölünür; bileşimleri tam modelle birebir aynıdır (Trainer
 selftest "hibrit bölme" denetimi):
@@ -37,11 +37,12 @@ import torch
 import torch.nn as nn
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from Core import STRIDE, WINDOW, fold_layer_scale  # noqa: E402
 from Video_Detector import DetectorConfig, VideoDetector  # noqa: E402
 from Video_Flow import FlowConfig, VideoFlow  # noqa: E402
 from Video_Mamba import MambaConfig, VideoMamba  # noqa: E402
 
-T = 30
+T = WINDOW            # 15 (Core.WINDOW)
 DET_HW = (288, 512)       # algılayıcı: tüm kare (küçültülmüş)
 ROI_HW = (128, 512)       # akış ve onarım: altyazı şeridi ROI'si
 
@@ -53,6 +54,9 @@ class Fn(nn.Module):
         super().__init__()
         self.owner = owner
         self.fn = fn
+        # torch.onnx.export dışa aktarımdan sonra modülün eğitim kipini geri yükler; sarmalayıcı eğitim
+        # kipinde kalırsa sahibini de eğitim kipine sokar ve BatchNorm yığın istatistiğine geçer.
+        self.eval()
 
     def forward(self, *args):
         return self.fn(*args)
@@ -63,7 +67,8 @@ def models():
     det = VideoDetector(DetectorConfig(infer_chunk=0)).eval()
     flow = VideoFlow(FlowConfig(infer_chunk=0, query_chunk=0)).eval()
     mamba = VideoMamba(MambaConfig(infer_chunk=0, ssm_token_chunk=0)).eval()
-    return det, flow, mamba
+    # Katman ölçeği son evrişime katlanır (birebir aynı sonuç; grafikte ayrı Mul kalmaz). BN zaten eval'de.
+    return tuple(fold_layer_scale(m) for m in (det, flow, mamba))
 
 
 def graphs():
@@ -168,7 +173,7 @@ def export_all(out_dir: Path, opset: int, check: bool) -> list:
 
 
 def measure_pipeline(out_dir: Path, kind: str, threads: int = 4) -> dict:
-    """Tek pencere (30 kare) boyunca tüm hattı zincirler: kare başına kodlayıcılar, çekirdekler, çiftler,
+    """Tek pencere (15 kare) boyunca tüm hattı zincirler: kare başına kodlayıcılar, çekirdekler, çiftler,
     çözücüler. Ara özellikler süreç belleğinde (telefonda Rust halka tamponu) tutulur."""
     import numpy as np
     import onnxruntime as ort
@@ -208,14 +213,16 @@ def measure_pipeline(out_dir: Path, kind: str, threads: int = 4) -> dict:
     # Onarım
     packed = [rnd(1, 15, rh, rw) for _ in range(T)]
     me = [run("mamba_enc", {"packed": p}) for p in packed]
-    s3, m16, _ = run("mamba_core", {"x8": np.concatenate([e[2] for e in me]), "valid": valid, "context": rnd(1, 456)})
+    ctx_dim = sess["mamba_core"].get_inputs()[2].shape[1]
+    s3, m16, _ = run("mamba_core", {"x8": np.concatenate([e[2] for e in me]), "valid": valid, "context": rnd(1, ctx_dim)})
     for i in range(T):
         run("mamba_dec", {"packed": packed[i], "x16": m16[i:i + 1], "s3": s3[i:i + 1], "s2": me[i][1], "s1": me[i][0]})
-    # Mod B: pencere 15 kare kayar → kare başına maliyet: kodlayıcı + 2 çift + 2 çözücü (iki pencerede) + çekirdek/15
-    per = {n: round(v * 1000 / (T if not n.endswith("core") else 15), 1) for n, v in times.items()}
+    # Mod B: pencere STRIDE (11) kare kayar → kare başına maliyet: kodlayıcı + 2 çift + çözücü × 15/11
+    # (örtüşen 4 kare iki pencerede çözülür) + çekirdek/11. Kodlayıcı ve çift halkada yeniden kullanılır.
+    per = {n: round(v * 1000 / (T if not n.endswith("core") else STRIDE), 1) for n, v in times.items()}
     per["flow_pair"] = round(times["flow_pair"] * 1000 / T, 1)
-    per["det_dec"] = round(times["det_dec"] * 1000 / T * 2, 1)
-    per["mamba_dec"] = round(times["mamba_dec"] * 1000 / T * 2, 1)
+    per["det_dec"] = round(times["det_dec"] * 1000 / STRIDE, 1)
+    per["mamba_dec"] = round(times["mamba_dec"] * 1000 / STRIDE, 1)
     total = round(sum(per.values()), 1)
     return {"kind": kind, "threads": threads, "load_s": round(load_s, 1), "frame_ms": per, "frame_ms_total": total,
             "peak_rss_mb": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024}

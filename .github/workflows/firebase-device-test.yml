@@ -122,9 +122,11 @@ jobs:
           # ZzInferenceSkeletonTest operatör uyumluluğunu, süreyi ve belleği ölçer (bench=true).
           python -m pip install --quiet torch==2.15.0 --index-url https://download.pytorch.org/whl/cpu
           python -m pip install --quiet onnx==1.23.2 onnxscript onnxruntime==1.30.0 numpy sympy packaging imageio-ffmpeg
-          # Hibrit grafikler: kare başına kodlayıcı/çözücü + 30 karelik zamansal çekirdek; FP32 ve FP16.
+          # Hibrit grafikler: kare başına kodlayıcı/çözücü + 15 karelik zamansal çekirdek (BN+ReLU, yarı genişlik Mamba).
           python Models/Export.py --out AndroidTest/assets/onnx
-          # Statik QDQ INT8 (simetrik, kanal başına; kalibrasyon: calib/c01–c08). Bellek için grafik başına
+          # 14 Kasım mimari kararı: telefonda yalnızca INT8 (+ karşılaştırma için FP32) ORT CPU; FP16 APK'ya girmez.
+          rm -f AndroidTest/assets/onnx/*_fp16.onnx
+          # Statik QDQ INT8 (ağırlık simetrik kanal başına, etkinleştirme asimetrik; kalibrasyon: calib/c01–c08). Bellek için grafik başına
           # ayrı süreç; çekirdekler küçük kopyada kalibre edilip aralık önbelleğiyle nicemlenir.
           for g in det_enc det_core det_dec flow_enc flow_pair mamba_enc mamba_core mamba_dec; do
             case $g in *core) lim=2; clips=c01,c05;; *) lim=32; clips=c01,c02,c03,c04,c05,c06,c07,c08;; esac

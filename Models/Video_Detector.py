@@ -34,7 +34,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from Core import ConvBlock, Downsample, LayerNorm2d, Upsample, check_window, flatten_time, run_block, unflatten_time
+from Core import ConvBlock, Downsample, Norm2d, Upsample, check_window, flatten_time, run_block, unflatten_time
 
 HEADS: Tuple[Tuple[str, int], ...] = (
     ("overlay_logit", 1),
@@ -60,25 +60,29 @@ class DetectorConfig:
 
 
 class TemporalMix(nn.Module):
-    """Kareler arası karıştırma: zaman ekseninde derinlik-yönlü evrişim + nokta evrişim.
+    """Kareler arası karıştırma: zaman ekseninde derinlik-yönlü evrişim → BN → ReLU → nokta evrişim.
 
-    Dolgu kareleri (valid=False) karıştırmaya sıfır olarak girer.
+    Dolgu kareleri (valid=False) karıştırmaya sıfır olarak girer. BN, Conv3d'nin ardındadır (ona katlanır);
+    katman ölçeği dışa aktarımda ``pw``'ye katlanır (``fold_layer_scale``).
     """
+
+    scale_target = "pw"
 
     def __init__(self, dim: int, kernel: int = 5):
         super().__init__()
-        self.norm = LayerNorm2d(dim)
         self.dw = nn.Conv3d(dim, dim, (kernel, 1, 1), padding=(kernel // 2, 0, 0), groups=dim)
+        self.norm = nn.BatchNorm3d(dim, eps=1e-5, momentum=0.01)
         self.pw = nn.Conv2d(dim, dim, 1)
         self.gamma = nn.Parameter(torch.full((1, dim, 1, 1), 1e-2))
+        self.scale_folded = False
 
     def forward(self, x: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
         """x: [B·T, C, h, w], valid: [B, T] (float veya bool)."""
         b, t = valid.shape
-        y = unflatten_time(self.norm(x), b) * valid.view(b, t, 1, 1, 1).to(x.dtype)
-        y = self.dw(y.transpose(1, 2)).transpose(1, 2)                  # [B, T, C, h, w]
-        y = self.pw(F.gelu(y.reshape(b * t, *y.shape[2:])))
-        return x + self.gamma * y
+        y = unflatten_time(x, b) * valid.view(b, t, 1, 1, 1).to(x.dtype)
+        y = self.norm(self.dw(y.transpose(1, 2))).transpose(1, 2)        # [B, T, C, h, w]
+        y = self.pw(F.relu(y.reshape(b * t, *y.shape[2:])))
+        return x + (y if self.scale_folded else self.gamma * y)
 
 
 class VideoDetector(nn.Module):
@@ -90,7 +94,7 @@ class VideoDetector(nn.Module):
         w, d = cfg.widths, cfg.depths
         block = lambda dim: ConvBlock(dim, cfg.expansion, kernel=5)
 
-        self.stem = nn.Sequential(nn.Conv2d(3, w[0], 3, stride=2, padding=1), LayerNorm2d(w[0]))
+        self.stem = nn.Sequential(nn.Conv2d(3, w[0], 3, stride=2, padding=1), Norm2d(w[0]), nn.ReLU())
         self.enc = nn.ModuleList([nn.ModuleList([block(w[i]) for _ in range(d[i])]) for i in range(4)])
         self.down = nn.ModuleList([Downsample(w[i], w[i + 1]) for i in range(3)])
         self.temporal8 = nn.ModuleList([TemporalMix(w[2], cfg.temporal_kernel) for _ in range(cfg.temporal_depths[0])])
@@ -103,7 +107,7 @@ class VideoDetector(nn.Module):
         )
         self.head = nn.Sequential(
             nn.Conv2d(w[0], w[0], 3, padding=1),
-            nn.GELU(),
+            nn.ReLU(),
             nn.Conv2d(w[0], OUT_CHANNELS * 4, 1),
             nn.PixelShuffle(2),
         )
@@ -130,7 +134,7 @@ class VideoDetector(nn.Module):
                 x = run_block(blk, x, use_checkpoint=self.config.use_checkpoint)
         return self.head(x)
 
-    # ---- Hibrit çıkarım (telefon): kare başına kodlayıcı / 30 karelik zamansal çekirdek / kare başına çözücü.
+    # ---- Hibrit çıkarım (telefon): kare başına kodlayıcı / 15 karelik zamansal çekirdek / kare başına çözücü.
     # Ara özellikler grafiğin dışında (Rust halka tamponu) tutulur; her kare BİR kez kodlanır. Üçünün
     # bileşimi ``forward`` ile aynı sonucu verir (selftest denetler).
 

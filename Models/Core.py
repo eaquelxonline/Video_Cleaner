@@ -19,15 +19,16 @@ Tensör sözleşmesi (tüm modeller için ortak)
 -------------------------------------------
     frames : float [B, T, 3, H, W]   RGB, 0..1, gama kodlu (BT.709/sRGB)
     valid  : bool  [B, T]            False = dolgu konumu (sahne/akış sınırı)
-    T      : 30 (WINDOW); H ve W 16'nın katı olmalı (720p: 1280×720 ✓)
+    T      : 15 (WINDOW); H ve W 16'nın katı olmalı (720p: 1280×720 ✓)
 
 Pencere modları (Rust/Core.rs içindeki Scheduler ile aynı tanım)
 ----------------------------------------------------------------
-    Mod B (15+15) : 30 kare girer, 30 kare çıkar; pencere 15 kare kayar ve örtüşen
-                    tahminler ``öncelik × güven`` ile harmanlanır.
-    Mod A (14+1+15): aynı 30 kare girer, yalnızca 14. konum çözülür.
+    Mod B (11+4)  : 15 kare girer, 15 kare çıkar; pencere 11 kare kayar, ardışık iki pencere 4 karede
+                    örtüşür ve örtüşen tahminler ``öncelik × güven`` ile harmanlanır (sınır sıçraması yok).
+    Mod A (7+1+7) : aynı 15 kare girer, yalnızca 7. konum çözülür.
     İki mod AYNI ağırlıkları ve AYNI kodlayıcıyı kullanır; aynı pencere için
-    Mod A çıktısı Mod B çıktısının 14. karesine eşittir (test_engine ile denetlenir).
+    Mod A çıktısı Mod B çıktısının 7. karesine eşittir (test_engine ile denetlenir).
+    14 Kasım telefon ölçümünden sonra 30 → 15: 30 karelik ara bellek halkası 526 MB'tı.
 
 İçe aktarma: dosyalar ``Models/`` dizininden düz modül olarak yüklenir
 (``python Models/Trainer.py`` veya ``sys.path``'e ``Models`` eklenerek).
@@ -44,9 +45,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as _checkpoint
 
-WINDOW = 30          # modelin tek geçişte gördüğü kare sayısı
-HALF = 15            # 15+15 bloğunun yarısı, Mod B'nin olağan kayması
-TARGET_A = 14        # Mod A'da hedef karenin konumu (14 geçmiş + hedef + 15 gelecek)
+WINDOW = 15          # modelin tek geçişte gördüğü kare sayısı
+STRIDE = 11          # Mod B'nin kayması
+OVERLAP = WINDOW - STRIDE   # ardışık pencerelerin ortak kare sayısı (4; harmanlanır)
+TARGET_A = 7         # Mod A'da hedef karenin konumu (7 geçmiş + hedef + 7 gelecek)
 
 # Başlangıç parametre bütçeleri. Bunlar ÜST SINIRDIR: modeller bu sayıları
 # doldurmak için kullanılmayan parametre içermez (bkz. parameter_report).
@@ -59,42 +61,69 @@ SYSTEM_NAMES = {"detector": "VC-Detector", "flow": "VC-Flow", "mamba": "VC-Mamba
 # 1. Ortak katmanlar
 # =============================================================================
 
-class LayerNorm2d(nn.GroupNorm):
-    """Kanal-uzam üzerinde tek gruplu normalizasyon.
+class Norm2d(nn.BatchNorm2d):
+    """Evrişim bloklarının normalizasyonu: BatchNorm2d, her zaman bir evrişimin ARDINDAN (son-norm).
 
-    BatchNorm bilerek kullanılmaz: eğitim mikro-yığın 1 ile yapılır ve çıkarımda
-    çözünürlük değişebilir.
+    Çıkarımda BN sabit bir kanal başına ölçek + kaydırmadır ve önündeki evrişime katlanır (ORT
+    Conv+BN birleştirmesi): grafikte ayrı düğüm kalmaz, QDQ'da evrişim + ReLU tek QLinearConv olur.
+    14 Kasım telefon ölçümü: LayerNorm2d (GroupNorm(1)) birleşmeyi kırıyordu; x86'da INT8 det_enc
+    92,1 → 35,5 ms. Eğitimde istatistik B·T kare üzerinden toplanır (pencere başına 15 kare).
+    Dizi normalizasyonu (Bi-SSM, pencere dikkati, bağlam köprüsü) zamansal çekirdekte değişmeden kalır.
     """
 
     def __init__(self, channels: int):
-        super().__init__(1, channels, eps=1e-6)
+        super().__init__(channels, eps=1e-5, momentum=0.01)
 
 
 class ConvBlock(nn.Module):
-    """ConvNeXt tarzı artık blok: derinlik-yönlü k×k → norm → 1×1 genişlet → GELU → 1×1."""
+    """ConvNeXt tarzı artık blok (mobil): derinlik-yönlü k×k → BN → 1×1 genişlet → ReLU → 1×1.
+
+    ReLU, GELU'nun aksine QDQ'da evrişimle tek QLinearConv'a kaynaşır. Katman ölçeği (``gamma``)
+    eğitimde ayrı parametredir; dışa aktarımda ``fold_layer_scale`` ile ``pw2``'ye katlanır.
+    """
 
     def __init__(self, dim: int, expansion: int = 4, kernel: int = 7, layer_scale: float = 1e-2):
         super().__init__()
         self.dw = nn.Conv2d(dim, dim, kernel, padding=kernel // 2, groups=dim)
-        self.norm = LayerNorm2d(dim)
+        self.norm = Norm2d(dim)
         self.pw1 = nn.Conv2d(dim, dim * expansion, 1)
         self.pw2 = nn.Conv2d(dim * expansion, dim, 1)
         self.gamma = nn.Parameter(torch.full((1, dim, 1, 1), layer_scale))
+        self.scale_folded = False
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x + self.gamma * self.pw2(F.gelu(self.pw1(self.norm(self.dw(x)))))
+        y = self.pw2(F.relu(self.pw1(self.norm(self.dw(x)))))
+        return x + (y if self.scale_folded else self.gamma * y)
+
+
+def fold_layer_scale(model: nn.Module) -> nn.Module:
+    """Çıkarım için: ``x + γ·conv(z)`` → ``x + conv'(z)`` (γ son evrişimin ağırlık ve önyargısına katlanır).
+
+    Sonuç birebir aynıdır; grafikte γ çarpımı (QDQ'da evrişim ile toplama arasındaki ayrı Mul) kalmaz.
+    ``scale_folded`` ve ``gamma`` taşıyan her modülün katlanacak evrişimi ``scale_target`` ile adlandırılır.
+    """
+    with torch.no_grad():
+        for m in model.modules():
+            if getattr(m, "scale_folded", None) is False and isinstance(getattr(m, "gamma", None), torch.Tensor):
+                conv = getattr(m, getattr(m, "scale_target", "pw2"))
+                g = m.gamma.detach().reshape(-1)
+                conv.weight.mul_(g.view(-1, *([1] * (conv.weight.dim() - 1))))
+                if conv.bias is not None:
+                    conv.bias.mul_(g)
+                m.scale_folded = True
+    return model
 
 
 class Downsample(nn.Module):
-    """2× küçültme (norm + adım-2 evrişim)."""
+    """2× küçültme: adım-2 evrişim → BN (son-norm; BN evrişime katlanır)."""
 
     def __init__(self, cin: int, cout: int):
         super().__init__()
-        self.norm = LayerNorm2d(cin)
         self.conv = nn.Conv2d(cin, cout, 2, stride=2)
+        self.norm = Norm2d(cout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.conv(self.norm(x))
+        return self.norm(self.conv(x))
 
 
 class Upsample(nn.Module):
@@ -116,7 +145,7 @@ def run_block(block: nn.Module, *args: torch.Tensor, use_checkpoint: bool = Fals
     * Çıkarım (gradyan kapalı) + ``chunk`` > 0: KARE BAŞINA çalışan bloklar yığın
       boyutunda ``chunk``'lık dilimlerle işlenir. Sonuç birebir aynıdır (kareler bu
       bloklarda birbirinden bağımsızdır); yalnızca blok içi geçici bellek (ör. 1/2
-      ölçekte 4× genişletme) 30 kare yerine ``chunk`` kare kadar yer tutar.
+      ölçekte 4× genişletme) 15 kare yerine ``chunk`` kare kadar yer tutar.
     """
     if torch.is_grad_enabled():
         if use_checkpoint and any(a.requires_grad for a in args if torch.is_tensor(a)):
@@ -550,7 +579,7 @@ class VideoCleaner(nn.Module):
         detach_priors: bool = True,
         context_state: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
-        """Bir 30 karelik pencereyi onarır.
+        """Bir 15 karelik pencereyi onarır.
 
         Args:
             frames   [B, T, 3, H, W]
@@ -575,7 +604,7 @@ class VideoCleaner(nn.Module):
             context_state bir sonraki pencereye aktarılacak özet (ROI/bypass'ta önceki aynen)
             roi      (y0, y1, x0, x1) VC-Mamba'nın çalıştığı bölge, None = tam kare, boş = atlandı
             + ara çıktılar: det, flows, mask_soft, priors
-        T' = 30 (Mod B) veya 1 (Mod A).
+        T' = 15 (Mod B) veya 1 (Mod A).
         """
         if mode not in ("A", "B"):
             raise ValueError("mode 'A' veya 'B' olmalı")
@@ -686,10 +715,10 @@ class VideoCleaner(nn.Module):
     def restore_video(self, video: torch.Tensor, cuts: Tuple[int, ...] = (), precision: Tuple[int, ...] = ()) -> Dict[str, torch.Tensor]:
         """Uzun bir klibi Rust zamanlayıcısıyla AYNI pencere düzeninde onarır (değerlendirme için).
 
-        Olağan akış Mod B'dir: pencereler 15 kare kayar, her karenin iki tahmini
-        ``öncelik × güven`` ile harmanlanır; öncelik = 1 + min(geçerli geçmiş, geçerli
-        gelecek). ``precision`` içindeki karelerin sonucu Mod A (14+1+15) tahminiyle
-        değiştirilir.
+        Olağan akış Mod B'dir: pencereler STRIDE (11) kare kayar, ardışık iki pencere OVERLAP (4)
+        karede örtüşür; örtüşen karelerin iki tahmini ``öncelik × güven`` ile harmanlanır; öncelik =
+        1 + min(geçerli geçmiş, geçerli gelecek) — pencere kenarındaki tahmin az, ortadaki çok ağırlık
+        alır. ``precision`` içindeki karelerin sonucu Mod A (7+1+7) tahminiyle değiştirilir.
         Pencereler ``cuts`` ile verilen sahne başlangıçlarını aşmaz; eksik konumlar
         dolgudur (valid=False).
 
@@ -713,22 +742,18 @@ class VideoCleaner(nn.Module):
             return frames.unsqueeze(0), ok.unsqueeze(0)
 
         for seg_lo, seg_hi in zip(bounds[:-1], bounds[1:]):
-            # Scheduler'daki B(j) adımı: e = sıradaki kesinleşecek kare, j = min(15, kalan).
-            # Pencere [e+j-15, e+j+15); konum [15-j, 15) kesinleşir, [15, 30) bir sonraki
-            # pencereyle harmanlanır. Her kare böylece (en çok) iki tahmin alır.
-            e = seg_lo
+            # Pencereler [b, b+15), b = seg_lo, seg_lo+11, …; son pencere sahne sonunu geçerse dolguludur.
+            base = seg_lo
             context = None          # sahne başında bloklar arası bağlam sıfırlanır
-            while e < seg_hi:
-                j = min(HALF, seg_hi - e)
-                base = e + j - HALF
+            while True:
                 frames, ok = window(base, seg_lo, seg_hi)
                 out = self(frames, ok, mode="B", context_state=context)
                 context = out["context_state"]
                 okv = ok[0]
                 past = torch.cumsum(okv.int(), 0) - okv.int()
                 future = okv.int().sum() - past - okv.int()
-                prior = (1 + torch.minimum(past, future)).clamp(max=HALF).float()
-                for pos in range(HALF - j, WINDOW):
+                prior = (1 + torch.minimum(past, future)).float()
+                for pos in range(WINDOW):
                     if not bool(okv[pos]):
                         continue
                     i = base + pos
@@ -738,7 +763,9 @@ class VideoCleaner(nn.Module):
                     weight[i] += wgt
                     mask_any[i] |= m
                     best_conf[i] = torch.maximum(best_conf[i], out["confidence"][0, pos].float() * m)
-                e += j
+                if base + WINDOW >= seg_hi:
+                    break
+                base += STRIDE
             for i in precision:
                 if seg_lo <= i < seg_hi:
                     frames, ok = window(i - TARGET_A, seg_lo, seg_hi)
@@ -773,8 +800,8 @@ def format_parameter_report(report: Dict[str, Dict[str, float]]) -> str:
 
 
 __all__ = [
-    "WINDOW", "HALF", "TARGET_A", "PARAM_BUDGET", "SYSTEM_NAMES", "roi_tube",
-    "LayerNorm2d", "ConvBlock", "Downsample", "Upsample", "run_block",
+    "WINDOW", "STRIDE", "OVERLAP", "TARGET_A", "PARAM_BUDGET", "SYSTEM_NAMES", "roi_tube",
+    "Norm2d", "fold_layer_scale", "ConvBlock", "Downsample", "Upsample", "run_block",
     "flatten_time", "unflatten_time", "count_parameters", "check_window",
     "srgb_to_linear", "linear_to_srgb", "composite", "analytic_background",
     "coords_grid", "sample_at", "warp", "in_bounds", "occlusion_mask", "pull_pixels",

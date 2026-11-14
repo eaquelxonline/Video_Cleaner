@@ -1,12 +1,12 @@
 """VC-Mamba (Video_Mamba) — çok ölçekli, çift yönlü durum uzayı (Bi-SSM) restorasyon omurgası.
 
 Görev: deterministik aşamaların (analitik alfa çözümü, piksel çekme) kurtaramadığı
-bölgeyi 30 karelik zamansal bağlamla tamamlamak ve her piksel için belirsizlik
+bölgeyi 15 karelik zamansal bağlamla tamamlamak ve her piksel için belirsizlik
 üretmek. Model her pikseli sıfırdan üretmez: önsellerin güvenle harmanlandığı bir
 taban görüntünün üzerine ARTIK (residual) tahmin eder.
 
     Uzamsal kodlayıcı (1/2 → 1/4)        yerel kenar, doku, geometri
-    Bi-SSM zamansal çekirdek (1/8, 1/16) 30 kare boyunca ileri + geri bilgi aktarımı
+    Bi-SSM zamansal çekirdek (1/8, 1/16) 15 kare boyunca ileri + geri bilgi aktarımı
     Yerel dikkat (1/16)                  pencere içi uzun menzilli uzamsal ilişki
     Kare başına çözücü (1/8 → tam)       atlama bağlantılarıyla ince detay
     Bloklar arası bağlam köprüsü         önceki 15 karelik bloğun özeti (context_state) bir
@@ -20,7 +20,7 @@ Tasarım kararları
       30, yığın = B·h·w. 30 adımlık döngü düz PyTorch ile yeterince hızlıdır; özel
       CUDA çekirdeği veya ``mamba-ssm`` paketi gerekmez.
     * Zamansal katmanlar yalnızca kodlayıcıdadır; çözücü tümüyle kare başınadır. Bu
-      sayede Mod A (14+1+15) yalnızca hedef kareyi çözerek çözücü maliyetinin ~29/30'unu
+      sayede Mod A (7+1+7) yalnızca hedef kareyi çözerek çözücü maliyetinin ~14/15'unu
       atlar ve aynı pencere için Mod B'nin 14. karesiyle AYNI sonucu verir.
     * Tarama fp32'de yapılır (BF16'nın 8 bitlik mantisi yinelemeli durumda hata
       biriktirir); geri kalan her şey autocast altındadır.
@@ -51,7 +51,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from Core import ConvBlock, Downsample, LayerNorm2d, Upsample, check_window, run_block
+from Core import ConvBlock, Downsample, Norm2d, Upsample, check_window, run_block
 
 IN_CHANNELS = 3 + 1 + 3 + 3 + 1 + 3 + 1     # kare, maske, 2 analitik çözüm + güven, çekilen + güven
 CONFIDENCE_SCALE = 0.05                     # b₀: güvenin 1/e'ye düştüğü Laplace ölçeği (0..1 yoğunluk biriminde)
@@ -59,8 +59,14 @@ CONFIDENCE_SCALE = 0.05                     # b₀: güvenin 1/e'ye düştüğü
 
 @dataclass
 class MambaConfig:
-    widths: Tuple[int, int, int, int] = (64, 128, 256, 456)   # 1/2, 1/4, 1/8, 1/16
+    # Kodlayıcı genişlikleri 1/2, 1/4, 1/8, 1/16. 14 Kasım telefon ölçümünden sonra zamansal çekirdek
+    # (1/8, 1/16) yarı genişlikte: (256, 456) → (128, 224); kare başına süre ve halka belleği bunlarla
+    # ölçeklenir. 1/2 ve 1/4 kodlayıcı (atlama bağlantılarını üreten, yüksek frekanslı doku) tam genişlikte.
+    widths: Tuple[int, int, int, int] = (64, 128, 128, 224)
     enc_depths: Tuple[int, int, int, int] = (2, 2, 4, 6)
+    # Çözücü genişlikleri (1/8, 1/4, 1/2): eskisinin (256, 128, 64) yarısı. Atlama bağlantıları s3/s2/s1
+    # kodlayıcının TAM genişliğiyle birleştirilir (fuse girişi = çözücü + atlama), doku doğrudan geçer.
+    dec_widths: Tuple[int, int, int] = (128, 64, 32)
     dec_depths: Tuple[int, int, int] = (3, 2, 2)              # 1/8, 1/4, 1/2 çözücü blokları
     conv_expansion: int = 4
     ssm_expand: int = 2
@@ -157,7 +163,7 @@ class SSDMixer(nn.Module):
 
         Y = (L ⊙ C Bᵀ) (Δ ⊙ X) + D X,     L[t, s] = exp(Λ_t − Λ_s) (s ≤ t), 0 (s > t)
 
-    T = 30 olduğundan L yalnızca 30×30'dur: ardışık 30 adımlık döngü (dışa aktarımda ~50 bin düğüm,
+    T = 15 olduğundan L yalnızca 15×15'tir: ardışık 15 adımlık döngü (dışa aktarımda ~50 bin düğüm,
     gigabaytlarca ara tampon) yerine birkaç MatMul. Dolgu karesinde Δ = 0 → sönüm 1, yazma 0: durum
     aynen taşınır (Mamba-1 sürümündeki ``torch.where`` ile aynı anlam). Girdi/çıktı: [N, T, D].
     """
@@ -310,7 +316,7 @@ class WindowAttention(nn.Module):
     def __init__(self, dim: int, window: int = 8, heads: int = 8):
         super().__init__()
         self.window, self.heads = window, heads
-        self.norm = LayerNorm2d(dim)
+        self.norm = nn.GroupNorm(1, dim, eps=1e-6)     # dikkat girişinin dizi normu (çekirdekte kalır)
         self.qkv = nn.Linear(dim, 3 * dim)
         self.proj = nn.Linear(dim, dim)
         nn.init.zeros_(self.proj.weight)
@@ -369,7 +375,7 @@ class VideoMamba(nn.Module):
         conv = lambda dim: ConvBlock(dim, cfg.conv_expansion, kernel=7)
 
         # PixelUnshuffle kayıpsız bir yeniden dizilimdir: ince yazı çizgileri adımlı evrişimde kaybolmaz.
-        self.embed = nn.Sequential(nn.PixelUnshuffle(2), nn.Conv2d(IN_CHANNELS * 4, w[0], 3, padding=1), LayerNorm2d(w[0]))
+        self.embed = nn.Sequential(nn.PixelUnshuffle(2), nn.Conv2d(IN_CHANNELS * 4, w[0], 3, padding=1), Norm2d(w[0]), nn.ReLU())
         self.enc1 = nn.ModuleList([conv(w[0]) for _ in range(d[0])])
         self.enc2 = nn.ModuleList([conv(w[1]) for _ in range(d[1])])
         self.enc3 = nn.ModuleList([SpatioTemporalBlock(w[2], cfg, attention=False) for _ in range(d[2])])
@@ -382,10 +388,13 @@ class VideoMamba(nn.Module):
             self.context[1].weight.zero_()
             self.context[1].bias.zero_()
 
-        self.up = nn.ModuleList([Upsample(w[3 - i], w[2 - i]) for i in range(3)])
-        self.fuse = nn.ModuleList([nn.Conv2d(2 * w[2 - i], w[2 - i], 1) for i in range(3)])
-        self.dec = nn.ModuleList([nn.ModuleList([conv(w[2 - i]) for _ in range(cfg.dec_depths[i])]) for i in range(3)])
-        self.head = nn.Sequential(nn.Conv2d(w[0], w[0], 3, padding=1), nn.GELU(), nn.Conv2d(w[0], 4 * 4, 1), nn.PixelShuffle(2))
+        dw = cfg.dec_widths
+        prev = (w[3],) + tuple(dw[:2])
+        skip = (w[2], w[1], w[0])                    # s3, s2, s1 — kodlayıcının tam genişliği
+        self.up = nn.ModuleList([Upsample(prev[i], dw[i]) for i in range(3)])
+        self.fuse = nn.ModuleList([nn.Conv2d(dw[i] + skip[i], dw[i], 1) for i in range(3)])
+        self.dec = nn.ModuleList([nn.ModuleList([conv(dw[i]) for _ in range(cfg.dec_depths[i])]) for i in range(3)])
+        self.head = nn.Sequential(nn.Conv2d(dw[2], dw[2], 3, padding=1), nn.ReLU(), nn.Conv2d(dw[2], 4 * 4, 1), nn.PixelShuffle(2))
         with torch.no_grad():
             # Başlangıçta artık = 0 (çıktı = taban görüntü) ve b ≈ e⁻³ ≈ 0,05.
             self.head[2].weight.zero_()
@@ -408,7 +417,7 @@ class VideoMamba(nn.Module):
         analytic = ac * priors["bg_gamma"].to(frames.dtype) + (1.0 - ac) * frames
         return pc * priors["pulled"].to(frames.dtype) + (1.0 - pc) * analytic
 
-    # ---- Hibrit çıkarım (telefon): kare başına kodlayıcı / 30 karelik zamansal çekirdek / kare başına çözücü.
+    # ---- Hibrit çıkarım (telefon): kare başına kodlayıcı / 15 karelik zamansal çekirdek / kare başına çözücü.
     # Girdi kare başına 15 kanallı tek tensördür (kare, maske, bg_gamma, bg_linear, analytic_conf, pulled,
     # pulled_conf — ``forward`` içindeki sırayla). Atlama özellikleri halka tamponda tutulur; her kare BİR
     # kez kodlanır, örtüşen iki pencerede yeniden kullanılır. Bileşim ``forward`` ile aynıdır (selftest).
@@ -470,7 +479,7 @@ class VideoMamba(nn.Module):
         dtype = frames.dtype
         vf = valid.to(dtype)
 
-        # 15 kanallı girdi tüm kareler için tek seferde kurulmaz: 720p × 30 karede yalnızca
+        # 15 kanallı girdi tüm kareler için tek seferde kurulmaz: 720p × 15 karede yalnızca
         # bu tensör ~1,7 GiB (fp32) tutar. Çıkarımda dilim dilim kurulup gömülür.
         parts = [
             p.flatten(0, 1)
@@ -522,7 +531,7 @@ class VideoMamba(nn.Module):
         else:
             index = list(range(t))
         # Çözücü kare başınadır; çıkarımda dilim dilim çalışır ki 1/2 ölçekteki birleştirme
-        # (atlama bağlantısı + büyütülmüş harita) 30 kare için aynı anda bellekte durmasın.
+        # (atlama bağlantısı + büyütülmüş harita) 15 kare için aynı anda bellekte durmasın.
         count = x.shape[0]
         if not torch.is_grad_enabled() and 0 < chunk < count:
             out = torch.cat(

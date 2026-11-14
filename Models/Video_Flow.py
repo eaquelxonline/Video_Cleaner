@@ -6,7 +6,7 @@ verir; model maskeyi girdi olarak alır ve maske altındaki akışı çevreden
 tamamlamayı öğrenir (akış tamamlama). Çıktı, piksel çekme aşamasında "bu piksel
 başka hangi karede temiz görünüyor" sorusunu yanıtlamak için kullanılır.
 
-Yapı (RAFT ailesinden, 720p × 30 kare için hafifletilmiş)
+Yapı (RAFT ailesinden, 720p × 15 kare için hafifletilmiş)
     * Ortak özellik kodlayıcı (1/8 ölçek) — her kare için BİR kez çalışır.
     * Yerel korelasyon piramidi: tüm-çiftler hacmi yerine, her yinelemede güncel
       akışla çarpıtılmış hedef özelliklerle ±r komşulukta korelasyon. 720p'de
@@ -57,8 +57,9 @@ class FlowConfig:
     query_chunk: int = 4096         # çıkarımda büyük karelerde korelasyon kaç sorgu konumunda dilimlensin
 
 
-def _norm(channels: int) -> nn.GroupNorm:
-    return nn.GroupNorm(8, channels)
+def _norm(channels: int) -> nn.BatchNorm2d:
+    """Son-norm BN (evrişimin ardında; çıkarımda ona katlanır, QDQ'da Conv + ReLU tek QLinearConv)."""
+    return nn.BatchNorm2d(channels, eps=1e-5, momentum=0.01)
 
 
 class ResBlock(nn.Module):
@@ -162,7 +163,7 @@ class GlobalRefine(nn.Module):
         cin = hidden + context + 2 + 1 + 2          # gizli, bağlam, akış, maske, eşleşme istatistikleri
         self.inp = nn.ModuleList([nn.Conv2d(cin, hidden, 3, padding=1) for _ in range(steps)])
         self.mix = nn.ModuleList([
-            nn.Sequential(nn.Conv2d(hidden, hidden, (1, 7), padding=(0, 3)), nn.GELU(), nn.Conv2d(hidden, hidden, (7, 1), padding=(3, 0)))
+            nn.Sequential(nn.Conv2d(hidden, hidden, (1, 7), padding=(0, 3)), nn.ReLU(), nn.Conv2d(hidden, hidden, (7, 1), padding=(3, 0)))
             for _ in range(steps)
         ])
         self.out = nn.ModuleList([nn.Conv2d(hidden, 2, 3, padding=1) for _ in range(steps)])
@@ -171,7 +172,7 @@ class GlobalRefine(nn.Module):
             nn.init.zeros_(conv.bias)
 
     def forward(self, net, context, flow, mask, stats, step: int):
-        z = F.gelu(self.inp[step](torch.cat([net, context, flow, mask, stats], dim=1)))
+        z = F.relu(self.inp[step](torch.cat([net, context, flow, mask, stats], dim=1)))
         z = z + self.mix[step](z)
         return z, flow + self.out[step](z)
 
@@ -321,7 +322,7 @@ class VideoFlow(nn.Module):
         idx = torch.arange(b * t, device=frames.device).view(b, t)
         src = torch.cat([idx[:, :-1].reshape(-1), idx[:, 1:].reshape(-1)])
         dst = torch.cat([idx[:, 1:].reshape(-1), idx[:, :-1].reshape(-1)])
-        # Çıkarımda çiftler dilim dilim iyileştirilir: 720p × 30 karede 58 çiftin tamamı tek
+        # Çıkarımda çiftler dilim dilim iyileştirilir: 720p × 15 karede 28 çiftin tamamı tek
         # yığında işlenirse yalnızca GRU girdisi ~1,5 GiB (fp32) tutar. Çiftler birbirinden
         # bağımsız olduğundan sonuç birebir aynıdır.
         count = src.numel()

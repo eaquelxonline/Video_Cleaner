@@ -1,8 +1,8 @@
 // Video_Cleaner — hibrit çıkarım iskelet testi: EĞİTİLMEMİŞ (sabit tohumlu rastgele) üç model telefonda.
 //
 // Mimari: ONNX yalnızca evrişim/MatMul hızlandırıcısıdır. Her model üç grafiğe bölünmüştür (Models/Export.py):
-// kare başına kodlayıcı, 30 karelik zamansal çekirdek, kare başına çözücü (akışta: kare başına kodlayıcı +
-// çift başına eşleştirme). 30 karelik pencere ve ara özellikler grafiğin DIŞINDA (burada yerel bellekte
+// kare başına kodlayıcı, 15 karelik zamansal çekirdek, kare başına çözücü (akışta: kare başına kodlayıcı +
+// çift başına eşleştirme). 15 karelik pencere (Mod B: 11 kare kayar) ve ara özellikler grafiğin DIŞINDA (burada yerel bellekte
 // Rust'ın ayırdığı yerel bellek — Core.nativeAllocDirect; üretimde Rust halka tamponu) tutulur; her kare BİR
 // kez kodlanır. Android'de ByteBuffer.allocateDirect Java yığınından ayrılır (192–256 MB sınırı): ilk telefon
 // turunda (13 Kasım) bütün varyantlar bu yüzden OutOfMemoryError ile düştü ve moto'da süreç lmkd ile öldü.
@@ -160,23 +160,14 @@ class ZzInferenceSkeletonTest {
             "VCBENCH device=\"${Build.MANUFACTURER} ${Build.MODEL}\" soc=\"${if (Build.VERSION.SDK_INT >= 31) Build.SOC_MODEL else "-"}\" api=${Build.VERSION.SDK_INT} " +
                 "cores=${Runtime.getRuntime().availableProcessors()} files=${available.count { it.endsWith(".onnx") }}",
         )
-        // Önem sırası (süre bütçesi biterse en değerliler ölçülmüş olur). 13 Kasım Z Flip8: ORT CPU (MLAS) FP32
-        // kare başına 1743 ms ile XNNPACK FP32'den (3205 ms) ve FP16'dan (2138 ms) hızlı — CPU önde. "noarena": ORT
-        // CPU bellek arenası kapalı. NNAPI Android 15'te kullanımdan kaldırıldı; yalnızca karşılaştırma için sonda.
-        // Düşük RAM'li cihazda (< 6 GB; moto g play 2021) yalnızca arenasız CPU varyantları: 13 Kasım'da moto'da
-        // üçüncü varyantta süreç lmkd ile öldürüldü (her varyant ~2 GB; oturum kapansa da RSS geri dönmüyor).
+        // 14 Kasım (Pixel 11 + Z Flip8): INT8 + ORT CPU (MLAS) en hızlı (Z Flip8 745 ms, Pixel 1074 ms);
+        // XNNPACK her varyantta daha yavaş, FP16 kazandırmıyor, NNAPI mamba_core'u yükleyemiyor → mimari
+        // kararıyla üçü de test ve üretim hattından çıkarıldı. Yalnızca INT8 ve FP32 (karşılaştırma) CPU'da.
+        // Düşük RAM'li cihazda (< 6 GB; moto g play 2021, 2,7 GB) CPU bellek arenası kapalı.
         val memory = ActivityManager.MemoryInfo().also { (app.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager).getMemoryInfo(it) }
         val totalMb = memory.totalMem shr 20
         val lowRam = totalMb < 6 * 1024
-        val plan = if (lowRam) {
-            listOf(Triple("int8", "cpu", false), Triple("fp32", "cpu", false))
-        } else {
-            listOf(
-                Triple("int8", "cpu", true), Triple("fp32", "cpu", true), Triple("int8", "xnnpack", true),
-                Triple("fp16", "xnnpack", true), Triple("fp32", "xnnpack", true), Triple("fp16", "cpu", true),
-                Triple("fp32", "cpu", false), Triple("fp32", "nnapi", true),
-            )
-        }
+        val plan = listOf(Triple("int8", "cpu", !lowRam), Triple("fp32", "cpu", !lowRam))
         Log.i(TAG, "VCBENCH ram_total_mb=$totalMb avail_mb=${memory.availMem shr 20} low_ram=$lowRam plan=${plan.size}")
         for ((variant, ep, cpuArena) in plan) {
             val label = if (cpuArena) ep else "$ep-noarena"
@@ -245,7 +236,7 @@ class ZzInferenceSkeletonTest {
             val loadMs = SystemClock.elapsedRealtime() - t0
             val p = Pipeline(env, sessions)
             pipeline = p
-            val t = 30
+            val t = WINDOW
             fun validMask() = Feature(longArrayOf(1, t.toLong()), direct(t).also { b -> repeat(t) { b.put(1f) }; b.rewind() })
 
             stage = "algılayıcı"
@@ -278,12 +269,13 @@ class ZzInferenceSkeletonTest {
             }
             ringMb = maxOf(ringMb, arena.bytes shr 20)
 
-            // Mod B (pencere 15 kare kayar): kare başına = kodlayıcı + 2 çift + 2 çözücü + çekirdek/15
+            // Mod B (pencere 15 kare, 11 kare kayar, 4 kare örtüşür): kare başına = kodlayıcı + 2 çift
+            // + çözücü × 15/11 (örtüşen kareler iki pencerede çözülür) + çekirdek/11
             val per = LinkedHashMap<String, Double>()
             for ((g, total) in p.ms) {
                 per[g] = when {
-                    g.endsWith("_core") -> total / 15
-                    g.endsWith("_dec") -> total / t * 2
+                    g.endsWith("_core") -> total / STRIDE
+                    g.endsWith("_dec") -> total / STRIDE
                     else -> total / t
                 }
             }
@@ -312,8 +304,10 @@ class ZzInferenceSkeletonTest {
 
     private companion object {
         const val TAG = "VCTEST"
+        const val WINDOW = 15                      // Models/Core.py WINDOW
+        const val STRIDE = 11                      // Models/Core.py STRIDE (Mod B kayması)
         const val CALL_LIMIT_MS = 60_000L          // tek grafik çağrısı
-        const val MIN_AVAIL_MB = 1200L             // altında varyant atlanır (lmkd öldürmesin, diğer satırlar kalsın)
+        const val MIN_AVAIL_MB = 900L              // altında varyant atlanır (lmkd öldürmesin); 14 Kasım moto boş 1159 MB
         const val PIPELINE_LIMIT_MS = 4 * 60_000L  // bir değişken × sağlayıcı hattının tamamı
     }
 }
