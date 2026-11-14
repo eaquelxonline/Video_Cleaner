@@ -70,6 +70,9 @@ object Core {
     /** Modelin tek geçişte gördüğü kare sayısı (Rust `WINDOW_FRAMES`, Models/Core.py `WINDOW`). */
     const val WINDOW_FRAMES = 15
 
+    /** Halka yuva sayısı (Rust `RING_FRAMES` = 2 × kayma 11): köprü penceresi için 11 geçmiş + 11 karar ufku. */
+    const val RING_FRAMES = 22
+
     const val STEP_NEED_FRAMES = 0
     const val STEP_WINDOW = 1
     const val STEP_OUTPUT = 2

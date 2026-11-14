@@ -565,7 +565,7 @@ private fun MainContentPreview() {
             progress = JobProgress(
                 framesDecoded = 930, framesEncoded = 900, positionUs = 15_000_000, durationUs = 60_000_000,
                 framesPerSecond = 212.0, elapsedMs = 4_300, width = 1280, height = 720,
-                stats = CoreStats(framesIn = 930, framesOut = 900, sceneCuts = 3, windowsB = 60, poolBytes = 41_472_000),
+                stats = CoreStats(framesIn = 930, framesOut = 900, sceneCuts = 3, windowsB = 60, poolBytes = 30_412_800),
             ),
             result = null,
             error = null,

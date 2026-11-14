@@ -79,7 +79,7 @@ class VideoPipelineTest {
             CleanerSession(w, h).use { session ->
                 // Çekirdek her yuvayı 64 bayta hizalar (Rust FrameRing: stride = round_up(kare, 64)).
                 val stride = (w.toLong() * h * 3 / 2 + 63) / 64 * 64
-                assertEquals(stride * 30, session.stats().poolBytes)
+                assertEquals(stride * Core.RING_FRAMES, session.stats().poolBytes)
             }
         }
         // Geçersiz boyut istisna olarak, doğru hata koduyla dönmeli (çökme değil).
