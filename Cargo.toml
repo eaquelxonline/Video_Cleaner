@@ -12,7 +12,7 @@ name = "video_cleaner"
 version = "2.0.0"
 edition = "2024"
 rust-version = "1.99"
-description = "Video_Cleaner çekirdeği: 30 karelik ring buffer, 15+15 / 14+1+15 pencere zamanlayıcı, bit-exact koruma kapısı, SIMD çekirdekleri"
+description = "Video_Cleaner çekirdeği: 22 karelik ring buffer, 15 karelik pencere (Mod B 11+4 / Mod A 7+1+7) zamanlayıcı, bit-exact koruma kapısı, SIMD çekirdekleri"
 publish = false
 
 [lib]

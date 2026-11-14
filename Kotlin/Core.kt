@@ -65,7 +65,10 @@ import kotlin.math.max
  * hatalar istisna yerine negatif kod olarak döner.
  */
 object Core {
-    const val ABI_VERSION = 2
+    const val ABI_VERSION = 3   // 3: pencere 15 kare (Mod B 11+4, Mod A 7+1+7), halka 22 kare
+
+    /** Modelin tek geçişte gördüğü kare sayısı (Rust `WINDOW_FRAMES`, Models/Core.py `WINDOW`). */
+    const val WINDOW_FRAMES = 15
 
     const val STEP_NEED_FRAMES = 0
     const val STEP_WINDOW = 1
@@ -243,10 +246,10 @@ class CoreException(val code: Int, where: String) : RuntimeException("$where: ${
 // 2. Oturum
 // =============================================================================
 
-/** Modelin çalıştırılacağı 30 konumluk pencere (bkz. Rust `WindowPlan`). */
+/** Modelin çalıştırılacağı 15 konumluk pencere (bkz. Rust `WindowPlan`). */
 data class WindowPlan(
     val id: Long,
-    /** true: Mod A (14+1+15, yalnızca konum 14 çözülür); false: Mod B (15+15). */
+    /** true: Mod A (7+1+7, yalnızca konum 7 çözülür); false: Mod B (11+4: 11 kare kayar, 4 kare örtüşür). */
     val modeA: Boolean,
     val slide: Int,
     val validCount: Int,

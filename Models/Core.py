@@ -742,10 +742,15 @@ class VideoCleaner(nn.Module):
             return frames.unsqueeze(0), ok.unsqueeze(0)
 
         for seg_lo, seg_hi in zip(bounds[:-1], bounds[1:]):
-            # Pencereler [b, b+15), b = seg_lo, seg_lo+11, …; son pencere sahne sonunu geçerse dolguludur.
-            base = seg_lo
+            # Rust Scheduler'daki B(j) adımı: e = sıradaki kesinleşecek kare, j = min(11, kalan).
+            # Pencere [e+j-11, e+j+4); konum [11-j, 11) kesinleşir, [11, 15) bir sonraki pencereyle
+            # harmanlanır. Olağan akışta pencereler [0,15) → [11,26) → … ; kısa sahnede ve sahne sonunda
+            # pencere geçmiş tarafına dolgulu kayar (Rust ile birebir aynı kareler, aynı konumlar).
+            e = seg_lo
             context = None          # sahne başında bloklar arası bağlam sıfırlanır
-            while True:
+            while e < seg_hi:
+                j = min(STRIDE, seg_hi - e)
+                base = e + j - STRIDE
                 frames, ok = window(base, seg_lo, seg_hi)
                 out = self(frames, ok, mode="B", context_state=context)
                 context = out["context_state"]
@@ -753,7 +758,7 @@ class VideoCleaner(nn.Module):
                 past = torch.cumsum(okv.int(), 0) - okv.int()
                 future = okv.int().sum() - past - okv.int()
                 prior = (1 + torch.minimum(past, future)).float()
-                for pos in range(WINDOW):
+                for pos in range(STRIDE - j, WINDOW):
                     if not bool(okv[pos]):
                         continue
                     i = base + pos
@@ -763,9 +768,7 @@ class VideoCleaner(nn.Module):
                     weight[i] += wgt
                     mask_any[i] |= m
                     best_conf[i] = torch.maximum(best_conf[i], out["confidence"][0, pos].float() * m)
-                if base + WINDOW >= seg_hi:
-                    break
-                base += STRIDE
+                e += j
             for i in precision:
                 if seg_lo <= i < seg_hi:
                     frames, ok = window(i - TARGET_A, seg_lo, seg_hi)

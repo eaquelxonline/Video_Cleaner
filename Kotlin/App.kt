@@ -329,7 +329,7 @@ fun MainContent(
 
                 Surface(color = MaterialTheme.colorScheme.tertiaryContainer, shape = RoundedCornerShape(14.dp)) {
                     Text(
-                        "Onarım modeli henüz bağlı değil: video çözülür, 30 karelik pencere hattından geçer ve " +
+                        "Onarım modeli henüz bağlı değil: video çözülür, 15 karelik pencere hattından geçer ve " +
                             "kareler değiştirilmeden yeniden kodlanır. Altyazı silme, eğitilmiş modellerle etkinleşecek.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onTertiaryContainer,
@@ -527,7 +527,7 @@ private fun Header(coreInfo: String) {
 @Composable
 private fun StatsText(stats: CoreStats) {
     Text(
-        "Pencere: ${stats.windowsB} blok (15+15), ${stats.windowsA} hassas (14+1+15), ${stats.bridges} köprü · " +
+        "Pencere: ${stats.windowsB} blok (11+4), ${stats.windowsA} hassas (7+1+7), ${stats.bridges} köprü · " +
             "sahne geçişi ${stats.sceneCuts} · halka ${stats.poolBytes / (1024 * 1024)} MiB",
         style = MaterialTheme.typography.bodySmall,
         color = MaterialTheme.colorScheme.onSurfaceVariant,

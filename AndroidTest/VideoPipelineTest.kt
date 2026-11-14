@@ -394,7 +394,7 @@ class VideoPipelineTest {
         val uvPlane = direct(rw * rh / 2).also { b -> for (i in 0 until rw * rh / 2 step 2) { b.put(i, cu.toByte()); b.put(i + 1, cv.toByte()) } }
         var estimates = 0
         val restorer = WindowRestorer { session, plan ->
-            for (pos in 0 until 30) {
+            for (pos in 0 until Core.WINDOW_FRAMES) {
                 if (plan.wantsEstimate(pos) && plan.isValid(pos)) {
                     session.submitEstimate(pos, rx, ry, rw, rh, yPlane, uvPlane, wPlane)
                     estimates++

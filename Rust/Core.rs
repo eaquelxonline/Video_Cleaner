@@ -4,7 +4,7 @@
 //!
 //! | Bölüm            | Sorumluluk                                                        |
 //! |------------------|-------------------------------------------------------------------|
-//! | [`FrameRing`]    | 30 karelik NV12 belleği + kare sahipliği (yazma/okuma kiraları)   |
+//! | [`FrameRing`]    | 22 karelik NV12 belleği + kare sahipliği (yazma/okuma kiraları)   |
 //! | [`Scheduler`]    | Hangi kare hangi pencerede girdi/çıktı olur (saf mantık, piksel yok) |
 //! | [`Estimate`]     | Modelin ürettiği onarım tahmini (yalnızca ROI içinde geçerli)     |
 //! | [`Pipeline`]     | Yukarıdakileri birleştiren kare giriş/çıkış hattı                 |
@@ -13,25 +13,25 @@
 //!
 //! ## Pencere matematiği (kesin tanım)
 //!
-//! Model **her zaman** ardışık 30 kareyi görür. İki mod yalnızca *hangi çıktının
-//! kullanıldığını* ve *pencerenin ne kadar kaydığını* değiştirir. `e` = sıradaki
-//! kesinleşecek karenin sıra numarası olsun:
+//! Model **her zaman** ardışık 15 kareyi görür (14 Kasım telefon ölçümünden sonra 30 → 15; ara bellek
+//! 30 karede 526 MB'tı). İki mod yalnızca *hangi çıktının kullanıldığını* ve *pencerenin ne kadar
+//! kaydığını* değiştirir. `e` = sıradaki kesinleşecek karenin sıra numarası olsun:
 //!
-//! * **Mod B (15+15 blok)** — `B(j)`, `0 ≤ j ≤ 15`: pencere `[e+j-15, e+j+15)`.
-//!   Konum `[15-j, 15)` kareleri kesinleşir, konum `[15, 30)` tahminleri bir sonraki
-//!   pencereyle harmanlanmak üzere önbelleğe alınır. Olağan akışta `j = 15`:
-//!   pencereler `[0,30) → [15,45) → [30,60)…` şeklinde 15 kare kayar.
+//! * **Mod B (11+4)** — `B(j)`, `0 ≤ j ≤ 11`: pencere `[e+j-11, e+j+4)`.
+//!   Konum `[11-j, 11)` kareleri kesinleşir, konum `[11, 15)` tahminleri bir sonraki
+//!   pencereyle harmanlanmak üzere önbelleğe alınır. Olağan akışta `j = 11`:
+//!   pencereler `[0,15) → [11,26) → [22,37)…` şeklinde 11 kare kayar; ardışık iki pencere
+//!   4 karede örtüşür ve bu 4 karenin iki tahmini `öncelik × güven` ile harmanlanır.
 //!   `j = 0` hiçbir kareyi kesinleştirmeyen "köprü" geçişidir (yalnızca önbellek üretir).
-//! * **Mod A (14+1+15 hassas)**: pencere `[e-14, e+16)`, yalnızca konum 14 (= `e`)
+//! * **Mod A (7+1+7 hassas)**: pencere `[e-7, e+8)`, yalnızca konum 7 (= `e`)
 //!   kesinleşir, pencere 1 kare kayar.
 //!
-//! "15 geçmiş + 15 gelecek" tek bir geçişte hiçbir kareye verilemez (bunun için 31
-//! kare gerekir). Bunun yerine şu **kanıtlanabilir** güvence sağlanır ve
-//! `scheduler_random_streams_keep_invariants` testiyle denetlenir: Mod B'de
-//! kesinleşen her kare, harmanlanan iki tahmini üzerinden en az
-//! `min(15, sahne başına uzaklık)` geçmiş ve `min(15, sahne sonuna uzaklık)` gelecek
-//! kareye erişmiştir. Pencereler sahne geçişini asla aşmaz; eksik konumlar
-//! "geçersiz" (dolgu) olarak işaretlenir ve modele geçerlilik maskesiyle bildirilir.
+//! **Kanıtlanabilir** güvence (`scheduler_random_streams_keep_invariants` testiyle denetlenir):
+//! Mod B'de kesinleşen her kare en az `min(4, sahne başına uzaklık)` geçmiş ve
+//! `min(4, sahne sonuna uzaklık)` gelecek kareye erişmiştir (harmanlanan 4 kare iki tahmini
+//! üzerinden 11 geçmiş görür); Mod A karesi `min(7, …)` geçmiş ve gelecek. Pencereler sahne
+//! geçişini asla aşmaz; eksik konumlar "geçersiz" (dolgu) olarak işaretlenir ve modele
+//! geçerlilik maskesiyle bildirilir. Halka kapasitesi 22 karedir (11 geçmiş + 11 karar ufku).
 //!
 //! ## Dürüst sınırlar
 //!
@@ -57,16 +57,21 @@ use std::sync::{Mutex, MutexGuard};
 // 1. Sabitler ve hata türü
 // ============================================================================
 
-/// Modelin tek geçişte gördüğü kare sayısı ve halka kapasitesi.
-pub const WINDOW_FRAMES: usize = 30;
-/// 15+15 bloğunun yarısı; Mod B'nin olağan kayma miktarı.
-pub const HALF_WINDOW: usize = 15;
-/// Mod A'da hedef karenin pencere içindeki konumu (14 geçmiş + hedef + 15 gelecek).
-pub const MODE_A_TARGET: usize = 14;
-/// Bu sayıdan az geçerli kare içeren pencereler "düşük bağlam" olarak işaretlenir.
-pub const LOW_CONTEXT_FRAMES: u32 = 10;
+/// Modelin tek geçişte gördüğü kare sayısı (Models/Core.py `WINDOW`).
+pub const WINDOW_FRAMES: usize = 15;
+/// Mod B'nin olağan kayma miktarı (Models/Core.py `STRIDE`).
+pub const STRIDE: usize = 11;
+/// Ardışık iki Mod B penceresinin ortak kare sayısı; bu karelerin iki tahmini harmanlanır.
+pub const OVERLAP: usize = WINDOW_FRAMES - STRIDE;
+/// Halka kapasitesi: karar anında `[e-11, e+11)` — köprü penceresi için 11 geçmiş kare + 11 karelik
+/// karar ufku. Pencereden büyüktür (15 < 22); halka yalnızca NV12 kareleri tutar (720p'de ~30 MB).
+pub const RING_FRAMES: usize = 2 * STRIDE;
+/// Mod A'da hedef karenin pencere içindeki konumu (7 geçmiş + hedef + 7 gelecek).
+pub const MODE_A_TARGET: usize = 7;
+/// Bu sayıdan az geçerli kare içeren pencereler "düşük bağlam" olarak işaretlenir (15'in üçte biri).
+pub const LOW_CONTEXT_FRAMES: u32 = 5;
 /// Kotlin köprüsüyle uyum denetimi için sürüm numarası.
-pub const ABI_VERSION: i32 = 2;
+pub const ABI_VERSION: i32 = 3; // 3: pencere 15 kare, Mod B 11+4, Mod A 7+1+7, halka 22
 
 /// Kare bayrağı: bu kare yeni bir sahnenin ilk karesidir.
 pub const FRAME_FLAG_SCENE_CUT: u32 = 1 << 0;
@@ -84,7 +89,7 @@ pub const PLAN_FLAG_BRIDGE: u32 = 1 << 3;
 
 /// Çıktı bayrağı: kare bir model tahminiyle üretildi (maske boşsa piksel değişmemiş olabilir).
 pub const OUT_FLAG_RESTORED: u32 = 1 << 0;
-/// Çıktı bayrağı: Mod A (14+1+15) ile üretildi.
+/// Çıktı bayrağı: Mod A (7+1+7) ile üretildi.
 pub const OUT_FLAG_MODE_A: u32 = 1 << 1;
 /// Çıktı bayrağı: iki örtüşen pencerenin tahmini harmanlandı.
 pub const OUT_FLAG_FUSED: u32 = 1 << 2;
@@ -103,7 +108,7 @@ pub enum CoreError {
     InvalidGeometry = -1,
     /// Bellek ayrılamadı.
     OutOfMemory = -2,
-    /// Halkada boş yer yok (30 kare dolu).
+    /// Halkada boş yer yok (22 kare dolu).
     RingFull = -3,
     /// Yazılacak yuva hâlâ bir okuyucu tarafından tutuluyor.
     SlotBusy = -4,
@@ -284,7 +289,7 @@ unsafe impl Send for AlignedBlock {}
 unsafe impl Sync for AlignedBlock {}
 
 // ============================================================================
-// 3. FrameRing — 30 karelik bellek ve kare sahipliği
+// 3. FrameRing — 22 karelik bellek ve kare sahipliği
 // ============================================================================
 
 /// Halkadaki bir karenin kimliği ve zaman bilgisi.
@@ -318,7 +323,7 @@ struct SlotInfo {
 }
 
 struct RingTable {
-    slots: [SlotInfo; WINDOW_FRAMES],
+    slots: [SlotInfo; RING_FRAMES],
     /// Halkadaki en eski karenin sıra numarası.
     head: u64,
     /// Bir sonraki yazılacak karenin sıra numarası.
@@ -327,7 +332,7 @@ struct RingTable {
     writing: bool,
 }
 
-/// 30 karelik NV12 halka belleği.
+/// 22 karelik NV12 halka belleği.
 ///
 /// Tek bir sayfa hizalı blok ayrılır (720p için tam 41.472.000 bayt). Kare `seq`,
 /// `seq % 30` numaralı yuvada durur. Yuva belleğine yalnızca kiralar üzerinden
@@ -394,12 +399,12 @@ impl FrameRing {
     pub fn with_storage(geo: FrameGeometry, kind: StorageKind) -> Result<Self, CoreError> {
         let stride = round_up(geo.frame_bytes(), 64);
         let total = stride
-            .checked_mul(WINDOW_FRAMES)
+            .checked_mul(RING_FRAMES)
             .ok_or(CoreError::OutOfMemory)?;
         let storage = match kind {
             #[cfg(target_os = "android")]
             StorageKind::HardwareBuffer => {
-                match hwbuf::SlotBuffers::allocate(stride, WINDOW_FRAMES) {
+                match hwbuf::SlotBuffers::allocate(stride, RING_FRAMES) {
                     Some(slots) => RingStorage::Hardware(slots),
                     None => RingStorage::Heap(AlignedBlock::zeroed(total, page_size().max(64))?),
                 }
@@ -420,7 +425,7 @@ impl FrameRing {
             stride,
             storage,
             table: Mutex::new(RingTable {
-                slots: [empty; WINDOW_FRAMES],
+                slots: [empty; RING_FRAMES],
                 head: 0,
                 tail: 0,
                 last_pts: None,
@@ -436,7 +441,7 @@ impl FrameRing {
 
     /// Ayrılan toplam bayt sayısı.
     pub fn pool_bytes(&self) -> usize {
-        self.stride * WINDOW_FRAMES
+        self.stride * RING_FRAMES
     }
 
     /// İlk yuvanın adresi (hizalama testleri ve tanılama için).
@@ -476,7 +481,7 @@ impl FrameRing {
     }
 
     fn slot_ptr(&self, slot: usize) -> *mut u8 {
-        debug_assert!(slot < WINDOW_FRAMES);
+        debug_assert!(slot < RING_FRAMES);
         self.storage.slot_base(slot, self.stride)
     }
 
@@ -487,10 +492,10 @@ impl FrameRing {
         if t.writing {
             return Err(CoreError::WriteInProgress);
         }
-        if t.tail - t.head >= WINDOW_FRAMES as u64 {
+        if t.tail - t.head >= RING_FRAMES as u64 {
             return Err(CoreError::RingFull);
         }
-        let slot = (t.tail % WINDOW_FRAMES as u64) as usize;
+        let slot = (t.tail % RING_FRAMES as u64) as usize;
         if t.slots[slot].state != SlotState::Free {
             return Err(CoreError::SlotBusy);
         }
@@ -538,7 +543,7 @@ impl FrameRing {
         if seq < t.head || seq >= t.tail {
             return Err(CoreError::UnknownFrame);
         }
-        let slot = (seq % WINDOW_FRAMES as u64) as usize;
+        let slot = (seq % RING_FRAMES as u64) as usize;
         let info = &mut t.slots[slot];
         debug_assert!(info.state == SlotState::Ready && info.meta.seq == seq);
         info.readers += 1;
@@ -562,7 +567,7 @@ impl FrameRing {
     /// Halkadaki bir karenin bilgisi (kira almadan).
     pub fn meta(&self, seq: u64) -> Option<FrameMeta> {
         let t = lock(&self.table);
-        (seq >= t.head && seq < t.tail).then(|| t.slots[(seq % WINDOW_FRAMES as u64) as usize].meta)
+        (seq >= t.head && seq < t.tail).then(|| t.slots[(seq % RING_FRAMES as u64) as usize].meta)
     }
 
     /// `seq`'ten küçük tüm kareleri halkadan çıkarır; çıkarılan kare sayısını döndürür.
@@ -571,7 +576,7 @@ impl FrameRing {
         let target = seq.min(t.tail);
         let mut released = 0;
         while t.head < target {
-            let slot = (t.head % WINDOW_FRAMES as u64) as usize;
+            let slot = (t.head % RING_FRAMES as u64) as usize;
             let info = &mut t.slots[slot];
             info.state = if info.readers == 0 {
                 SlotState::Free
@@ -2325,7 +2330,7 @@ pub fn verify_preservation(
 pub enum Mode {
     /// 14 geçmiş + 1 hedef + 15 gelecek; yalnızca hedef kare kesinleşir.
     A,
-    /// 15+15 blok; `slide` kadar kare kesinleşir, son 15 konum önbelleğe alınır.
+    /// 11+4 blok; `slide` kadar kare kesinleşir, son 4 konum önbelleğe alınır.
     B,
 }
 
@@ -2354,14 +2359,14 @@ impl Hint {
     }
 }
 
-/// Modelin çalıştırılacağı 30 konumluk pencerenin tanımı.
+/// Modelin çalıştırılacağı 15 konumluk pencerenin tanımı.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WindowPlan {
     /// Artan plan numarası.
     pub id: u64,
     /// Çalışma modu.
     pub mode: Mode,
-    /// Bu pencereyle kesinleşen kare sayısı (Mod A: 1, Mod B: 0..=15).
+    /// Bu pencereyle kesinleşen kare sayısı (Mod A: 1, Mod B: 0..=11).
     pub slide: u8,
     /// Konum 0'a karşılık gelen sıra numarası. Sahne başında negatif olabilir
     /// (o konumlar dolgudur).
@@ -2409,10 +2414,10 @@ impl WindowPlan {
         (p >= self.emit.0 && p < self.emit.1) || (p >= self.cache.0 && p < self.cache.1)
     }
 
-    /// Harmanlama önceliği: `1 + min(geçmiş, gelecek)`, en çok 15. Olağan Mod B
-    /// akışında örtüşen iki tahmin arasında üçgen (doğrusal) geçiş üretir.
+    /// Harmanlama önceliği: `1 + min(geçmiş, gelecek)` (15 karelik pencerede en çok 8). Olağan Mod B
+    /// akışında örtüşen 4 karede iki tahmin arasında doğrusal geçiş üretir (Models/Core.py ile aynı).
     pub fn prior_at(&self, pos: usize) -> u8 {
-        (1 + self.past_context(pos).min(self.future_context(pos))).min(15) as u8
+        (1 + self.past_context(pos).min(self.future_context(pos))) as u8
     }
 }
 
@@ -2487,11 +2492,11 @@ struct CacheRange {
 
 /// Pencere zamanlayıcı: yalnızca sıra numaralarıyla çalışan durum makinesi.
 ///
-/// Her kararın alındığı "kanonik durum"da halka `[e-15, e+15)` aralığını tutar
-/// (`e` = sıradaki kesinleşecek kare): 15 kesinleşmiş kare geçmiş bağlam, 15 kare
-/// gelecek bağlam. Buradan Mod A 1 kare, Mod B `j` kare kaydırarak aynı duruma
-/// döner; bu yüzden iki mod kare kare karıştırılabilir ve halka hiçbir zaman 30
-/// kareyi aşmaz.
+/// Her kararın alındığı "kanonik durum"da halka en çok `[e-11, e+11)` aralığını tutar
+/// (`e` = sıradaki kesinleşecek kare): 11 kesinleşmiş kare geçmiş bağlam (köprü penceresi
+/// `[e-11, e+4)` için), 11 karelik karar ufku. Buradan Mod A 1 kare, Mod B `j` kare kaydırarak
+/// aynı duruma döner; bu yüzden iki mod kare kare karıştırılabilir ve halka hiçbir zaman
+/// `RING_FRAMES` (22) kareyi aşmaz.
 pub struct Scheduler {
     pushed: u64,
     eos: bool,
@@ -2501,7 +2506,7 @@ pub struct Scheduler {
     retired: u64,
     decided_until: u64,
     cache: Option<CacheRange>,
-    hints: [Hint; WINDOW_FRAMES],
+    hints: [Hint; RING_FRAMES],
     pending: Option<Action>,
     issued: Option<WindowPlan>,
     outputs: VecDeque<OutputItem>,
@@ -2527,7 +2532,7 @@ impl Scheduler {
             retired: 0,
             decided_until: 0,
             cache: None,
-            hints: [Hint::Normal; WINDOW_FRAMES],
+            hints: [Hint::Normal; RING_FRAMES],
             pending: None,
             issued: None,
             outputs: VecDeque::new(),
@@ -2558,7 +2563,7 @@ impl Scheduler {
 
     /// Halkada kalan boş yuva sayısı.
     pub fn capacity_left(&self) -> usize {
-        WINDOW_FRAMES - (self.pushed - self.retired) as usize
+        RING_FRAMES - (self.pushed - self.retired) as usize
     }
 
     /// Verilmiş ama henüz tamamlanmamış plan.
@@ -2572,7 +2577,7 @@ impl Scheduler {
     }
 
     fn hint(&self, seq: u64) -> Hint {
-        self.hints[(seq % WINDOW_FRAMES as u64) as usize]
+        self.hints[(seq % RING_FRAMES as u64) as usize]
     }
 
     /// Yeni bir kare geldiğini bildirir. `cut`, karenin yeni bir sahnenin ilk
@@ -2588,7 +2593,7 @@ impl Scheduler {
         if cut && seq > 0 {
             self.cuts.push_back(seq);
         }
-        self.hints[(seq % WINDOW_FRAMES as u64) as usize] = Hint::Normal;
+        self.hints[(seq % RING_FRAMES as u64) as usize] = Hint::Normal;
         self.pushed += 1;
         Ok(seq)
     }
@@ -2606,7 +2611,7 @@ impl Scheduler {
         if seq < self.decided_until {
             return Err(CoreError::BadState);
         }
-        self.hints[(seq % WINDOW_FRAMES as u64) as usize] = hint;
+        self.hints[(seq % RING_FRAMES as u64) as usize] = hint;
         Ok(())
     }
 
@@ -2657,10 +2662,10 @@ impl Scheduler {
             let s = self.seg_start;
 
             if self.pending.is_none() {
-                // Karar için sıradaki 15 karenin (veya sahne sonuna kadarının) gelmiş olması gerekir.
-                let horizon = end.map_or(e + HALF_WINDOW as u64, |c| c.min(e + HALF_WINDOW as u64));
+                // Karar için sıradaki 11 karenin (veya sahne sonuna kadarının) gelmiş olması gerekir.
+                let horizon = end.map_or(e + STRIDE as u64, |c| c.min(e + STRIDE as u64));
                 if self.pushed < horizon {
-                    self.retire_before(e.saturating_sub(HALF_WINDOW as u64).max(s));
+                    self.retire_before(e.saturating_sub(STRIDE as u64).max(s));
                     return Step::NeedFrames(
                         ((horizon - self.pushed) as usize).min(self.capacity_left()),
                     );
@@ -2672,14 +2677,25 @@ impl Scheduler {
 
             let action = self.pending.expect("karar verilmiş olmalı");
             let (w_lo, w_hi) = match action {
-                Action::A => (e as i64 - MODE_A_TARGET as i64, e + 16),
+                Action::A => (
+                    e as i64 - MODE_A_TARGET as i64,
+                    e + (WINDOW_FRAMES - MODE_A_TARGET) as u64,
+                ),
                 Action::B(j) => (
-                    e as i64 + j as i64 - HALF_WINDOW as i64,
-                    e + j as u64 + HALF_WINDOW as u64,
+                    e as i64 + j as i64 - STRIDE as i64,
+                    e + j as u64 + OVERLAP as u64,
                 ),
             };
             let need_hi = end.map_or(w_hi, |c| c.min(w_hi));
-            self.retire_before(w_lo.max(s as i64) as u64);
+            // Halkadan çıkarma sınırı: pencerenin başı, ama sonraki karenin olası köprü penceresinin
+            // ([e'-11, e'+4), e' = bu pencereden sonra kesinleşecek kare) başından ileri değil. Mod A
+            // penceresi yalnızca 7 geçmiş kare kullanır; ardından gelen köprü 11 ister.
+            let slide = match action {
+                Action::A => 1,
+                Action::B(j) => j as i64,
+            };
+            let keep_from = w_lo.min(e as i64 + slide - STRIDE as i64);
+            self.retire_before(keep_from.max(s as i64) as u64);
             if self.pushed < need_hi {
                 return Step::NeedFrames(
                     ((need_hi - self.pushed) as usize).min(self.capacity_left()),
@@ -2697,7 +2713,7 @@ impl Scheduler {
     fn decide(&mut self, e: u64, s: u64, horizon: u64) -> bool {
         let run_of = |this: &Self, hint: Hint| -> u64 {
             let mut n = 0;
-            while e + n < horizon && n < HALF_WINDOW as u64 && this.hint(e + n) == hint {
+            while e + n < horizon && n < STRIDE as u64 && this.hint(e + n) == hint {
                 n += 1;
             }
             n
@@ -2730,8 +2746,11 @@ impl Scheduler {
                     .filter(|c| c.lo == e && c.hi > e)
                     .map(|c| c.hi - e);
                 let slide = match covered {
-                    // Önceki pencerenin ikinci yarı tahminleri hazır: harmanlayarak kesinleştir.
-                    Some(k) => run.min(k),
+                    // Önceki pencerenin örtüşen tahminleri hazır (en çok 4 kare): bu `k` kare harmanlanır,
+                    // sonrakiler yalnızca bu pencereden kesinleşir. Tek tahminli kare pencerede en az
+                    // OVERLAP konum geçmiş görmeli: konumu 11-j+k ≥ 4 → j ≤ 7 + k (Mod A sonrası kırpılmış
+                    // önbellekte kayma kısalır; olağan akışta k = 4 → j = 11).
+                    Some(k) => run.min((STRIDE - OVERLAP) as u64 + k),
                     // Geçmiş kare var ama önbellek yok: önce köprü geçişi.
                     None if e > s => 0,
                     // Sahne başı: geçmiş yok, harmanlanacak bir şey de yok.
@@ -2759,7 +2778,7 @@ impl Scheduler {
                 valid |= 1 << p;
             }
         }
-        let tail = (valid >> HALF_WINDOW).count_ones() as u8;
+        let tail = (valid >> STRIDE).count_ones() as u8;
         let (mode, slide, emit, cache) = match action {
             Action::A => (
                 Mode::A,
@@ -2770,8 +2789,8 @@ impl Scheduler {
             Action::B(j) => (
                 Mode::B,
                 j,
-                (HALF_WINDOW as u8 - j, HALF_WINDOW as u8),
-                (HALF_WINDOW as u8, HALF_WINDOW as u8 + tail),
+                (STRIDE as u8 - j, STRIDE as u8),
+                (STRIDE as u8, STRIDE as u8 + tail),
             ),
         };
         let mut flags = 0;
@@ -2952,7 +2971,7 @@ impl<'p> WindowIo<'p> {
         if p >= self.plan.emit.0 && p < self.plan.emit.1 {
             Some(&mut self.emit[(p - self.plan.emit.0) as usize])
         } else if p >= self.plan.cache.0 && p < self.plan.cache.1 {
-            Some(&mut self.tail[(p - HALF_WINDOW as u8) as usize])
+            Some(&mut self.tail[(p - STRIDE as u8) as usize])
         } else {
             None
         }
@@ -3014,19 +3033,15 @@ impl Pipeline {
 
     /// Halka belleğinin türünü seçerek hat kurar (bkz. [`FrameRing::with_storage`]).
     pub fn with_storage(geo: FrameGeometry, kind: StorageKind) -> Result<Self, CoreError> {
-        let estimates = || {
-            (0..HALF_WINDOW)
-                .map(|_| Estimate::new(geo))
-                .collect::<Vec<_>>()
-        };
+        let estimates = |n: usize| (0..n).map(|_| Estimate::new(geo)).collect::<Vec<_>>();
         Ok(Self {
             geo,
             ring: FrameRing::with_storage(geo, kind)?,
             sched: Scheduler::new(),
             scene: SceneDetector::new(geo, SceneCutConfig::default()),
-            est_emit: estimates(),
-            est_tail: estimates(),
-            est_cache: estimates(),
+            est_emit: estimates(STRIDE),
+            est_tail: estimates(OVERLAP),
+            est_cache: estimates(OVERLAP),
             prepared: None,
             auto_scene_cut: true,
             integrity_check: false,
@@ -3107,7 +3122,7 @@ impl Pipeline {
                 est.prior = plan.prior_at(p as usize);
             }
             for p in plan.cache.0..plan.cache.1 {
-                let est = &mut self.est_tail[(p - HALF_WINDOW as u8) as usize];
+                let est = &mut self.est_tail[(p - STRIDE as u8) as usize];
                 est.clear();
                 est.prior = plan.prior_at(p as usize);
             }
@@ -3452,7 +3467,7 @@ pub unsafe fn unpack_nv12(
 /// Motorun pencere politikası.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EngineMode {
-    /// Mod B (15+15); zor kare ipucu gelirse Mod A (14+1+15). Varsayılan üretim modu.
+    /// Mod B (11+4); zor kare ipucu gelirse Mod A (7+1+7). Varsayılan üretim modu.
     Auto,
     /// Yalnızca Mod B (zor kare ipuçları yok sayılır).
     B,
@@ -6201,7 +6216,7 @@ mod tests {
         let geo = FrameGeometry::HD720;
         assert_eq!(geo.frame_bytes(), 1_382_400);
         let ring = FrameRing::new(geo).unwrap();
-        assert_eq!(ring.pool_bytes(), 41_472_000);
+        assert_eq!(ring.pool_bytes(), 1_382_400 * RING_FRAMES); // 22 × 720p NV12 = 30,4 MB
         assert_eq!(ring.base_addr() % page_size(), 0);
         assert!(page_size() == 4096 || page_size() == 16384 || page_size() == 65536);
         assert_eq!(
@@ -6221,31 +6236,31 @@ mod tests {
     fn ring_write_read_retire() {
         let geo = small();
         let ring = FrameRing::new(geo).unwrap();
-        for seq in 0..WINDOW_FRAMES as u64 {
+        for seq in 0..RING_FRAMES as u64 {
             let mut w = ring.begin_write().unwrap();
             w.data().copy_from_slice(&frame_content(geo, seq));
             let meta = w.commit(seq as i64 * 16_667, 0).unwrap();
             assert_eq!(meta.seq, seq);
         }
-        assert_eq!(ring.len(), 30);
+        assert_eq!(ring.len(), 22);
         assert_eq!(ring.begin_write().err(), Some(CoreError::RingFull));
-        for seq in [0u64, 7, 29] {
+        for seq in [0u64, 7, 21] {
             let lease = ring.read(seq).unwrap();
             assert_eq!(lease.data(), &frame_content(geo, seq)[..]);
             assert_eq!(lease.meta().pts_us, seq as i64 * 16_667);
             assert_eq!(lease.luma().len() + lease.chroma().len(), geo.frame_bytes());
         }
-        assert_eq!(ring.retire_before(15), 15);
-        assert_eq!(ring.bounds(), (15, 30));
-        assert_eq!(ring.read(14).err(), Some(CoreError::UnknownFrame));
-        assert!(ring.meta(14).is_none() && ring.meta(15).is_some());
+        assert_eq!(ring.retire_before(11), 11);
+        assert_eq!(ring.bounds(), (11, 22));
+        assert_eq!(ring.read(10).err(), Some(CoreError::UnknownFrame));
+        assert!(ring.meta(10).is_none() && ring.meta(11).is_some());
         // Boşalan yuvalar yeniden kullanılır; eski kareler bozulmaz.
-        for seq in 30..45u64 {
+        for seq in 22..33u64 {
             let mut w = ring.begin_write().unwrap();
             w.data().copy_from_slice(&frame_content(geo, seq));
             w.commit(seq as i64 * 16_667, 0).unwrap();
         }
-        for seq in 15..45u64 {
+        for seq in 11..33u64 {
             assert_eq!(ring.read(seq).unwrap().data(), &frame_content(geo, seq)[..]);
         }
     }
@@ -6268,7 +6283,7 @@ mod tests {
             Some(CoreError::NonMonotonicPts)
         );
         assert_eq!(ring.len(), 1);
-        for i in 1..WINDOW_FRAMES as i64 {
+        for i in 1..RING_FRAMES as i64 {
             ring.begin_write().unwrap().commit(100 + i, 0).unwrap();
         }
 
@@ -6279,7 +6294,7 @@ mod tests {
         assert_eq!(reader.meta().seq, 0);
         drop(reader);
         ring.begin_write().unwrap().commit(1000, 0).unwrap();
-        assert_eq!(ring.bounds(), (1, 31));
+        assert_eq!(ring.bounds(), (1, 23));
     }
 
     #[test]
@@ -6721,24 +6736,23 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_steady_state_is_15_plus_15_with_stride_15() {
+    fn scheduler_steady_state_is_window_15_with_stride_11() {
         let (plans, outputs, s) = drive_scheduler(75, &BTreeSet::new(), &|_| Hint::Normal);
         let bases: Vec<i64> = plans.iter().map(|p| p.base_seq).collect();
-        assert_eq!(bases, vec![0, 15, 30, 45, 60]);
-        for (i, plan) in plans.iter().enumerate() {
+        assert_eq!(bases, vec![0, 11, 22, 33, 44, 55, 64]);
+        for plan in &plans[..6] {
             assert_eq!(plan.mode, Mode::B);
-            assert_eq!(plan.slide, 15);
-            assert_eq!(plan.emit, (0, 15));
-            if i < 4 {
-                assert_eq!(plan.valid, (1 << 30) - 1, "tam 30 karelik pencere");
-                assert_eq!(plan.cache, (15, 30));
-            }
+            assert_eq!(plan.slide, 11);
+            assert_eq!(plan.emit, (0, 11));
+            assert_eq!(plan.valid, (1 << 15) - 1, "tam 15 karelik pencere");
+            assert_eq!(plan.cache, (11, 15));
         }
         assert_ne!(plans[0].flags & PLAN_FLAG_SEGMENT_START, 0);
-        // Son pencere: 60..74 kareleri geçerli, gelecek tarafı dolgu.
-        let last = plans[4];
-        assert_eq!(last.valid, (1 << 15) - 1);
-        assert_eq!(last.cache, (15, 15));
+        // Son pencere: 66..74 kesinleşir; [64, 75) geçerli, gelecek tarafı dolgu.
+        let last = plans[6];
+        assert_eq!((last.slide, last.emit), (9, (2, 11)));
+        assert_eq!(last.valid, (1 << 11) - 1);
+        assert_eq!(last.cache, (11, 11));
         assert_ne!(last.flags & PLAN_FLAG_SEGMENT_END, 0);
 
         assert_eq!(outputs.len(), 75);
@@ -6747,22 +6761,22 @@ mod tests {
             let fused = item.flags & OUT_FLAG_FUSED != 0;
             assert_eq!(
                 fused,
-                i >= 15,
-                "ilk 15 kare dışında her kare iki pencereden harmanlanır"
+                i >= 11 && (i - 11) % 11 < 4,
+                "yalnızca örtüşen 4 kare iki pencereden harmanlanır (kare {i})"
             );
         }
-        assert_eq!(s.stats().windows_b, 5);
-        assert_eq!(s.stats().fused, 60);
-        // Üçgen geçiş: örtüşen iki tahminin öncelikleri (15-k) : (k+1).
-        for k in 0..15 {
+        assert_eq!(s.stats().windows_b, 7);
+        assert_eq!(s.stats().fused, 24);
+        // Doğrusal geçiş: örtüşen iki tahminin öncelikleri (4-k) : (k+1).
+        for k in 0..4 {
             assert_eq!(plans[1].prior_at(k), (k + 1) as u8);
-            assert_eq!(plans[0].prior_at(15 + k), (15 - k) as u8);
+            assert_eq!(plans[0].prior_at(11 + k), (4 - k) as u8);
         }
     }
 
     #[test]
     fn scheduler_pads_short_and_tail_windows() {
-        // 20 kare: [0,20) dolgulu pencere + son 5 kare için [5,20) penceresi.
+        // 20 kare: [0,15) penceresi + son 9 kare için [9,24) dolgulu pencere.
         let (plans, outputs, _) = drive_scheduler(20, &BTreeSet::new(), &|_| Hint::Normal);
         assert_eq!(plans.len(), 2);
         assert_eq!(
@@ -6772,21 +6786,21 @@ mod tests {
                 plans[0].emit,
                 plans[0].cache
             ),
-            (0, 20, (0, 15), (15, 20))
+            (0, 15, (0, 11), (11, 15))
         );
         assert_eq!(
             (plans[1].base_seq, plans[1].slide, plans[1].emit),
-            (5, 5, (10, 15))
+            (9, 9, (2, 11))
         );
-        assert_eq!(plans[1].valid, (1 << 15) - 1);
+        assert_eq!(plans[1].valid, (1 << 11) - 1);
         assert_eq!(outputs.len(), 20);
 
-        // 5 kare: tek pencere, düşük bağlam işaretli.
-        let (plans, outputs, _) = drive_scheduler(5, &BTreeSet::new(), &|_| Hint::Normal);
+        // 4 kare: tek pencere, düşük bağlam işaretli.
+        let (plans, outputs, _) = drive_scheduler(4, &BTreeSet::new(), &|_| Hint::Normal);
         assert_eq!(plans.len(), 1);
-        assert_eq!(plans[0].base_seq, -10);
-        assert_eq!(plans[0].valid, 0b11111 << 10);
-        assert_eq!(plans[0].emit, (10, 15));
+        assert_eq!(plans[0].base_seq, -7);
+        assert_eq!(plans[0].valid, 0b1111 << 7);
+        assert_eq!(plans[0].emit, (7, 11));
         assert_ne!(plans[0].flags & PLAN_FLAG_LOW_CONTEXT, 0);
         assert!(outputs.iter().all(|o| o.flags & OUT_FLAG_LOW_CONTEXT != 0));
 
@@ -6801,7 +6815,7 @@ mod tests {
         let (plans, outputs, s) = drive_scheduler(120, &cuts, &|_| Hint::Normal);
         let segment = |seq: u64| cuts.iter().filter(|&&c| c <= seq).count();
         for plan in &plans {
-            let seqs: Vec<u64> = (0..30).filter_map(|p| plan.seq_at(p)).collect();
+            let seqs: Vec<u64> = (0..WINDOW_FRAMES).filter_map(|p| plan.seq_at(p)).collect();
             assert!(!seqs.is_empty());
             assert!(
                 seqs.iter().all(|&q| segment(q) == segment(seqs[0])),
@@ -6814,8 +6828,8 @@ mod tests {
 
     #[test]
     fn scheduler_precision_and_bypass_hints() {
-        // 20..22 hassas: önce B(5) ile 15..19, sonra üç Mod A adımı, sonra önbelleğin
-        // kapsadığı 12 kare için B(12).
+        // 20..22 hassas: önce B(9) ile 11..19, sonra üç Mod A adımı, sonra Mod A'nın kırptığı
+        // önbellekte tek kare (23) kaldığı için B(8): tek tahminli kareler de en az 4 geçmiş görür.
         let hint = |seq: u64| {
             if (20..23).contains(&seq) {
                 Hint::Precision
@@ -6832,19 +6846,20 @@ mod tests {
         assert_eq!(
             summary,
             vec![
-                (Mode::B, 15, 0),
-                (Mode::B, 5, 5),
-                (Mode::A, 1, 6),
-                (Mode::A, 1, 7),
-                (Mode::A, 1, 8),
-                (Mode::B, 12, 20)
+                (Mode::B, 11, 0),
+                (Mode::B, 9, 9),
+                (Mode::A, 1, 13),
+                (Mode::A, 1, 14),
+                (Mode::A, 1, 15),
+                (Mode::B, 8, 20)
             ]
         );
         for plan in plans.iter().filter(|p| p.mode == Mode::A) {
-            assert_eq!(plan.emit, (14, 15));
-            assert_eq!(plan.past_context(14), 14);
-            assert_eq!(plan.future_context(14), 15);
+            assert_eq!(plan.emit, (7, 8));
+            assert_eq!(plan.past_context(7), 7);
+            assert_eq!(plan.future_context(7), 7);
         }
+        assert_eq!(plans[5].emit, (3, 11));
         assert_eq!(s.stats().windows_a, 3);
         assert_eq!(
             s.stats().bridges,
@@ -6870,19 +6885,19 @@ mod tests {
                 plans[0].emit,
                 plans[0].cache
             ),
-            (25, 0, (15, 15), (15, 30))
+            (29, 0, (11, 11), (11, 15))
         );
-        assert_eq!((plans[1].base_seq, plans[1].slide), (40, 15));
+        assert_eq!((plans[1].base_seq, plans[1].slide), (40, 11));
         assert_eq!(s.stats().bypassed, 40);
         assert_eq!(s.stats().bridges, 1);
         for item in &outputs {
             if item.seq < 40 {
                 assert_eq!(item.source, OutputSource::Original);
             } else {
-                assert_ne!(
-                    item.flags & OUT_FLAG_FUSED,
-                    0,
-                    "kare {} harmanlanmalı",
+                assert_eq!(
+                    item.flags & OUT_FLAG_FUSED != 0,
+                    (item.seq - 40) % 11 < 4,
+                    "kare {}: köprüden sonra her pencerenin ilk 4 karesi harmanlanır",
                     item.seq
                 );
             }
@@ -6893,10 +6908,10 @@ mod tests {
     fn scheduler_rejects_late_or_unknown_hints() {
         let mut s = Scheduler::new();
         assert_eq!(s.set_hint(0, Hint::Bypass), Err(CoreError::UnknownFrame));
-        for _ in 0..15 {
+        for _ in 0..11 {
             s.on_push(false).unwrap();
         }
-        assert_eq!(s.poll(), Step::NeedFrames(15)); // B(15) kararı verildi: 0..14 artık değişmez
+        assert_eq!(s.poll(), Step::NeedFrames(4)); // B(11) kararı verildi: 0..10 artık değişmez
         assert_eq!(s.set_hint(3, Hint::Precision), Err(CoreError::BadState));
         assert_eq!(s.complete(0), Err(CoreError::BadState));
         s.on_eos();
@@ -6906,17 +6921,17 @@ mod tests {
     /// Rastgele akışlar: uzunluk, sahne geçişleri, ipuçları ve itme düzeni rastgele.
     /// Denetlenen değişmezler:
     ///  1. Her kare tam bir kez ve sırayla çıkar.
-    ///  2. Halka doluluğu 30'u aşmaz; planlar yalnızca halkadaki kareleri kullanır.
+    ///  2. Halka doluluğu 22'yi aşmaz; planlar yalnızca halkadaki kareleri kullanır.
     ///  3. Pencereler sahne geçişini aşmaz.
-    ///  4. Bağlam güvencesi: onarılan her kare en az min(15|14, sahne başına uzaklık)
-    ///     geçmiş ve min(15, sahne sonuna uzaklık) gelecek kareye erişmiştir.
+    ///  4. Bağlam güvencesi: onarılan her kare en az min(4, sahne başına uzaklık) geçmiş ve
+    ///     min(4, sahne sonuna uzaklık) gelecek kareye erişmiştir (Mod A: min(7, …)).
     #[test]
     fn scheduler_random_streams_keep_invariants() {
         let mut rng = Rng::new(2026);
         for case in 0..600 {
             let total = match case % 6 {
                 0 => rng.below(40),
-                1 => 29 + rng.below(4),
+                1 => 10 + rng.below(14),
                 _ => rng.below(260),
             };
             let cut_rate = [0u64, 0, 4, 15, 40][rng.below(5) as usize];
@@ -6966,14 +6981,17 @@ mod tests {
                         }
                     }
                     Step::Window(plan) => {
-                        let seqs: Vec<u64> = (0..30).filter_map(|p| plan.seq_at(p)).collect();
+                        let seqs: Vec<u64> =
+                            (0..WINDOW_FRAMES).filter_map(|p| plan.seq_at(p)).collect();
                         assert!(!seqs.is_empty());
                         // Geçerli konumlar kesintisiz bir aralıktır.
                         assert_eq!(seqs.len() as u64, seqs[seqs.len() - 1] - seqs[0] + 1);
                         for &q in &seqs {
                             assert!(
                                 q >= s.retired() && q < s.pushed(),
-                                "durum {case}: plan halkada olmayan kareyi istedi"
+                                "durum {case}: plan halkada olmayan kareyi istedi: q={q} retired={} pushed={} plan={plan:?}",
+                                s.retired(),
+                                s.pushed()
                             );
                             assert_eq!(
                                 seg_start(q),
@@ -7044,7 +7062,10 @@ mod tests {
                     }
                     Step::Finished => break,
                 }
-                assert!(s.pushed() - s.retired() <= 30, "durum {case}: halka taştı");
+                assert!(
+                    s.pushed() - s.retired() <= RING_FRAMES as u64,
+                    "durum {case}: halka taştı"
+                );
             }
             assert_eq!(next_out, total, "durum {case}: her kare çıkmalı");
             for seq in 0..total {
@@ -7052,9 +7073,13 @@ mod tests {
                 if hints[i] == Hint::Bypass {
                     continue;
                 }
-                let reach = if hints[i] == Hint::Precision { 14 } else { 15 };
+                let reach = if hints[i] == Hint::Precision {
+                    MODE_A_TARGET as u64
+                } else {
+                    OVERLAP as u64
+                };
                 let need_past = (seq - seg_start(seq)).min(reach) as u32;
-                let need_future = (seg_end(seq) - 1 - seq).min(15) as u32;
+                let need_future = (seg_end(seq) - 1 - seq).min(reach) as u32;
                 assert!(
                     past[i] >= need_past,
                     "durum {case}: kare {seq} geçmiş {} < {need_past}",
@@ -7117,7 +7142,7 @@ mod tests {
             }
             assert_eq!((stats.frames_in, stats.frames_out), (total, total));
             assert_eq!(stats.order_violations + stats.preservation_violations, 0);
-            assert!(stats.max_occupancy <= 30);
+            assert!(stats.max_occupancy <= RING_FRAMES as u32);
         }
     }
 
@@ -7165,34 +7190,39 @@ mod tests {
             assert_eq!(stats.modified_pixels, total * (roi.w * roi.h) as u64);
             for (meta, frame) in &outputs {
                 let original = frame_content(geo, meta.seq);
-                let k = (meta.seq % 15) as usize;
-                // Öncelik = 1 + min(geçerli geçmiş, geçerli gelecek). Tam pencerelerde bu,
-                // (konum k → k+1) ile (konum 15+k → 15-k) arasında üçgen geçiş verir; akışın
-                // sonundaki dolgulu pencerede gelecek kısaldığı için öncelik de küçülür.
-                let prior = |window_base: u64, pos: u64| -> u32 {
-                    let last = (total - 1 - window_base).min(29);
-                    1 + pos.min(last - pos).min(14) as u32
+                // 75 kare: pencereler [0,15) → [11,26) → … → [55,70) (j = 11), son pencere [64,79)
+                // (dolgulu, 66..74'ü kesinleştirir). Kare, onu kesinleştiren pencerenin `pos`
+                // konumundan; örtüşen 4 karede ayrıca önceki pencerenin `pos+11` konumundan gelir.
+                let seq = meta.seq;
+                let (base, k) = if seq < 66 {
+                    (seq / 11 * 11, (seq % 11) as usize)
+                } else {
+                    (64, (seq - 64) as usize)
                 };
-                let base = meta.seq - k as u64;
-                // İlk 15 kare tek tahminden; sonrakiler bu pencerenin (konum k) ve önceki
-                // pencerenin (konum 15+k) tahminlerinden harmanlanır.
+                let cached = (seq >= 11 && (seq - 11) % 11 < 4).then(|| {
+                    let prev = if seq < 66 { base - 11 } else { 55 };
+                    (prev, (seq - prev) as usize)
+                });
+                // Öncelik = 1 + min(geçerli geçmiş, geçerli gelecek): örtüşmede (k+1) : (4-k) doğrusal
+                // geçiş; akışın sonundaki dolgulu pencerede gelecek kısaldığı için öncelik de küçülür.
+                let prior = |window_base: u64, pos: usize| -> u32 {
+                    let last = (total - 1 - window_base).min(14) as usize;
+                    1 + pos.min(last - pos) as u32
+                };
                 let expect = |plane: usize| -> u8 {
-                    let cur = [
-                        PaintRestorer::value(k).0,
-                        PaintRestorer::value(k).1,
-                        PaintRestorer::value(k).2,
-                    ][plane];
-                    if meta.seq < 15 {
+                    let v = PaintRestorer::value(k);
+                    let cur = [v.0, v.1, v.2][plane];
+                    let Some((prev, old_pos)) = cached else {
                         return cur;
-                    }
-                    let old = PaintRestorer::value(15 + k);
-                    let old = [old.0, old.1, old.2][plane];
+                    };
+                    let o = PaintRestorer::value(old_pos);
+                    let old = [o.0, o.1, o.2][plane];
                     // Y pikseli başına ağırlık w; UV bloğu başına 4w — oran aynıdır.
                     blend(
                         cur,
-                        prior(base, k as u64) * weight(k) as u32,
+                        prior(base, k) * weight(k) as u32,
                         old,
-                        prior(base - 15, 15 + k as u64) * weight(15 + k) as u32,
+                        prior(prev, old_pos) * weight(old_pos) as u32,
                     )
                 };
                 for y in 0..geo.height() {
@@ -7224,7 +7254,7 @@ mod tests {
                         );
                     }
                 }
-                assert_eq!(meta.flags & OUT_FLAG_FUSED != 0, meta.seq >= 15);
+                assert_eq!(meta.flags & OUT_FLAG_FUSED != 0, cached.is_some());
             }
         }
     }
@@ -7946,7 +7976,7 @@ mod tests {
                     let valid = read_i32(&info, 56) as u32;
                     let base = read_i64(&info, 48);
                     // Pencere karesi okunabilir ve doğru kareyi verir; dolgu konumu 0 döner.
-                    for pos in [0, 14, 29] {
+                    for pos in [0, 7, 14] {
                         let got = unsafe {
                             Java_com_video_cleaner_Core_nativeReadWindowFrame(
                                 env,
