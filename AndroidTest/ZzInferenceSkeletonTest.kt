@@ -44,9 +44,16 @@ class ZzInferenceSkeletonTest {
     private val app = instrumentation.targetContext
     private val testAssets = instrumentation.context.assets
 
-    /** Yerel bellekte (Java yığını dışında) tutulan tensör: halka tamponunun yerini tutar. */
-    private class Feature(val shape: LongArray, val data: FloatBuffer) {
-        val perItem: Int get() = (data.capacity() / shape[0]).toInt()
+    /** Halkadaki FP16 bölge: doğrudan tampon + öğe ofseti + öğe sayısı. */
+    private class Slice(val buf: ByteBuffer, val offset: Int, val count: Int)
+
+    /**
+     * Halkadaki tensör görünümü: bir veya birkaç parçanın (kare) art arda birleşimi. Birleştirme ve kare seçme
+     * KOPYA YAPMAZ (üretimdeki Rust halkası gibi); FP32'ye yalnızca ORT'ye girerken geçici tamponda açılır.
+     */
+    private class Feature(val shape: LongArray, val parts: List<Slice>) {
+        val count: Int get() = parts.sumOf { it.count }
+        val perItem: Int get() = (count / shape[0]).toInt()
     }
 
     /** Java yığını dışı bellek bölgesi (Rust nativeAllocDirect); [free] ile topluca geri verilir. */
@@ -55,12 +62,14 @@ class ZzInferenceSkeletonTest {
         var bytes = 0L
             private set
 
-        fun floats(count: Int): FloatBuffer {
-            val block = Core.nativeAllocDirect(count * 4L) ?: throw OutOfMemoryError("yerel bellek ayrılamadı (${count * 4L} bayt)")
+        fun alloc(size: Long): ByteBuffer {
+            val block = Core.nativeAllocDirect(size) ?: throw OutOfMemoryError("yerel bellek ayrılamadı ($size bayt)")
             blocks += block
-            bytes += count * 4L
-            return block.order(ByteOrder.nativeOrder()).asFloatBuffer()
+            bytes += size
+            return block.order(ByteOrder.nativeOrder())
         }
+
+        fun halves(count: Int): ByteBuffer = alloc(count * 2L)
 
         fun free() {
             blocks.forEach { Core.nativeFreeDirect(it) }
@@ -69,34 +78,57 @@ class ZzInferenceSkeletonTest {
         }
     }
 
-    private var arena = NativeArena()
+    /** ORT giriş/çıkışı için FP32 geçici tamponlar (yuva başına bir tane, büyüyerek yeniden kullanılır). */
+    private class Scratch {
+        private val slots = HashMap<Int, ByteBuffer>()
+        val bytes: Long get() = slots.values.sumOf { it.capacity().toLong() }
 
-    private fun direct(count: Int): FloatBuffer = arena.floats(count)
+        fun get(slot: Int, floats: Int): ByteBuffer {
+            val have = slots[slot]
+            if (have != null && have.capacity() >= floats * 4) return have.also { it.clear() }
+            have?.let { Core.nativeFreeDirect(it) }
+            val block = Core.nativeAllocDirect(floats * 4L) ?: throw OutOfMemoryError("geçici tampon ayrılamadı (${floats * 4L} bayt)")
+            return block.order(ByteOrder.nativeOrder()).also { slots[slot] = it }
+        }
 
-    private fun random(shape: LongArray, seed: Long): Feature {
+        fun free() {
+            slots.values.forEach { Core.nativeFreeDirect(it) }
+            slots.clear()
+        }
+    }
+
+    private var arena = NativeArena()          // ara özellik halkası (FP16)
+    private val scratch = Scratch()
+    private var convNs = 0L                    // FP32 ↔ FP16 dönüşüm süresi (Rust NEON)
+
+    /** FP32 değerleri halkaya FP16 olarak yazar. */
+    private fun store(values: FloatBuffer, shape: LongArray): Feature {
+        val n = values.remaining()
+        val tmp = scratch.get(OUT_SLOT, n)
+        tmp.asFloatBuffer().put(values)
+        val dst = arena.halves(n)
+        val t0 = SystemClock.elapsedRealtimeNanos()
+        check(Core.nativeF32ToF16(tmp, 0, dst, 0, n) == n) { "nativeF32ToF16" }
+        convNs += SystemClock.elapsedRealtimeNanos() - t0
+        return Feature(shape, listOf(Slice(dst, 0, n)))
+    }
+
+    private fun random(shape: LongArray, seed: Long, fill: Float? = null): Feature {
         val count = shape.fold(1L) { a, b -> a * b }.toInt()
-        val buf = direct(count)
+        val values = FloatBuffer.allocate(count)
         val rnd = java.util.Random(seed)
-        repeat(count) { buf.put(rnd.nextFloat()) }
-        buf.rewind()
-        return Feature(shape, buf)
+        repeat(count) { values.put(fill ?: rnd.nextFloat()) }
+        values.flip()
+        return store(values, shape)
     }
 
-    private fun concat(parts: List<Feature>): Feature {
-        val shape = parts[0].shape.copyOf().also { it[0] = parts.sumOf { p -> p.shape[0] } }
-        val out = direct(parts.sumOf { it.data.capacity() })
-        for (p in parts) out.put(p.data.duplicate().also { it.rewind() })
-        out.rewind()
-        return Feature(shape, out)
-    }
+    private fun concat(parts: List<Feature>): Feature =
+        Feature(parts[0].shape.copyOf().also { it[0] = parts.sumOf { p -> p.shape[0] } }, parts.flatMap { it.parts })
 
     private fun item(f: Feature, i: Int): Feature {
+        val part = f.parts.single()
         val per = f.perItem
-        val src = f.data.duplicate().also { it.position(i * per); it.limit((i + 1) * per) }
-        val out = direct(per)
-        out.put(src)
-        out.rewind()
-        return Feature(f.shape.copyOf().also { it[0] = 1 }, out)
+        return Feature(f.shape.copyOf().also { it[0] = 1 }, listOf(Slice(part.buf, part.offset + i * per, per)))
     }
 
     /** /proc/self/status → VmRSS (MB). */
@@ -119,7 +151,19 @@ class ZzInferenceSkeletonTest {
             // Hat başına süre sınırı: bir yürütme sağlayıcısı yavaş yedek çekirdeğe düşerse (x86'da FP16 MatMul
             // gibi) tek çağrı dakikalar sürebilir; RunOptions.setTerminate ile kesilir, sonuç FAIL yazılır.
             if (SystemClock.elapsedRealtime() - started > PIPELINE_LIMIT_MS) throw IllegalStateException("hat süre sınırı aşıldı ($graph öncesi)")
-            val tensors = feeds.associate { (name, f) -> name to OnnxTensor.createTensor(env, f.data.duplicate().also { it.rewind() }, f.shape) }
+            // Halkadaki FP16 parçalar geçici FP32 tampona açılır (Rust NEON); ORT doğrudan tamponu kopyasız kullanır.
+            val tensors = feeds.withIndex().associate { (k, feed) ->
+                val (name, f) = feed
+                val buf = scratch.get(k, f.count)
+                var off = 0
+                val t0 = SystemClock.elapsedRealtimeNanos()
+                for (part in f.parts) {
+                    check(Core.nativeF16ToF32(part.buf, part.offset, buf, off, part.count) == part.count) { "nativeF16ToF32" }
+                    off += part.count
+                }
+                convNs += SystemClock.elapsedRealtimeNanos() - t0
+                name to OnnxTensor.createTensor(env, buf.asFloatBuffer().also { it.limit(f.count) }, f.shape)
+            }
             val options = OrtSession.RunOptions()
             val guard = watchdog.schedule(Runnable { runCatching { options.setTerminate(true) } }, CALL_LIMIT_MS, java.util.concurrent.TimeUnit.MILLISECONDS)
             try {
@@ -128,11 +172,7 @@ class ZzInferenceSkeletonTest {
                     ms[graph] = (ms[graph] ?: 0.0) + (SystemClock.elapsedRealtimeNanos() - t0) / 1e6
                     return result.map { entry ->
                         val tensor = entry.value as OnnxTensor
-                        val values = tensor.floatBuffer                  // ORT kopyası (kısa ömürlü)
-                        val copy = direct(values.capacity())
-                        copy.put(values)
-                        copy.rewind()
-                        Feature(tensor.info.shape, copy)
+                        store(tensor.floatBuffer, tensor.info.shape)     // ORT kopyası (kısa ömürlü) → halkada FP16
                     }
                 }
             } finally {
@@ -163,11 +203,16 @@ class ZzInferenceSkeletonTest {
         // 14 Kasım (Pixel 11 + Z Flip8): INT8 + ORT CPU (MLAS) en hızlı (Z Flip8 745 ms, Pixel 1074 ms);
         // XNNPACK her varyantta daha yavaş, FP16 kazandırmıyor, NNAPI mamba_core'u yükleyemiyor → mimari
         // kararıyla üçü de test ve üretim hattından çıkarıldı. Yalnızca INT8 ve FP32 (karşılaştırma) CPU'da.
-        // Düşük RAM'li cihazda (< 6 GB; moto g play 2021, 2,7 GB) CPU bellek arenası kapalı.
+        // 15 Kasım kararı: üretimde CPU bellek arenası HER cihazda kapalı (14 Kasım: arenasız moto tepe RSS
+        // 665 MB, arenalı Z Flip8 1263 MB). Arenalı INT8 yalnızca malloc/free ek yükünü ölçmek için (RAM ≥ 6 GB).
         val memory = ActivityManager.MemoryInfo().also { (app.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager).getMemoryInfo(it) }
         val totalMb = memory.totalMem shr 20
         val lowRam = totalMb < 6 * 1024
-        val plan = listOf(Triple("int8", "cpu", !lowRam), Triple("fp32", "cpu", !lowRam))
+        val plan = if (lowRam) {
+            listOf(Triple("int8", "cpu", false), Triple("fp32", "cpu", false))
+        } else {
+            listOf(Triple("int8", "cpu", false), Triple("int8", "cpu", true), Triple("fp32", "cpu", false))
+        }
         Log.i(TAG, "VCBENCH ram_total_mb=$totalMb avail_mb=${memory.availMem shr 20} low_ram=$lowRam plan=${plan.size}")
         for ((variant, ep, cpuArena) in plan) {
             val label = if (cpuArena) ep else "$ep-noarena"
@@ -209,6 +254,7 @@ class ZzInferenceSkeletonTest {
         var pipeline: Pipeline? = null
         var ringMb = 0L
         arena = NativeArena()
+        convNs = 0L
         try {
             val t0 = SystemClock.elapsedRealtime()
             for (g in graphs) {
@@ -237,7 +283,7 @@ class ZzInferenceSkeletonTest {
             val p = Pipeline(env, sessions)
             pipeline = p
             val t = WINDOW
-            fun validMask() = Feature(longArrayOf(1, t.toLong()), direct(t).also { b -> repeat(t) { b.put(1f) }; b.rewind() })
+            fun validMask() = random(longArrayOf(1, t.toLong()), 0, fill = 1f)
 
             stage = "algılayıcı"
             val frame = random(p.shapeOf("det_enc", "frame"), 1)
@@ -284,7 +330,9 @@ class ZzInferenceSkeletonTest {
                 TAG,
                 "VCBENCH variant=$variant ep=$label status=OK load_ms=$loadMs frame_ms=${"%.1f".format(frameMs)} " +
                     per.entries.joinToString(" ") { (g, v) -> "$g=${"%.1f".format(v)}" } +
-                    " window_ms=${"%.0f".format(p.ms.values.sum())} ring_mb=$ringMb rss_before_mb=$rssBefore peak_rss_mb=${peak.get()} thermal=$thermalBefore->${thermal()}",
+                    " window_ms=${"%.0f".format(p.ms.values.sum())} ring_mb=$ringMb ring=fp16 conv_window_ms=${"%.1f".format(convNs / 1e6)} " +
+                    "conv_frame_ms=${"%.2f".format(convNs / 1e6 / STRIDE)} scratch_mb=${scratch.bytes shr 20} rss_before_mb=$rssBefore " +
+                    "peak_rss_mb=${peak.get()} thermal=$thermalBefore->${thermal()}",
             )
         } catch (e: Throwable) {
             Log.i(
@@ -297,6 +345,7 @@ class ZzInferenceSkeletonTest {
             sampler.join(500)
             pipeline?.close()
             arena.free()
+            scratch.free()
             sessions.values.forEach { runCatching { it.close() } }
             files.forEach { it.delete() }
         }
@@ -304,6 +353,7 @@ class ZzInferenceSkeletonTest {
 
     private companion object {
         const val TAG = "VCTEST"
+        const val OUT_SLOT = 100                   // çıktı dönüşümü için geçici tampon yuvası (girişler 0..4)
         const val WINDOW = 15                      // Models/Core.py WINDOW
         const val STRIDE = 11                      // Models/Core.py STRIDE (Mod B kayması)
         const val CALL_LIMIT_MS = 60_000L          // tek grafik çağrısı

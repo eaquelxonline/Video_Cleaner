@@ -150,6 +150,16 @@ object Core {
     /** [nativeAllocDirect] belleğini geri verir (0 başarı). Yalnızca o işlevden gelen tampon verilmelidir. */
     @JvmStatic external fun nativeFreeDirect(buffer: ByteBuffer): Int
 
+    /**
+     * Ara özellik halkası FP16'dır (15 Kasım mimari kararı). FP32 → FP16 (en yakına yuvarla); ofset ve sayı ÖĞE
+     * cinsinden, tamponlar doğrudan ve hizalı (nativeAllocDirect 64 bayt). Dönüş `count` veya negatif hata kodu.
+     * aarch64'te FCVTN (ARMv8.0 NEON), x86_64'te F16C; skaler yolla bit düzeyinde aynı.
+     */
+    @JvmStatic external fun nativeF32ToF16(src: ByteBuffer, srcOffset: Int, dst: ByteBuffer, dstOffset: Int, count: Int): Int
+
+    /** FP16 → FP32 (kayıpsız; ONNX Runtime girişi için). Bkz. [nativeF32ToF16]. */
+    @JvmStatic external fun nativeF16ToF32(src: ByteBuffer, srcOffset: Int, dst: ByteBuffer, dstOffset: Int, count: Int): Int
+
     @JvmStatic external fun nativeProbeVui(codec: Int, src: ByteBuffer, offset: Int, length: Int, out: ByteBuffer): Int
 
     @JvmStatic external fun nativePushHardwareBuffer(handle: Long, buffer: HardwareBuffer, cropLeft: Int, cropTop: Int, ptsUs: Long, flags: Int): Long

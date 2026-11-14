@@ -4834,6 +4834,226 @@ pub mod vui {
 }
 
 // ============================================================================
+// 9b. half — FP32 ↔ FP16 (IEEE 754 binary16) dönüşümü
+// ============================================================================
+
+/// Ara özellik halkası FP16 tutulur (15 Kasım mimari kararı): ONNX Runtime giriş/çıkışı FP32, çözücüler
+/// INT8 QDQ olduğu için atlama tensörleri çözücüye girerken zaten 8 bite yuvarlanır; FP16 saklama halkayı
+/// yarıya indirir (14 Kasım Z Flip8: 264 MB). Dönüşüm burada, Kotlin'de değil:
+///
+/// * aarch64: `FCVTN`/`FCVTN2` ve `FCVTL`/`FCVTL2` — ARMv8.0 temel Advanced SIMD (FP16 aritmetik eklentisi
+///   ARMv8.2 GEREKMEZ; Cortex-A53'te de vardır). 8 değer/yineleme, kuyruk skaler.
+/// * x86_64: F16C (`VCVTPS2PH` en yakına yuvarlama / `VCVTPH2PS`), çalışma zamanında algılanır.
+/// * Diğer / kuyruk: skaler başvuru — en yakına yuvarlama (eşitlikte çift), alt-normaller, ±sonsuz taşma,
+///   NaN yükü korunur ve sessiz biti kurulur. Donanım yollarıyla bit düzeyinde aynıdır (testler denetler).
+pub mod half {
+    /// f32 → f16 bitleri (en yakına yuvarla, eşitlikte çift).
+    pub fn f32_to_f16(x: f32) -> u16 {
+        let b = x.to_bits();
+        let sign = ((b >> 16) & 0x8000) as u16;
+        let exp = ((b >> 23) & 0xff) as i32;
+        let man = b & 0x007f_ffff;
+        if exp == 0xff {
+            // ±sonsuz veya NaN (sessiz bit kurulur, yükün üst bitleri korunur).
+            return sign
+                | 0x7c00
+                | if man != 0 {
+                    0x0200 | (man >> 13) as u16
+                } else {
+                    0
+                };
+        }
+        let e = exp - 127 + 15;
+        if e >= 0x1f {
+            return sign | 0x7c00;
+        }
+        if e <= 0 {
+            if e < -10 {
+                return sign;
+            }
+            let m = man | 0x0080_0000;
+            let shift = (14 - e) as u32;
+            let q = m >> shift;
+            let rem = m & ((1 << shift) - 1);
+            let mid = 1 << (shift - 1);
+            return sign | (q + (rem > mid || (rem == mid && q & 1 == 1)) as u32) as u16;
+        }
+        let q = ((e as u32) << 10) | (man >> 13);
+        let rem = man & 0x1fff;
+        // Mantis taşması üsse geçer (en büyük sonlu değerden sonsuza doğru yuvarlama dahil).
+        sign | (q + (rem > 0x1000 || (rem == 0x1000 && q & 1 == 1)) as u32) as u16
+    }
+
+    /// f16 bitleri → f32 (kayıpsız).
+    pub fn f16_to_f32(h: u16) -> f32 {
+        let sign = ((h & 0x8000) as u32) << 16;
+        let exp = ((h >> 10) & 0x1f) as u32;
+        let man = (h & 0x03ff) as u32;
+        let bits = match (exp, man) {
+            (0, 0) => sign,
+            (0, _) => {
+                let mut e = 127 - 14;
+                let mut m = man;
+                while m & 0x0400 == 0 {
+                    m <<= 1;
+                    e -= 1;
+                }
+                sign | (e << 23) | ((m & 0x03ff) << 13)
+            }
+            (0x1f, _) => sign | 0x7f80_0000 | (man << 13),
+            _ => sign | ((exp + 127 - 15) << 23) | (man << 13),
+        };
+        f32::from_bits(bits)
+    }
+
+    /// Hangi yol kullanılıyor (tanılama).
+    pub fn backend() -> &'static str {
+        #[cfg(target_arch = "aarch64")]
+        {
+            "aarch64-fcvtn"
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            if std::is_x86_feature_detected!("f16c") {
+                "x86_64-f16c"
+            } else {
+                "scalar"
+            }
+        }
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+        {
+            "scalar"
+        }
+    }
+
+    /// `dst[i] = f16(src[i])`; uzunluklar eşit olmalı.
+    pub fn narrow(src: &[f32], dst: &mut [u16]) {
+        assert_eq!(src.len(), dst.len());
+        let done = simd_narrow(src, dst);
+        for (d, &x) in dst[done..].iter_mut().zip(&src[done..]) {
+            *d = f32_to_f16(x);
+        }
+    }
+
+    /// `dst[i] = f32(src[i])`; uzunluklar eşit olmalı.
+    pub fn widen(src: &[u16], dst: &mut [f32]) {
+        assert_eq!(src.len(), dst.len());
+        let done = simd_widen(src, dst);
+        for (d, &h) in dst[done..].iter_mut().zip(&src[done..]) {
+            *d = f16_to_f32(h);
+        }
+    }
+
+    /// Skaler başvuru (testler donanım yoluyla karşılaştırır).
+    pub fn narrow_scalar(src: &[f32], dst: &mut [u16]) {
+        for (d, &x) in dst.iter_mut().zip(src) {
+            *d = f32_to_f16(x);
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn simd_narrow(src: &[f32], dst: &mut [u16]) -> usize {
+        let n = src.len() / 8 * 8;
+        for i in (0..n).step_by(8) {
+            // SAFETY: i + 8 <= n <= len; ld1/st1 hizasız erişime izin verir. Yalnızca v0–v2 bozulur.
+            unsafe {
+                core::arch::asm!(
+                    "ld1 {{v0.4s, v1.4s}}, [{s}]",
+                    "fcvtn v2.4h, v0.4s",
+                    "fcvtn2 v2.8h, v1.4s",
+                    "st1 {{v2.8h}}, [{d}]",
+                    s = in(reg) src.as_ptr().add(i),
+                    d = in(reg) dst.as_mut_ptr().add(i),
+                    out("v0") _, out("v1") _, out("v2") _,
+                    options(nostack, preserves_flags),
+                );
+            }
+        }
+        n
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn simd_widen(src: &[u16], dst: &mut [f32]) -> usize {
+        let n = src.len() / 8 * 8;
+        for i in (0..n).step_by(8) {
+            // SAFETY: i + 8 <= n <= len; yalnızca v0–v2 bozulur.
+            unsafe {
+                core::arch::asm!(
+                    "ld1 {{v0.8h}}, [{s}]",
+                    "fcvtl v1.4s, v0.4h",
+                    "fcvtl2 v2.4s, v0.8h",
+                    "st1 {{v1.4s, v2.4s}}, [{d}]",
+                    s = in(reg) src.as_ptr().add(i),
+                    d = in(reg) dst.as_mut_ptr().add(i),
+                    out("v0") _, out("v1") _, out("v2") _,
+                    options(nostack, preserves_flags),
+                );
+            }
+        }
+        n
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn simd_narrow(src: &[f32], dst: &mut [u16]) -> usize {
+        if !std::is_x86_feature_detected!("f16c") {
+            return 0;
+        }
+        // SAFETY: F16C çalışma zamanında doğrulandı.
+        unsafe { narrow_f16c(src, dst) }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "f16c,avx")]
+    unsafe fn narrow_f16c(src: &[f32], dst: &mut [u16]) -> usize {
+        use core::arch::x86_64::*;
+        let n = src.len() / 8 * 8;
+        for i in (0..n).step_by(8) {
+            // SAFETY: i + 8 <= n; hizasız yükleme/saklama.
+            unsafe {
+                let v = _mm256_loadu_ps(src.as_ptr().add(i));
+                let h = _mm256_cvtps_ph::<{ _MM_FROUND_TO_NEAREST_INT }>(v);
+                _mm_storeu_si128(dst.as_mut_ptr().add(i) as *mut __m128i, h);
+            }
+        }
+        n
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn simd_widen(src: &[u16], dst: &mut [f32]) -> usize {
+        if !std::is_x86_feature_detected!("f16c") {
+            return 0;
+        }
+        // SAFETY: F16C çalışma zamanında doğrulandı.
+        unsafe { widen_f16c(src, dst) }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "f16c,avx")]
+    unsafe fn widen_f16c(src: &[u16], dst: &mut [f32]) -> usize {
+        use core::arch::x86_64::*;
+        let n = src.len() / 8 * 8;
+        for i in (0..n).step_by(8) {
+            // SAFETY: i + 8 <= n; hizasız yükleme/saklama.
+            unsafe {
+                let h = _mm_loadu_si128(src.as_ptr().add(i) as *const __m128i);
+                _mm256_storeu_ps(dst.as_mut_ptr().add(i), _mm256_cvtph_ps(h));
+            }
+        }
+        n
+    }
+
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    fn simd_narrow(_: &[f32], _: &mut [u16]) -> usize {
+        0
+    }
+
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    fn simd_widen(_: &[u16], _: &mut [f32]) -> usize {
+        0
+    }
+}
+
+// ============================================================================
 // 10. JNI köprüsü (Kotlin: com.video.cleaner.Core)
 // ============================================================================
 
@@ -5352,6 +5572,90 @@ pub mod jni {
             }
             Err(e) => e.code(),
         }
+    }
+
+    /// Doğrudan tampondan `[offset, offset+count)` öğelik hizalı dilim (`T` = f32 veya u16).
+    ///
+    /// # Safety
+    /// `env` geçerli olmalı; tampon çağrı boyunca yaşamalıdır.
+    unsafe fn typed<'a, T>(
+        env: *mut JniEnv,
+        buf: JObject,
+        offset: i32,
+        count: i32,
+    ) -> Result<&'a mut [T], CoreError> {
+        // SAFETY: çağıranın sözleşmesi.
+        let (ptr, cap) = unsafe { direct_buffer(env, buf)? };
+        if offset < 0 || count < 0 {
+            return Err(CoreError::BadArgument);
+        }
+        let size = std::mem::size_of::<T>();
+        let end = (offset as usize + count as usize)
+            .checked_mul(size)
+            .ok_or(CoreError::BadArgument)?;
+        if end > cap {
+            return Err(CoreError::BufferTooSmall);
+        }
+        // SAFETY: aralık tamponun içinde.
+        let start = unsafe { ptr.add(offset as usize * size) };
+        if !(start as usize).is_multiple_of(std::mem::align_of::<T>()) {
+            return Err(CoreError::BadArgument);
+        }
+        // SAFETY: hizalı, tampon içinde; çağıran aynı bölgeye eşzamanlı yazmaz.
+        Ok(unsafe { std::slice::from_raw_parts_mut(start as *mut T, count as usize) })
+    }
+
+    /// `external fun nativeF32ToF16(src: ByteBuffer, srcOffset: Int, dst: ByteBuffer, dstOffset: Int, count: Int): Int`
+    ///
+    /// Ara özellik halkasına yazma: ORT'nin FP32 çıktısı → halkada FP16 ([`half::narrow`]). Ofset ve sayı
+    /// ÖĞE cinsinden; dönüş `count` veya negatif hata kodu. Kaynak ve hedef çakışmamalıdır.
+    ///
+    /// # Safety
+    /// `env` geçerli olmalıdır.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "system" fn Java_com_video_cleaner_Core_nativeF32ToF16(
+        env: *mut JniEnv,
+        _class: JObject,
+        src: JObject,
+        src_offset: i32,
+        dst: JObject,
+        dst_offset: i32,
+        count: i32,
+    ) -> i32 {
+        // SAFETY: çağıranın sözleşmesi.
+        let run = || -> Result<i32, CoreError> {
+            let s: &[f32] = unsafe { typed(env, src, src_offset, count)? };
+            let d: &mut [u16] = unsafe { typed(env, dst, dst_offset, count)? };
+            half::narrow(s, d);
+            Ok(count)
+        };
+        run().unwrap_or_else(|e| e.code())
+    }
+
+    /// `external fun nativeF16ToF32(src: ByteBuffer, srcOffset: Int, dst: ByteBuffer, dstOffset: Int, count: Int): Int`
+    ///
+    /// Halkadan okuma: FP16 → ORT girişi için FP32 ([`half::widen`], kayıpsız).
+    ///
+    /// # Safety
+    /// `env` geçerli olmalıdır.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "system" fn Java_com_video_cleaner_Core_nativeF16ToF32(
+        env: *mut JniEnv,
+        _class: JObject,
+        src: JObject,
+        src_offset: i32,
+        dst: JObject,
+        dst_offset: i32,
+        count: i32,
+    ) -> i32 {
+        // SAFETY: çağıranın sözleşmesi.
+        let run = || -> Result<i32, CoreError> {
+            let s: &[u16] = unsafe { typed(env, src, src_offset, count)? };
+            let d: &mut [f32] = unsafe { typed(env, dst, dst_offset, count)? };
+            half::widen(s, d);
+            Ok(count)
+        };
+        run().unwrap_or_else(|e| e.code())
     }
 
     const NATIVE_ALIGN: usize = 64;
@@ -8887,6 +9191,90 @@ mod finish_tests {
             (sigma_in - sigma_out).abs() / sigma_out < 0.25,
             "içeride σ {sigma_in}, dışarıda σ {sigma_out}"
         );
+    }
+}
+
+#[cfg(test)]
+mod half_tests {
+    use super::half::*;
+
+    #[test]
+    fn known_values_and_edges() {
+        let cases: [(f32, u16); 14] = [
+            (0.0, 0x0000),
+            (-0.0, 0x8000),
+            (1.0, 0x3c00),
+            (-2.0, 0xc000),
+            (0.5, 0x3800),
+            (65504.0, 0x7bff), // en büyük sonlu
+            (65520.0, 0x7c00), // eşitlikte çift → sonsuz
+            (1e9, 0x7c00),
+            (f32::INFINITY, 0x7c00),
+            (f32::NEG_INFINITY, 0xfc00),
+            (6.103_515_6e-5, 0x0400), // en küçük normal 2^-14
+            (5.960_464_5e-8, 0x0001), // en küçük alt-normal 2^-24
+            (2.980_232_2e-8, 0x0000), // tam 2^-25: eşitlikte çift → 0
+            (1.000_488_3, 0x3c00),    // 1 + 2^-11: eşitlikte çift → 1
+        ];
+        for (x, h) in cases {
+            assert_eq!(f32_to_f16(x), h, "{x:e}");
+        }
+        assert_eq!(f32_to_f16(1.001_464_8), 0x3c02); // 1 + 3·2^-11 → yukarı (çift)
+        assert!(f16_to_f32(f32_to_f16(f32::NAN)).is_nan());
+    }
+
+    #[test]
+    fn every_half_roundtrips_exactly() {
+        for h in 0..=u16::MAX {
+            let x = f16_to_f32(h);
+            if x.is_nan() {
+                assert_eq!(
+                    f32_to_f16(x) & 0x7e00,
+                    0x7e00,
+                    "NaN sessiz kalmalı: {h:#06x}"
+                );
+                continue;
+            }
+            assert_eq!(f32_to_f16(x), h, "{h:#06x}");
+        }
+    }
+
+    #[test]
+    fn vector_path_matches_scalar_bit_exactly() {
+        // Rastgele bitler (NaN, sonsuz, alt-normal, eşitlik durumları dahil) + eşitlik sınırları.
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut src: Vec<f32> = (0..100_003)
+            .map(|_| f32::from_bits(next() as u32))
+            .collect();
+        for k in 0..2048u32 {
+            src.push(f32::from_bits((k << 13) | 0x1000)); // tam yarım: eşitlikte çift
+            src.push(f32::from_bits(0x3300_0000 + (k << 12))); // alt-normal sınırı
+        }
+        let mut fast = vec![0u16; src.len()];
+        let mut slow = vec![0u16; src.len()];
+        narrow(&src, &mut fast);
+        narrow_scalar(&src, &mut slow);
+        for (i, (a, b)) in fast.iter().zip(&slow).enumerate() {
+            assert_eq!(a, b, "{} öğe {i}: {:#010x}", backend(), src[i].to_bits());
+        }
+        let halves: Vec<u16> = (0..=u16::MAX).chain(0..13).collect();
+        let mut wide = vec![0f32; halves.len()];
+        widen(&halves, &mut wide);
+        for (&h, &x) in halves.iter().zip(&wide) {
+            let want = f16_to_f32(h);
+            assert!(
+                x.to_bits() == want.to_bits()
+                    || (x.is_nan() && want.is_nan() && f32_to_f16(x) == f32_to_f16(want)),
+                "{} {h:#06x}",
+                backend()
+            );
+        }
     }
 }
 
